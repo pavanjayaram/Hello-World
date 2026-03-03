@@ -1,145 +1,36 @@
 #!/bin/bash
 
-echo "╔══════════════════════════════════════════════════════════════════╗"
-echo "║                                                                  ║"
-echo "║     Config-Driven PySpark ETL Engine - Development Startup      ║"
-echo "║                                                                  ║"
-echo "╚══════════════════════════════════════════════════════════════════╝"
-echo ""
+echo "Stopping development servers..."
 
-# Function to check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# Check prerequisites
-echo "Checking prerequisites..."
-echo ""
-
-if ! command_exists python3; then
-    echo "✗ Python 3 not found. Please install Python 3.8+"
-    exit 1
-fi
-echo "✓ Python 3 found: $(python3 --version)"
-
-if ! command_exists node; then
-    echo "✗ Node.js not found. Please install Node.js 16+"
-    exit 1
-fi
-echo "✓ Node.js found: $(node --version)"
-
-if ! command_exists npm; then
-    echo "✗ npm not found. Please install npm"
-    exit 1
-fi
-echo "✓ npm found: $(npm --version)"
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Starting Backend API Server"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-# Start backend
-cd backend
-
-# Check if virtual environment exists
-if [ ! -d ".venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv .venv
+# Read PIDs from files
+if [ -f ".backend.pid" ]; then
+    BACKEND_PID=$(cat .backend.pid)
+    if kill -0 $BACKEND_PID 2>/dev/null; then
+        echo "Stopping backend (PID: $BACKEND_PID)..."
+        kill $BACKEND_PID
+        echo "✓ Backend stopped"
+    else
+        echo "Backend not running"
+    fi
+    rm .backend.pid
 fi
 
-# Activate virtual environment
-echo "Activating virtual environment..."
-source .venv/bin/activate
-
-# Install dependencies if needed
-if ! python -c "import flask" 2>/dev/null; then
-    echo "Installing backend dependencies..."
-    pip install -q -r requirements.txt
-    pip install -q -r requirements_api.txt
+if [ -f ".frontend.pid" ]; then
+    FRONTEND_PID=$(cat .frontend.pid)
+    if kill -0 $FRONTEND_PID 2>/dev/null; then
+        echo "Stopping frontend (PID: $FRONTEND_PID)..."
+        kill $FRONTEND_PID
+        echo "✓ Frontend stopped"
+    else
+        echo "Frontend not running"
+    fi
+    rm .frontend.pid
 fi
 
-# Check if .env exists
-if [ ! -f ".env" ]; then
-    echo "⚠ Warning: .env file not found"
-    echo "Creating .env from .env.example..."
-    cp .env.example .env
-    echo "Please edit backend/.env with your database credentials"
-fi
-
-# Start backend API in background
-echo "Starting backend API on http://localhost:9001..."
-python json_generator.py > ../backend.log 2>&1 &
-BACKEND_PID=$!
-echo "Backend PID: $BACKEND_PID"
-
-cd ..
-
-# Wait for backend to start
-echo "Waiting for backend to start..."
-sleep 3
-
-# Check if backend is running
-if curl -s http://localhost:9001/api/health > /dev/null; then
-    echo "✓ Backend API is running"
-else
-    echo "✗ Backend API failed to start. Check backend.log for details"
-    kill $BACKEND_PID 2>/dev/null
-    exit 1
-fi
+# Also kill any remaining processes on ports 9001 and 3007
+echo "Cleaning up ports..."
+lsof -ti:9001 | xargs kill -9 2>/dev/null
+lsof -ti:3007 | xargs kill -9 2>/dev/null
 
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Starting Frontend Development Server"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-# Start frontend
-cd frontend
-
-# Install dependencies if needed
-if [ ! -d "node_modules" ]; then
-    echo "Installing frontend dependencies..."
-    npm install
-fi
-
-echo "Starting frontend on http://localhost:3007..."
-npm run dev > ../frontend.log 2>&1 &
-FRONTEND_PID=$!
-echo "Frontend PID: $FRONTEND_PID"
-
-cd ..
-
-echo ""
-echo "╔══════════════════════════════════════════════════════════════════╗"
-echo "║                                                                  ║"
-echo "║                    🚀 SERVERS STARTED                            ║"
-echo "║                                                                  ║"
-echo "╚══════════════════════════════════════════════════════════════════╝"
-echo ""
-echo "Backend API:  http://localhost:9001"
-echo "Frontend UI:  http://localhost:3007"
-echo ""
-echo "Backend PID:  $BACKEND_PID"
-echo "Frontend PID: $FRONTEND_PID"
-echo ""
-echo "Logs:"
-echo "  Backend:  tail -f backend.log"
-echo "  Frontend: tail -f frontend.log"
-echo ""
-echo "To stop servers:"
-echo "  kill $BACKEND_PID $FRONTEND_PID"
-echo ""
-echo "Or run: ./stop_dev.sh"
-echo ""
-echo "Press Ctrl+C to view logs (servers will continue running)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-# Save PIDs to file for stop script
-echo "$BACKEND_PID" > .backend.pid
-echo "$FRONTEND_PID" > .frontend.pid
-
-# Follow logs
-trap 'echo ""; echo "Servers are still running in background"; exit 0' INT
-tail -f backend.log frontend.log
+echo "✓ All servers stopped"
