@@ -1,36 +1,30 @@
-#!/bin/bash
+# Database Connection Credentials
+# Copy this file to .env and update with your actual credentials
 
-echo "Stopping development servers..."
+# Oracle Database
+ORACLE_HOST=hostname
+ORACLE_PORT=1521
+ORACLE_SERVICE=service_name
+ORACLE_USER=oracle_user
+ORACLE_PASSWORD=oracle_password
 
-# Read PIDs from files
-if [ -f ".backend.pid" ]; then
-    BACKEND_PID=$(cat .backend.pid)
-    if kill -0 $BACKEND_PID 2>/dev/null; then
-        echo "Stopping backend (PID: $BACKEND_PID)..."
-        kill $BACKEND_PID
-        echo "✓ Backend stopped"
-    else
-        echo "Backend not running"
-    fi
-    rm .backend.pid
-fi
+# PostgreSQL Database
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=postgres
+POSTGRES_USER=Pavn
+POSTGRES_PASSWORD=L%4002
 
-if [ -f ".frontend.pid" ]; then
-    FRONTEND_PID=$(cat .frontend.pid)
-    if kill -0 $FRONTEND_PID 2>/dev/null; then
-        echo "Stopping frontend (PID: $FRONTEND_PID)..."
-        kill $FRONTEND_PID
-        echo "✓ Frontend stopped"
-    else
-        echo "Frontend not running"
-    fi
-    rm .frontend.pid
-fi
+# MySQL Database
+MYSQL_HOST=hostname
+MYSQL_PORT=3306
+MYSQL_DB=database
+MYSQL_USER=mysql_user
+MYSQL_PASSWORD=mysql_password
 
-# Also kill any remaining processes on ports 9001 and 3007
-echo "Cleaning up ports..."
-lsof -ti:9001 | xargs kill -9 2>/dev/null
-lsof -ti:3007 | xargs kill -9 2>/dev/null
-
-echo ""
-echo "✓ All servers stopped"
+# SQL Server Database (optional)
+SQLSERVER_HOST=hostname
+SQLSERVER_PORT=1433
+SQLSERVER_DB=database
+SQLSERVER_USER=sqlserver_user
+SQLSERVER_PASSWORD=sqlserver_password
