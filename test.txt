@@ -194,6 +194,50 @@ def main(xml_path, output_path=None, skip_elements=None):
     finally:
         if output_path:
             output_file.close()
+    
+    # Post-process: Remove any empty rows from the output file
+    if output_path:
+        print("Cleaning up empty rows...", file=sys.stderr)
+        clean_csv(output_path)
+
+def clean_csv(csv_path):
+    """Remove completely empty rows from CSV file."""
+    import tempfile
+    import shutil
+    
+    # Read the file and filter out empty rows
+    with open(csv_path, 'r') as infile:
+        reader = csv.reader(infile)
+        header = next(reader, None)
+        
+        # Create temp file
+        temp_fd, temp_path = tempfile.mkstemp(mode='w', suffix='.csv', delete=False)
+        
+        try:
+            with open(temp_path, 'w', newline='') as outfile:
+                writer = csv.writer(outfile)
+                if header:
+                    writer.writerow(header)
+                
+                rows_kept = 0
+                rows_removed = 0
+                for row in reader:
+                    # Check if row has any non-empty values
+                    if any(cell.strip() for cell in row):
+                        writer.writerow(row)
+                        rows_kept += 1
+                    else:
+                        rows_removed += 1
+            
+            # Replace original file with cleaned version
+            shutil.move(temp_path, csv_path)
+            print(f"Removed {rows_removed} empty rows, kept {rows_kept} data rows", file=sys.stderr)
+        except Exception as e:
+            # Clean up temp file on error
+            import os
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
