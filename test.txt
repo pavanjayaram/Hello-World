@@ -41,8 +41,8 @@ def flatten(elem):
         children_by_tag.setdefault(clean_child_tag, []).append(child)
 
     if not children_by_tag:
-        # leaf node
-        return [base]
+        # leaf node - only return if there's actual data
+        return [base] if base else []
 
     # for each child tag, flatten and then compute cross-product
     lists_of_rows = []
@@ -72,7 +72,9 @@ def flatten(elem):
         row = dict(base)  # copy parent data
         for part in comb:
             row.update(part)
-        rows.append(row)
+        # Only add row if it contains actual data
+        if row:
+            rows.append(row)
     return rows
 
 def _parse_xml(xml_path):
