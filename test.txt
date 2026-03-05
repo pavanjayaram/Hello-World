@@ -1,262 +1,83 @@
 #!/usr/bin/env python3
 """
-xml2text.py – convert arbitrary XML to “rows” by
-expanding repeating child elements.
+get_count_csv.py - Count occurrences of values in a CSV column
 
 Usage:
-    python3 xml2text.py sample_xml_2.xml > output_2.csv
-
-Note: install lxml if you expect to need recovery:
-    pip install lxml
+    python3 get_count_csv.py -i input.csv -c column_name
+    python3 get_count_csv.py -i input.csv -c column_name -o output.csv
 """
-import sys
-import xml.etree.ElementTree as ET
-from itertools import product, chain
 import csv
-import re
 import argparse
+from collections import Counter
+import sys
 
-def strip_namespace(tag):
-    """Remove namespace from tag name. E.g., {http://example.com}tag -> tag"""
-    return re.sub(r'\{.*?\}', '', tag)
-
-def flatten(elem):
+def count_column_values(input_file, column_name, output_file=None):
     """
-    Recursively flatten an element.
-    Returns a list of dicts.  Each dict represents one
-    “row” for this subtree.
-    """
-    # collect simple text/int attributes
-    base = {}
-    clean_tag = strip_namespace(elem.tag)
-    if elem.text and elem.text.strip():
-        base[clean_tag] = elem.text.strip()
-    for name, val in elem.attrib.items():
-        base[f"{clean_tag}@{name}"] = val
-
-    # group children by tag so we can detect repeats
-    children_by_tag = {}
-    for child in elem:
-        clean_child_tag = strip_namespace(child.tag)
-        children_by_tag.setdefault(clean_child_tag, []).append(child)
-
-    if not children_by_tag:
-        # leaf node - only return if there's actual data
-        return [base] if base else []
-
-    # for each child tag, flatten and then compute cross-product
-    lists_of_rows = []
-    for tag, children in children_by_tag.items():
-        # flatten each child; if there are several with same tag able to produce one row per child.
-        subrows = []
-        for child in children:
-            for r in flatten(child):
-                # prefix keys with tag path to keep hierarchy
-                prefixed = {}
-                for k, v in r.items():
-                    if k == tag:
-                        # Leaf node: avoid obligationname.obligationname tag repitition.
-                        prefixed[tag] = v
-                    else:
-                        # Nested nodes: maintain hierarchy
-                        prefixed[f"{tag}.{k}"] = v
-                subrows.append(prefixed)
-        lists_of_rows.append(subrows)
-
-    # If a tag occurs only once, we still want to merge its dict,
-    # but the product will just be itself.
-    all_combinations = product(*lists_of_rows)
-
-    rows = []
-    for comb in all_combinations:
-        row = dict(base)  # copy parent data
-        for part in comb:
-            row.update(part)
-        # Only add row if it contains actual data
-        if row:
-            rows.append(row)
-    return rows
-
-def _parse_xml(xml_path):
-    """
-    Parse XML file with fallback to lxml recovery mode.
-    Returns the root element.
-    """
-    try:
-        tree = ET.parse(xml_path)
-    except ET.ParseError as e:
-        # fallback to lxml with recovery mode, useful for imperfect prod data
-        try:
-            import lxml.etree as LET  # lxml is not stdlib; install if needed
-        except ImportError:
-            print("Error: XML is malformed and lxml is not installed.", file=sys.stderr)
-            print("Install lxml: pip install lxml", file=sys.stderr)
-            raise
-        try:
-            parser = LET.XMLParser(recover=True)
-            tree = LET.parse(xml_path, parser)
-        except Exception as lxml_err:
-            print(f"Error: Even lxml cannot recover from this XML: {lxml_err}", file=sys.stderr)
-            raise
-    return tree.getroot()
-
-def main(xml_path, output_path=None, skip_elements=None):
-    """
+    Count occurrences of values in a specified column.
+    
     Args:
-        xml_path: Path to input XML file
-        output_path: Path to output CSV file (None = stdout)
-        skip_elements: List of element tags to skip (e.g., ['header', 'footer'])
-    
-    Uses two-pass approach:
-      Pass 1: Scan XML to collect all unique fieldnames
-      Pass 2: Write CSV with complete schema
-    
-    This handles:
-      - Rows with different fields (missing tags in some rows)
-      - Large files efficiently by clearing processed elements
-      - Memory scaling: memory usage is bounded by largest element, not file size
+        input_file: Path to input CSV file
+        column_name: Name of the column to count
+        output_file: Optional path to output CSV file (None = stdout)
     """
-    if skip_elements is None:
-        skip_elements = []
-    
-    # PASS 1: Discover all unique fieldnames
-    print("Pass 1: Discovering fieldnames...", file=sys.stderr)
-    all_keys = {}
-    root = _parse_xml(xml_path)
-    
-    total_data_rows = 0
-    for child in root:
-        child_tag = strip_namespace(child.tag)
-        if child_tag not in skip_elements:
-            for row in flatten(child):
-                # Only count rows with actual data
-                if any(str(v).strip() for v in row.values()):
-                    all_keys.update(row)
-                    total_data_rows += 1
-    
-    if not all_keys:
-        print("Warning: No rows to write.", file=sys.stderr)
-        return
-    
-    # Sort keys by hierarchy: top-level fields first, then nested fields grouped by parent
-    top_level = []
-    nested_by_parent = {}
-    
-    for key in all_keys.keys():
-        if '.' not in key:
-            # Top-level field (no dots) - preserve order of first appearance
-            top_level.append(key)
-        else:
-            # Nested field - group by parent (first segment before dot)
-            parent = key.split('.')[0]
-            if parent not in nested_by_parent:
-                nested_by_parent[parent] = []
-            nested_by_parent[parent].append(key)
-    
-    # Sort nested keys within each parent group for consistency
-    for parent in nested_by_parent:
-        nested_by_parent[parent].sort()
-    
-    # Build final sorted keys: top-level first, then nested sorted by parent
-    sorted_keys = top_level
-    for parent in sorted(nested_by_parent.keys()):
-        sorted_keys.extend(nested_by_parent[parent])
-    
-    print(f"Found {total_data_rows} total records with {len(sorted_keys)} unique columns", file=sys.stderr)
-    
-    # PASS 2: Write CSV with complete schema
-    print("Pass 2: Writing CSV...", file=sys.stderr)
-    output_file = sys.stdout if output_path is None else open(output_path, 'w')
-    
-    row_count = 0
     try:
-        writer = csv.DictWriter(output_file, fieldnames=sorted_keys, restval='')
-        writer.writeheader()
-        
-        # Re-parse for second pass
-        root = _parse_xml(xml_path)
-        
-        for child in root:
-            child_tag = strip_namespace(child.tag)
-            if child_tag not in skip_elements:
-                for row in flatten(child):
-                    # Only write row if it has at least one non-empty value
-                    if any(str(v).strip() for v in row.values()):
-                        writer.writerow(row)
-                        row_count += 1
-                
-                # Clear the child element from memory immediately after processing
-                # This prevents memory accumulation for large files
-                child.clear()
-        
-        if output_path:
-            print(f"Successfully wrote {row_count} rows to {output_path}", file=sys.stderr)
-    finally:
-        if output_path:
-            output_file.close()
-    
-    # Post-process: Remove any empty rows from the output file
-    if output_path:
-        print("Cleaning up empty rows...", file=sys.stderr)
-        clean_csv(output_path)
-
-def clean_csv(csv_path):
-    """Remove completely empty rows from CSV file."""
-    import tempfile
-    import shutil
-    
-    # Read the file and filter out empty rows
-    with open(csv_path, 'r') as infile:
-        reader = csv.reader(infile)
-        header = next(reader, None)
-        
-        # Create temp file
-        temp_fd, temp_path = tempfile.mkstemp(mode='w', suffix='.csv', delete=False)
-        
-        try:
-            with open(temp_path, 'w', newline='') as outfile:
-                writer = csv.writer(outfile)
-                if header:
-                    writer.writerow(header)
-                
-                rows_kept = 0
-                rows_removed = 0
-                for row in reader:
-                    # Check if row has any non-empty values
-                    if any(cell.strip() for cell in row):
-                        writer.writerow(row)
-                        rows_kept += 1
-                    else:
-                        rows_removed += 1
+        with open(input_file, 'r') as f:
+            reader = csv.DictReader(f)
             
-            # Replace original file with cleaned version
-            shutil.move(temp_path, csv_path)
-            print(f"Removed {rows_removed} empty rows, kept {rows_kept} data rows", file=sys.stderr)
-        except Exception as e:
-            # Clean up temp file on error
-            import os
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-            raise
+            # Check if column exists
+            if column_name not in reader.fieldnames:
+                print(f"Error: Column '{column_name}' not found in CSV", file=sys.stderr)
+                print(f"Available columns: {', '.join(reader.fieldnames)}", file=sys.stderr)
+                return
+            
+            # Count values in the specified column
+            counter = Counter()
+            total_rows = 0
+            
+            for row in reader:
+                value = row[column_name].strip()
+                if value:  # Only count non-empty values
+                    counter[value] += 1
+                total_rows += 1
+            
+            # Sort by count (descending) then by value (ascending)
+            sorted_counts = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
+            
+            # Output results
+            if output_file:
+                with open(output_file, 'w', newline='') as out:
+                    writer = csv.writer(out)
+                    writer.writerow([column_name, 'Count'])
+                    writer.writerows(sorted_counts)
+                print(f"Results written to {output_file}", file=sys.stderr)
+            else:
+                print(f"\nColumn: {column_name}")
+                print(f"Total rows: {total_rows}")
+                print(f"Unique values: {len(counter)}")
+                print(f"\n{'Value':<40} {'Count':>10}")
+                print("-" * 52)
+                for value, count in sorted_counts:
+                    print(f"{value:<40} {count:>10}")
+    
+    except FileNotFoundError:
+        print(f"Error: File '{input_file}' not found", file=sys.stderr)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert arbitrary XML to CSV by expanding repeating child elements.",
+        description="Count occurrences of values in a CSV column",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 xml2text.py -i input.xml -o output.csv
-  python3 xml2text.py -i input.xml -o output.csv --skip-elements header,footer
-  python3 xml2text.py -i input.xml  # outputs to stdout
+  python3 get_count_csv.py -i data.csv -c status
+  python3 get_count_csv.py -i data.csv -c type -o counts.csv
         """
     )
-    parser.add_argument('-i', '--input', required=True, help='Input XML file (required)')
+    parser.add_argument('-i', '--input', required=True, help='Input CSV file (required)')
+    parser.add_argument('-c', '--column', required=True, help='Column name to count (required)')
     parser.add_argument('-o', '--output', default=None, help='Output CSV file (optional, default: stdout)')
-    parser.add_argument('--skip-elements', default='header', help='Comma-separated list of elements to skip (default: header)')
     
     args = parser.parse_args()
     
-    # Parse skip-elements into a list
-    skip_elements = [tag.strip() for tag in args.skip_elements.split(',')]
-    
-    main(args.input, args.output, skip_elements)
+    count_column_values(args.input, args.column, args.output)
