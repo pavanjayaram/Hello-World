@@ -129,8 +129,10 @@ def main(xml_path, output_path=None, skip_elements=None):
         child_tag = strip_namespace(child.tag)
         if child_tag not in skip_elements:
             for row in flatten(child):
-                all_keys.update(row)
-                total_data_rows += 1
+                # Only count rows with actual data
+                if any(str(v).strip() for v in row.values()):
+                    all_keys.update(row)
+                    total_data_rows += 1
     
     if not all_keys:
         print("Warning: No rows to write.", file=sys.stderr)
@@ -178,8 +180,10 @@ def main(xml_path, output_path=None, skip_elements=None):
             child_tag = strip_namespace(child.tag)
             if child_tag not in skip_elements:
                 for row in flatten(child):
-                    writer.writerow(row)
-                    row_count += 1
+                    # Only write row if it has at least one non-empty value
+                    if any(str(v).strip() for v in row.values()):
+                        writer.writerow(row)
+                        row_count += 1
                 
                 # Clear the child element from memory immediately after processing
                 # This prevents memory accumulation for large files
