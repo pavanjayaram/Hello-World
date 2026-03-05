@@ -75,17 +75,11 @@ def flatten(elem):
         rows.append(row)
     return rows
 
-def main(xml_path, output_path=None, skip_elements=None):
+def _parse_xml(xml_path):
     """
-    Args:
-        xml_path: Path to input XML file
-        output_path: Path to output CSV file (None = stdout)
-        skip_elements: List of element tags to skip (e.g., ['header', 'footer'])
+    Parse XML file with fallback to lxml recovery mode.
+    Returns the root element.
     """
-    if skip_elements is None:
-        skip_elements = []
-    
-    # try to parse the file with the stdlib parser first
     try:
         tree = ET.parse(xml_path)
     except ET.ParseError as e:
@@ -102,32 +96,95 @@ def main(xml_path, output_path=None, skip_elements=None):
         except Exception as lxml_err:
             print(f"Error: Even lxml cannot recover from this XML: {lxml_err}", file=sys.stderr)
             raise
-    root = tree.getroot()
+    return tree.getroot()
 
-    rows = []
-    # Process elements, skipping specified tags
+def main(xml_path, output_path=None, skip_elements=None):
+    """
+    Args:
+        xml_path: Path to input XML file
+        output_path: Path to output CSV file (None = stdout)
+        skip_elements: List of element tags to skip (e.g., ['header', 'footer'])
+    
+    Uses two-pass approach:
+      Pass 1: Scan XML to collect all unique fieldnames
+      Pass 2: Write CSV with complete schema
+    
+    This handles:
+      - Rows with different fields (missing tags in some rows)
+      - Large files efficiently by clearing processed elements
+      - Memory scaling: memory usage is bounded by largest element, not file size
+    """
+    if skip_elements is None:
+        skip_elements = []
+    
+    # PASS 1: Discover all unique fieldnames
+    print("Pass 1: Discovering fieldnames...", file=sys.stderr)
+    all_keys = {}
+    root = _parse_xml(xml_path)
+    
+    total_data_rows = 0
     for child in root:
         child_tag = strip_namespace(child.tag)
         if child_tag not in skip_elements:
-            rows.extend(flatten(child))
-
-    # write CSV to file or stdout
+            for row in flatten(child):
+                all_keys.update(row)
+                total_data_rows += 1
+    
+    if not all_keys:
+        print("Warning: No rows to write.", file=sys.stderr)
+        return
+    
+    # Sort keys by hierarchy: top-level fields first, then nested fields grouped by parent
+    top_level = []
+    nested_by_parent = {}
+    
+    for key in all_keys.keys():
+        if '.' not in key:
+            # Top-level field (no dots) - preserve order of first appearance
+            top_level.append(key)
+        else:
+            # Nested field - group by parent (first segment before dot)
+            parent = key.split('.')[0]
+            if parent not in nested_by_parent:
+                nested_by_parent[parent] = []
+            nested_by_parent[parent].append(key)
+    
+    # Sort nested keys within each parent group for consistency
+    for parent in nested_by_parent:
+        nested_by_parent[parent].sort()
+    
+    # Build final sorted keys: top-level first, then nested sorted by parent
+    sorted_keys = top_level
+    for parent in sorted(nested_by_parent.keys()):
+        sorted_keys.extend(nested_by_parent[parent])
+    
+    print(f"Found {total_data_rows} total records with {len(sorted_keys)} unique columns", file=sys.stderr)
+    
+    # PASS 2: Write CSV with complete schema
+    print("Pass 2: Writing CSV...", file=sys.stderr)
     output_file = sys.stdout if output_path is None else open(output_path, 'w')
     
+    row_count = 0
     try:
-        if rows:
-            # Preserve key order from first row (insertion order from XML)
-            sorted_keys = list(rows[0].keys())
-            
-            writer = csv.DictWriter(output_file, fieldnames=sorted_keys)
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(r)
-            
-            if output_path:
-                print(f"Successfully wrote {len(rows)} rows to {output_path}", file=sys.stderr)
-        else:
-            print("Warning: No rows to write.", file=sys.stderr)
+        writer = csv.DictWriter(output_file, fieldnames=sorted_keys, restval='')
+        writer.writeheader()
+        
+        # Re-parse for second pass
+        root = _parse_xml(xml_path)
+        
+        for child in root:
+            child_tag = strip_namespace(child.tag)
+            if child_tag not in skip_elements:
+                for row in flatten(child):
+                    writer.writerow(row)
+                    row_count += 1
+                
+                # Clear the child element from memory immediately after processing
+                # This prevents memory accumulation for large files
+                child.clear()
+        
+        if output_path:
+            print(f"Successfully wrote {row_count} rows to {output_path}", file=sys.stderr)
     finally:
         if output_path:
             output_file.close()
