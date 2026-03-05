@@ -1,30 +1,155 @@
-# Database Connection Credentials
-# Copy this file to .env and update with your actual credentials
+#!/usr/bin/env python3
+"""
+xml2text.py – convert arbitrary XML to “rows” by
+expanding repeating child elements.
 
-# Oracle Database
-ORACLE_HOST=hostname
-ORACLE_PORT=1521
-ORACLE_SERVICE=service_name
-ORACLE_USER=oracle_user
-ORACLE_PASSWORD=oracle_password
+Usage:
+    python3 xml2text.py sample_xml_2.xml > output_2.csv
 
-# PostgreSQL Database
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=postgres
-POSTGRES_USER=Pavn
-POSTGRES_PASSWORD=L%4002
+Note: install lxml if you expect to need recovery:
+    pip install lxml
+"""
+import sys
+import xml.etree.ElementTree as ET
+from itertools import product, chain
+import csv
+import re
+import argparse
 
-# MySQL Database
-MYSQL_HOST=hostname
-MYSQL_PORT=3306
-MYSQL_DB=database
-MYSQL_USER=mysql_user
-MYSQL_PASSWORD=mysql_password
+def strip_namespace(tag):
+    """Remove namespace from tag name. E.g., {http://example.com}tag -> tag"""
+    return re.sub(r'\{.*?\}', '', tag)
 
-# SQL Server Database (optional)
-SQLSERVER_HOST=hostname
-SQLSERVER_PORT=1433
-SQLSERVER_DB=database
-SQLSERVER_USER=sqlserver_user
-SQLSERVER_PASSWORD=sqlserver_password
+def flatten(elem):
+    """
+    Recursively flatten an element.
+    Returns a list of dicts.  Each dict represents one
+    “row” for this subtree.
+    """
+    # collect simple text/int attributes
+    base = {}
+    clean_tag = strip_namespace(elem.tag)
+    if elem.text and elem.text.strip():
+        base[clean_tag] = elem.text.strip()
+    for name, val in elem.attrib.items():
+        base[f"{clean_tag}@{name}"] = val
+
+    # group children by tag so we can detect repeats
+    children_by_tag = {}
+    for child in elem:
+        clean_child_tag = strip_namespace(child.tag)
+        children_by_tag.setdefault(clean_child_tag, []).append(child)
+
+    if not children_by_tag:
+        # leaf node
+        return [base]
+
+    # for each child tag, flatten and then compute cross-product
+    lists_of_rows = []
+    for tag, children in children_by_tag.items():
+        # flatten each child; if there are several with same tag able to produce one row per child.
+        subrows = []
+        for child in children:
+            for r in flatten(child):
+                # prefix keys with tag path to keep hierarchy
+                prefixed = {}
+                for k, v in r.items():
+                    if k == tag:
+                        # Leaf node: avoid obligationname.obligationname tag repitition.
+                        prefixed[tag] = v
+                    else:
+                        # Nested nodes: maintain hierarchy
+                        prefixed[f"{tag}.{k}"] = v
+                subrows.append(prefixed)
+        lists_of_rows.append(subrows)
+
+    # If a tag occurs only once, we still want to merge its dict,
+    # but the product will just be itself.
+    all_combinations = product(*lists_of_rows)
+
+    rows = []
+    for comb in all_combinations:
+        row = dict(base)  # copy parent data
+        for part in comb:
+            row.update(part)
+        rows.append(row)
+    return rows
+
+def main(xml_path, output_path=None, skip_elements=None):
+    """
+    Args:
+        xml_path: Path to input XML file
+        output_path: Path to output CSV file (None = stdout)
+        skip_elements: List of element tags to skip (e.g., ['header', 'footer'])
+    """
+    if skip_elements is None:
+        skip_elements = []
+    
+    # try to parse the file with the stdlib parser first
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError as e:
+        # fallback to lxml with recovery mode, useful for imperfect prod data
+        try:
+            import lxml.etree as LET  # lxml is not stdlib; install if needed
+        except ImportError:
+            print("Error: XML is malformed and lxml is not installed.", file=sys.stderr)
+            print("Install lxml: pip install lxml", file=sys.stderr)
+            raise
+        try:
+            parser = LET.XMLParser(recover=True)
+            tree = LET.parse(xml_path, parser)
+        except Exception as lxml_err:
+            print(f"Error: Even lxml cannot recover from this XML: {lxml_err}", file=sys.stderr)
+            raise
+    root = tree.getroot()
+
+    rows = []
+    # Process elements, skipping specified tags
+    for child in root:
+        child_tag = strip_namespace(child.tag)
+        if child_tag not in skip_elements:
+            rows.extend(flatten(child))
+
+    # write CSV to file or stdout
+    output_file = sys.stdout if output_path is None else open(output_path, 'w')
+    
+    try:
+        if rows:
+            # Preserve key order from first row (insertion order from XML)
+            sorted_keys = list(rows[0].keys())
+            
+            writer = csv.DictWriter(output_file, fieldnames=sorted_keys)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+            
+            if output_path:
+                print(f"Successfully wrote {len(rows)} rows to {output_path}", file=sys.stderr)
+        else:
+            print("Warning: No rows to write.", file=sys.stderr)
+    finally:
+        if output_path:
+            output_file.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert arbitrary XML to CSV by expanding repeating child elements.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 xml2text.py -i input.xml -o output.csv
+  python3 xml2text.py -i input.xml -o output.csv --skip-elements header,footer
+  python3 xml2text.py -i input.xml  # outputs to stdout
+        """
+    )
+    parser.add_argument('-i', '--input', required=True, help='Input XML file (required)')
+    parser.add_argument('-o', '--output', default=None, help='Output CSV file (optional, default: stdout)')
+    parser.add_argument('--skip-elements', default='header', help='Comma-separated list of elements to skip (default: header)')
+    
+    args = parser.parse_args()
+    
+    # Parse skip-elements into a list
+    skip_elements = [tag.strip() for tag in args.skip_elements.split(',')]
+    
+    main(args.input, args.output, skip_elements)
