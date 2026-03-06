@@ -34,19 +34,24 @@ def flatten(elem):
     for name, val in elem.attrib.items():
         base[f"{clean_tag}@{name}"] = val
 
-    # group children by tag so we can detect repeats
+    # group children by tag so we can detect repeats, preserve order
     children_by_tag = {}
+    child_order = []  # Track order of first appearance
     for child in elem:
         clean_child_tag = strip_namespace(child.tag)
-        children_by_tag.setdefault(clean_child_tag, []).append(child)
+        if clean_child_tag not in children_by_tag:
+            children_by_tag[clean_child_tag] = []
+            child_order.append(clean_child_tag)
+        children_by_tag[clean_child_tag].append(child)
 
     if not children_by_tag:
         # leaf node - only return if there's actual data
         return [base] if base else []
 
-    # for each child tag, flatten and then compute cross-product
+    # for each child tag, flatten and then compute cross-product (preserve order)
     lists_of_rows = []
-    for tag, children in children_by_tag.items():
+    for tag in child_order:  # Use child_order instead of children_by_tag.items()
+        children = children_by_tag[tag]
         # flatten each child; if there are several with same tag able to produce one row per child.
         subrows = []
         for child in children:
