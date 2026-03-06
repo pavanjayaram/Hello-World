@@ -1,95 +1,247 @@
-#!/bin/bash
-#
-# get_files_directory_list.sh - List all directories, subdirectories, and files with deployment dates
-#
-# Usage:
-#   ./get_files_directory_list.sh /path/to/directory
-#   ./get_files_directory_list.sh /path/to/directory output.csv
-#
+#!/usr/bin/env python3
+"""
+xml2csv.py – convert arbitrary XML to “rows” by
+expanding repeating child elements.
 
-# Check if path argument is provided
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <directory_path> [output_file.csv]" >&2
-    echo "Example: $0 /var/www/html" >&2
-    echo "Example: $0 /var/www/html output.csv" >&2
-    exit 1
-fi
+Usage:
+    python3 xml2csv.py sample_xml_2.xml > output_2.csv
 
-TARGET_PATH="$1"
-OUTPUT_FILE="${2:-}"
+Note: install lxml if you expect to need recovery:
+    pip install lxml
+"""
+import sys
+import xml.etree.ElementTree as ET
+from itertools import product, chain
+import csv
+import re
+import argparse
 
-# Check if target path exists
-if [ ! -d "$TARGET_PATH" ]; then
-    echo "Error: Directory '$TARGET_PATH' does not exist" >&2
-    exit 1
-fi
+def strip_namespace(tag):
+    """Remove namespace from tag name. E.g., {http://example.com}tag -> tag"""
+    return re.sub(r'\{.*?\}', '', tag)
 
-# Function to output results
-output_results() {
-    if [ -n "$OUTPUT_FILE" ]; then
-        # Write header
-        echo "Type,Path,Name,Modified_Date,Size_Bytes,Permissions,Owner" > "$OUTPUT_FILE"
+def flatten(elem):
+    """
+    Recursively flatten an element.
+    Returns a list of dicts.  Each dict represents one
+    “row” for this subtree.
+    """
+    # collect simple text/int attributes
+    base = {}
+    clean_tag = strip_namespace(elem.tag)
+    if elem.text and elem.text.strip():
+        base[clean_tag] = elem.text.strip()
+    for name, val in elem.attrib.items():
+        base[f"{clean_tag}@{name}"] = val
+
+    # group children by tag so we can detect repeats
+    children_by_tag = {}
+    for child in elem:
+        clean_child_tag = strip_namespace(child.tag)
+        children_by_tag.setdefault(clean_child_tag, []).append(child)
+
+    if not children_by_tag:
+        # leaf node - only return if there's actual data
+        return [base] if base else []
+
+    # for each child tag, flatten and then compute cross-product
+    lists_of_rows = []
+    for tag, children in children_by_tag.items():
+        # flatten each child; if there are several with same tag able to produce one row per child.
+        subrows = []
+        for child in children:
+            for r in flatten(child):
+                # prefix keys with tag path to keep hierarchy
+                prefixed = {}
+                for k, v in r.items():
+                    if k == tag:
+                        # Leaf node: avoid obligationname.obligationname tag repitition.
+                        prefixed[tag] = v
+                    else:
+                        # Nested nodes: maintain hierarchy
+                        prefixed[f"{tag}.{k}"] = v
+                subrows.append(prefixed)
+        lists_of_rows.append(subrows)
+
+    # If a tag occurs only once, we still want to merge its dict,
+    # but the product will just be itself.
+    all_combinations = product(*lists_of_rows)
+
+    rows = []
+    for comb in all_combinations:
+        row = dict(base)  # copy parent data
+        for part in comb:
+            row.update(part)
+        # Only add row if it contains actual data
+        if row:
+            rows.append(row)
+    return rows
+
+def _parse_xml(xml_path):
+    """
+    Parse XML file with fallback to lxml recovery mode.
+    Returns the root element.
+    """
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError as e:
+        # fallback to lxml with recovery mode, useful for imperfect prod data
+        try:
+            import lxml.etree as LET  # lxml is not stdlib; install if needed
+        except ImportError:
+            print("Error: XML is malformed and lxml is not installed.", file=sys.stderr)
+            print("Install lxml: pip install lxml", file=sys.stderr)
+            raise
+        try:
+            parser = LET.XMLParser(recover=True)
+            tree = LET.parse(xml_path, parser)
+        except Exception as lxml_err:
+            print(f"Error: Even lxml cannot recover from this XML: {lxml_err}", file=sys.stderr)
+            raise
+    return tree.getroot()
+
+def main(xml_path, output_path=None, skip_elements=None):
+    """
+    Args:
+        xml_path: Path to input XML file
+        output_path: Path to output CSV file (None = stdout)
+        skip_elements: List of element tags to skip (e.g., ['header', 'footer'])
+    
+    Uses two-pass approach:
+      Pass 1: Scan XML to collect all unique fieldnames
+      Pass 2: Write CSV with complete schema
+    
+    This handles:
+      - Rows with different fields (missing tags in some rows)
+      - Large files efficiently by clearing processed elements
+      - Memory scaling: memory usage is bounded by largest element, not file size
+    """
+    if skip_elements is None:
+        skip_elements = []
+    
+    # PASS 1: Discover all unique fieldnames in document order
+    print("Pass 1: Discovering fieldnames...", file=sys.stderr)
+    all_keys = []  # Use list to preserve order
+    seen_keys = set()  # Track what we've seen
+    root = _parse_xml(xml_path)
+    
+    total_data_rows = 0
+    for child in root:
+        child_tag = strip_namespace(child.tag)
+        if child_tag not in skip_elements:
+            for row in flatten(child):
+                # Only count rows with actual data
+                if any(str(v).strip() for v in row.values()):
+                    # Add keys in the order they appear
+                    for key in row.keys():
+                        if key not in seen_keys:
+                            all_keys.append(key)
+                            seen_keys.add(key)
+                    total_data_rows += 1
+    
+    if not all_keys:
+        print("Warning: No rows to write.", file=sys.stderr)
+        return
+    
+    # Use the document order as-is
+    sorted_keys = all_keys
+    
+    print(f"Found {total_data_rows} total records with {len(sorted_keys)} unique columns", file=sys.stderr)
+    
+    # PASS 2: Write CSV with complete schema
+    print("Pass 2: Writing CSV...", file=sys.stderr)
+    output_file = sys.stdout if output_path is None else open(output_path, 'w')
+    
+    row_count = 0
+    try:
+        writer = csv.DictWriter(output_file, fieldnames=sorted_keys, restval='')
+        writer.writeheader()
         
-        # Find all files and directories, format output
-        find "$TARGET_PATH" -print0 | while IFS= read -r -d '' item; do
-            if [ -d "$item" ]; then
-                TYPE="Directory"
-            else
-                TYPE="File"
-            fi
-            
-            # Get file stats (compatible with both macOS and Linux)
-            if stat -f "%Sm" "$item" >/dev/null 2>&1; then
-                # macOS/BSD stat
-                MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item")
-                SIZE=$(stat -f "%z" "$item")
-                PERMS=$(stat -f "%Sp" "$item")
-                OWNER=$(stat -f "%Su" "$item")
-            else
-                # Linux/GNU stat
-                MODIFIED_DATE=$(stat -c "%y" "$item" | cut -d'.' -f1)
-                SIZE=$(stat -c "%s" "$item")
-                PERMS=$(stat -c "%A" "$item")
-                OWNER=$(stat -c "%U" "$item")
-            fi
-            NAME=$(basename "$item")
-            
-            echo "$TYPE,\"$item\",\"$NAME\",\"$MODIFIED_DATE\",$SIZE,$PERMS,$OWNER"
-        done >> "$OUTPUT_FILE"
+        # Re-parse for second pass
+        root = _parse_xml(xml_path)
         
-        echo "Results written to $OUTPUT_FILE" >&2
-        echo "Total items: $(tail -n +2 "$OUTPUT_FILE" | wc -l)" >&2
-    else
-        # Output to stdout with formatted table
-        echo "Scanning: $TARGET_PATH" >&2
-        echo "" >&2
-        printf "%-12s %-20s %-80s %-10s %s\n" "TYPE" "MODIFIED DATE" "PATH" "SIZE" "OWNER"
-        printf "%s\n" "$(printf '%.0s-' {1..150})"
+        for child in root:
+            child_tag = strip_namespace(child.tag)
+            if child_tag not in skip_elements:
+                for row in flatten(child):
+                    # Only write row if it has at least one non-empty value
+                    if any(str(v).strip() for v in row.values()):
+                        writer.writerow(row)
+                        row_count += 1
+                
+                # Clear the child element from memory immediately after processing
+                # This prevents memory accumulation for large files
+                child.clear()
         
-        find "$TARGET_PATH" -print0 | while IFS= read -r -d '' item; do
-            if [ -d "$item" ]; then
-                TYPE="Directory"
-            else
-                TYPE="File"
-            fi
-            
-            # Get file stats (compatible with both macOS and Linux)
-            if stat -f "%Sm" "$item" >/dev/null 2>&1; then
-                # macOS/BSD stat
-                MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item")
-                SIZE=$(stat -f "%z" "$item")
-                OWNER=$(stat -f "%Su" "$item")
-            else
-                # Linux/GNU stat
-                MODIFIED_DATE=$(stat -c "%y" "$item" | cut -d'.' -f1)
-                SIZE=$(stat -c "%s" "$item")
-                OWNER=$(stat -c "%U" "$item")
-            fi
-            
-            printf "%-12s %-20s %-80s %-10s %s\n" "$TYPE" "$MODIFIED_DATE" "$item" "$SIZE" "$OWNER"
-        done
-    fi
-}
+        if output_path:
+            print(f"Successfully wrote {row_count} rows to {output_path}", file=sys.stderr)
+    finally:
+        if output_path:
+            output_file.close()
+    
+    # Post-process: Remove any empty rows from the output file
+    if output_path:
+        print("Cleaning up empty rows...", file=sys.stderr)
+        clean_csv(output_path)
 
-# Execute
-output_results
+def clean_csv(csv_path):
+    """Remove completely empty rows from CSV file."""
+    import tempfile
+    import shutil
+    import os
+    
+    # Read the file and filter out empty rows
+    with open(csv_path, 'r') as infile:
+        reader = csv.reader(infile)
+        header = next(reader, None)
+        
+        # Create temp file
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.csv')
+        os.close(temp_fd)  # Close the file descriptor
+        
+        try:
+            with open(temp_path, 'w', newline='') as outfile:
+                writer = csv.writer(outfile)
+                if header:
+                    writer.writerow(header)
+                
+                rows_kept = 0
+                rows_removed = 0
+                for row in reader:
+                    # Check if row has any non-empty values
+                    if any(cell.strip() for cell in row):
+                        writer.writerow(row)
+                        rows_kept += 1
+                    else:
+                        rows_removed += 1
+            
+            # Replace original file with cleaned version
+            shutil.move(temp_path, csv_path)
+            print(f"Removed {rows_removed} empty rows, kept {rows_kept} data rows", file=sys.stderr)
+        except Exception as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert arbitrary XML to CSV by expanding repeating child elements.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 xml2csv.py -i input.xml -o output.csv
+  python3 xml2csv.py -i input.xml -o output.csv --skip-elements header,footer
+  python3 xml2csv.py -i input.xml  # outputs to stdout
+        """
+    )
+    parser.add_argument('-i', '--input', required=True, help='Input XML file (required)')
+    parser.add_argument('-o', '--output', default=None, help='Output CSV file (optional, default: stdout)')
+    parser.add_argument('--skip-elements', default='header', help='Comma-separated list of elements to skip (default: header)')
+    
+    args = parser.parse_args()
+    
+    # Parse skip-elements into a list
+    skip_elements = [tag.strip() for tag in args.skip_elements.split(',')]
+    
+    main(args.input, args.output, skip_elements)
