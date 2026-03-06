@@ -38,11 +38,20 @@ output_results() {
                 TYPE="File"
             fi
             
-            # Get file stats
-            MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item" 2>/dev/null || stat -c "%y" "$item" 2>/dev/null | cut -d'.' -f1)
-            SIZE=$(stat -f "%z" "$item" 2>/dev/null || stat -c "%s" "$item" 2>/dev/null)
-            PERMS=$(stat -f "%Sp" "$item" 2>/dev/null || stat -c "%A" "$item" 2>/dev/null)
-            OWNER=$(stat -f "%Su" "$item" 2>/dev/null || stat -c "%U" "$item" 2>/dev/null)
+            # Get file stats (compatible with both macOS and Linux)
+            if stat -f "%Sm" "$item" >/dev/null 2>&1; then
+                # macOS/BSD stat
+                MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item")
+                SIZE=$(stat -f "%z" "$item")
+                PERMS=$(stat -f "%Sp" "$item")
+                OWNER=$(stat -f "%Su" "$item")
+            else
+                # Linux/GNU stat
+                MODIFIED_DATE=$(stat -c "%y" "$item" | cut -d'.' -f1)
+                SIZE=$(stat -c "%s" "$item")
+                PERMS=$(stat -c "%A" "$item")
+                OWNER=$(stat -c "%U" "$item")
+            fi
             NAME=$(basename "$item")
             
             echo "$TYPE,\"$item\",\"$NAME\",\"$MODIFIED_DATE\",$SIZE,$PERMS,$OWNER"
@@ -64,9 +73,18 @@ output_results() {
                 TYPE="File"
             fi
             
-            MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item" 2>/dev/null || stat -c "%y" "$item" 2>/dev/null | cut -d'.' -f1)
-            SIZE=$(stat -f "%z" "$item" 2>/dev/null || stat -c "%s" "$item" 2>/dev/null)
-            OWNER=$(stat -f "%Su" "$item" 2>/dev/null || stat -c "%U" "$item" 2>/dev/null)
+            # Get file stats (compatible with both macOS and Linux)
+            if stat -f "%Sm" "$item" >/dev/null 2>&1; then
+                # macOS/BSD stat
+                MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item")
+                SIZE=$(stat -f "%z" "$item")
+                OWNER=$(stat -f "%Su" "$item")
+            else
+                # Linux/GNU stat
+                MODIFIED_DATE=$(stat -c "%y" "$item" | cut -d'.' -f1)
+                SIZE=$(stat -c "%s" "$item")
+                OWNER=$(stat -c "%U" "$item")
+            fi
             
             printf "%-12s %-20s %-80s %-10s %s\n" "$TYPE" "$MODIFIED_DATE" "$item" "$SIZE" "$OWNER"
         done
