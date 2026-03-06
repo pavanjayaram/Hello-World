@@ -1,83 +1,77 @@
-#!/usr/bin/env python3
-"""
-get_count_csv.py - Count occurrences of values in a CSV column
+#!/bin/bash
+#
+# get_files_directory_list.sh - List all directories, subdirectories, and files with deployment dates
+#
+# Usage:
+#   ./get_files_directory_list.sh /path/to/directory
+#   ./get_files_directory_list.sh /path/to/directory output.csv
+#
 
-Usage:
-    python3 get_count_csv.py -i input.csv -c column_name
-    python3 get_count_csv.py -i input.csv -c column_name -o output.csv
-"""
-import csv
-import argparse
-from collections import Counter
-import sys
+# Check if path argument is provided
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <directory_path> [output_file.csv]" >&2
+    echo "Example: $0 /var/www/html" >&2
+    echo "Example: $0 /var/www/html output.csv" >&2
+    exit 1
+fi
 
-def count_column_values(input_file, column_name, output_file=None):
-    """
-    Count occurrences of values in a specified column.
-    
-    Args:
-        input_file: Path to input CSV file
-        column_name: Name of the column to count
-        output_file: Optional path to output CSV file (None = stdout)
-    """
-    try:
-        with open(input_file, 'r') as f:
-            reader = csv.DictReader(f)
-            
-            # Check if column exists
-            if column_name not in reader.fieldnames:
-                print(f"Error: Column '{column_name}' not found in CSV", file=sys.stderr)
-                print(f"Available columns: {', '.join(reader.fieldnames)}", file=sys.stderr)
-                return
-            
-            # Count values in the specified column
-            counter = Counter()
-            total_rows = 0
-            
-            for row in reader:
-                value = row[column_name].strip()
-                if value:  # Only count non-empty values
-                    counter[value] += 1
-                total_rows += 1
-            
-            # Sort by count (descending) then by value (ascending)
-            sorted_counts = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
-            
-            # Output results
-            if output_file:
-                with open(output_file, 'w', newline='') as out:
-                    writer = csv.writer(out)
-                    writer.writerow([column_name, 'Count'])
-                    writer.writerows(sorted_counts)
-                print(f"Results written to {output_file}", file=sys.stderr)
-            else:
-                print(f"\nColumn: {column_name}")
-                print(f"Total rows: {total_rows}")
-                print(f"Unique values: {len(counter)}")
-                print(f"\n{'Value':<40} {'Count':>10}")
-                print("-" * 52)
-                for value, count in sorted_counts:
-                    print(f"{value:<40} {count:>10}")
-    
-    except FileNotFoundError:
-        print(f"Error: File '{input_file}' not found", file=sys.stderr)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+TARGET_PATH="$1"
+OUTPUT_FILE="${2:-}"
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Count occurrences of values in a CSV column",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 get_count_csv.py -i data.csv -c status
-  python3 get_count_csv.py -i data.csv -c type -o counts.csv
-        """
-    )
-    parser.add_argument('-i', '--input', required=True, help='Input CSV file (required)')
-    parser.add_argument('-c', '--column', required=True, help='Column name to count (required)')
-    parser.add_argument('-o', '--output', default=None, help='Output CSV file (optional, default: stdout)')
-    
-    args = parser.parse_args()
-    
-    count_column_values(args.input, args.column, args.output)
+# Check if target path exists
+if [ ! -d "$TARGET_PATH" ]; then
+    echo "Error: Directory '$TARGET_PATH' does not exist" >&2
+    exit 1
+fi
+
+# Function to output results
+output_results() {
+    if [ -n "$OUTPUT_FILE" ]; then
+        # Write header
+        echo "Type,Path,Name,Modified_Date,Size_Bytes,Permissions,Owner" > "$OUTPUT_FILE"
+        
+        # Find all files and directories, format output
+        find "$TARGET_PATH" -print0 | while IFS= read -r -d '' item; do
+            if [ -d "$item" ]; then
+                TYPE="Directory"
+            else
+                TYPE="File"
+            fi
+            
+            # Get file stats
+            MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item" 2>/dev/null || stat -c "%y" "$item" 2>/dev/null | cut -d'.' -f1)
+            SIZE=$(stat -f "%z" "$item" 2>/dev/null || stat -c "%s" "$item" 2>/dev/null)
+            PERMS=$(stat -f "%Sp" "$item" 2>/dev/null || stat -c "%A" "$item" 2>/dev/null)
+            OWNER=$(stat -f "%Su" "$item" 2>/dev/null || stat -c "%U" "$item" 2>/dev/null)
+            NAME=$(basename "$item")
+            
+            echo "$TYPE,\"$item\",\"$NAME\",\"$MODIFIED_DATE\",$SIZE,$PERMS,$OWNER"
+        done >> "$OUTPUT_FILE"
+        
+        echo "Results written to $OUTPUT_FILE" >&2
+        echo "Total items: $(tail -n +2 "$OUTPUT_FILE" | wc -l)" >&2
+    else
+        # Output to stdout with formatted table
+        echo "Scanning: $TARGET_PATH" >&2
+        echo "" >&2
+        printf "%-12s %-20s %-80s %-10s %s\n" "TYPE" "MODIFIED DATE" "PATH" "SIZE" "OWNER"
+        printf "%s\n" "$(printf '%.0s-' {1..150})"
+        
+        find "$TARGET_PATH" -print0 | while IFS= read -r -d '' item; do
+            if [ -d "$item" ]; then
+                TYPE="Directory"
+            else
+                TYPE="File"
+            fi
+            
+            MODIFIED_DATE=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$item" 2>/dev/null || stat -c "%y" "$item" 2>/dev/null | cut -d'.' -f1)
+            SIZE=$(stat -f "%z" "$item" 2>/dev/null || stat -c "%s" "$item" 2>/dev/null)
+            OWNER=$(stat -f "%Su" "$item" 2>/dev/null || stat -c "%U" "$item" 2>/dev/null)
+            
+            printf "%-12s %-20s %-80s %-10s %s\n" "$TYPE" "$MODIFIED_DATE" "$item" "$SIZE" "$OWNER"
+        done
+    fi
+}
+
+# Execute
+output_results
