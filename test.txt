@@ -22,6 +22,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# ---------------------------------------------------------------------------
+# Base directory for all engine-managed paths (audit, reject, etc.).
+# Derived from this file's location so it never depends on spark-submit's cwd.
+# On all OSes: backend/core/../  ==  backend/
+# ---------------------------------------------------------------------------
+ETL_BASE_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 # Global debug buffer to ensure logs are visible in truncated API output
 CDC_DEBUG_LOGS = []
 def log_cdc(msg):
@@ -1550,19 +1557,21 @@ class ETLEngine:
     
     def __init__(self, config_path: str):
         import os as _os
-        # Store config directory so relative paths (./audit, ./reject) resolve
-        # next to the config file, not against spark-submit's working directory
-        # (which on Windows is often C:\ — a protected system folder).
+        # Store config directory for resolving source/target file paths
         self.config_dir = _os.path.dirname(_os.path.abspath(config_path))
 
         self.config = ETLConfig(config_path)
         self.spark = self._create_spark_session()
         self.audit = AuditMetrics()
 
-        # Resolve reject path relative to the config file's directory
+        # Resolve reject path: use ETL_BASE_DIR so relative paths like ./reject
+        # always land in backend/reject — never in spark-submit's cwd (C:\ on Windows).
         reject_cfg = dict(self.config.get('reject', {}))
-        if reject_cfg.get('path') and not _os.path.isabs(reject_cfg['path']):
-            reject_cfg['path'] = _os.path.join(self.config_dir, reject_cfg['path'])
+        raw_reject_path = reject_cfg.get('path', './reject')
+        if not _os.path.isabs(raw_reject_path):
+            # Strip leading ./ or .\ before joining
+            raw_reject_path = raw_reject_path.lstrip('./').lstrip('.\\')
+            reject_cfg['path'] = _os.path.join(ETL_BASE_DIR, raw_reject_path)
         self.reject_handler = RejectHandler(reject_cfg)
         
         # Error handling configuration
@@ -1840,18 +1849,23 @@ class ETLEngine:
 
     
     def _write_audit_metrics(self):
-        """Write audit metrics"""
+        """Write audit metrics to backend/audit/<pipeline_id>.csv"""
         import os
         metrics = self.audit.get_metrics()
         logging.info(f"Audit Metrics: {metrics}")
 
-        # Resolve audit path relative to config file directory (not spark-submit cwd)
-        audit_path = self.config.get('audit', {}).get('path', './audit')
-        if not os.path.isabs(audit_path):
-            audit_path = os.path.join(self.config_dir, audit_path)
-        abs_audit_path = os.path.abspath(audit_path)
+        # Resolve audit path against ETL_BASE_DIR (backend/) so relative paths
+        # like ./audit always write to backend/audit, never to C:\audit on Windows.
+        raw_audit_path = self.config.get('audit', {}).get('path', './audit')
+        if os.path.isabs(raw_audit_path):
+            abs_audit_path = raw_audit_path
+        else:
+            clean = raw_audit_path.lstrip('./').lstrip('.\\')
+            abs_audit_path = os.path.join(ETL_BASE_DIR, clean)
+
         os.makedirs(abs_audit_path, exist_ok=True)
         audit_file = os.path.join(abs_audit_path, f"{metrics.get('pipeline_id', 'audit')}.csv")
+        logging.info(f"Writing audit metrics to: {audit_file}")
         try:
             import pandas as pd
             audit_df = pd.DataFrame([metrics])
