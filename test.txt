@@ -60,6 +60,10 @@ def _parse_oracle_connection(cs: str):
     if not normalised.startswith('oracle://'):
         normalised = 'oracle://' + normalised.lstrip('/')
 
+    # oracle://user:pass@//host:port/SERVICE  →  oracle://user:pass@host:port/SERVICE
+    # The double-slash after @ is valid Oracle syntax but breaks urlparse
+    normalised = normalised.replace('@//', '@')
+
     parsed = urlparse(normalised)
     uname = unquote(parsed.username or '')
     pwd   = unquote(parsed.password or '')
