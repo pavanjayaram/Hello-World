@@ -1508,16 +1508,36 @@ class RejectHandler:
 
         logging.info(f"Writing {count} rejected rows to {self.path}")
 
-        # Convert path to a forward-slash URI so PySpark/Hadoop works on Windows
+        # Use pandas to write rejects as CSV — avoids PySpark's Hadoop file writer
+        # which requires winutils.exe on Windows ("o104.parquet" / FileFormatWriter errors).
         import os
         abs_reject_path = os.path.abspath(self.path)
-        fwd = abs_reject_path.replace("\\", "/")
-        if len(fwd) > 1 and fwd[1] == ':':   # Windows drive letter (e.g. C:/...)
-            spark_reject_path = "file:///" + fwd
-        else:
-            spark_reject_path = fwd
+        # Ensure we write to a .csv file (replace .parquet extension if present)
+        if abs_reject_path.endswith('.parquet'):
+            abs_reject_path = abs_reject_path[:-8] + '.csv'
+        # If path has no extension, add .csv
+        elif '.' not in os.path.basename(abs_reject_path):
+            abs_reject_path = abs_reject_path + '.csv'
 
-        df.write.mode('append').parquet(spark_reject_path)
+        reject_dir = os.path.dirname(abs_reject_path)
+        if reject_dir:
+            os.makedirs(reject_dir, exist_ok=True)
+
+        try:
+            import pandas as pd
+            pdf = df.toPandas()
+            # Append mode: write header only if file does not exist yet
+            file_exists = os.path.exists(abs_reject_path)
+            pdf.to_csv(abs_reject_path, index=False,
+                       mode='a' if file_exists else 'w',
+                       header=not file_exists)
+            logging.info(f"Successfully wrote {count} rejected rows to {abs_reject_path}")
+        except ImportError:
+            logging.error("pandas not installed — cannot write rejects. Run: pip install pandas")
+            raise
+        except Exception as e:
+            logging.error(f"Failed to write reject rows: {e}")
+            raise
 
     
     def get_reject_count(self) -> int:
@@ -1795,10 +1815,24 @@ class ETLEngine:
         metrics = self.audit.get_metrics()
         logging.info(f"Audit Metrics: {metrics}")
         
-        # Convert to DataFrame and write
-        metrics_df = self.spark.createDataFrame([metrics])
-        audit_path = self.config.get('audit', {}).get('path', '/data/audit')
-        metrics_df.write.mode('append').parquet(audit_path)
+        # Use pandas to write audit metrics — avoids Hadoop/winutils requirement on Windows
+
+        import os, json
+        audit_path = self.config.get('audit', {}).get('path', './audit')
+        abs_audit_path = os.path.abspath(audit_path)
+        os.makedirs(abs_audit_path, exist_ok=True)
+        audit_file = os.path.join(abs_audit_path, f"{metrics.get('pipeline_id', 'audit')}.csv")
+        try:
+            import pandas as pd
+            audit_df = pd.DataFrame([metrics])
+            file_exists = os.path.exists(audit_file)
+            audit_df.to_csv(audit_file, index=False,
+                            mode='a' if file_exists else 'w',
+                            header=not file_exists)
+            logging.info(f"Audit metrics written to {audit_file}")
+        except Exception as e:
+            logging.warning(f"Could not write audit metrics to CSV: {e}")
+
 
 
 def main():
