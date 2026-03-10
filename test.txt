@@ -176,12 +176,20 @@ class DBSourceHandler(SourceHandler):
         Supports formats like: postgresql://user:password@host:port/database
         """
         import re
-        from urllib.parse import urlparse, parse_qs
-        
+        from urllib.parse import urlparse, parse_qs, unquote
+
         # Remove jdbc: prefix if present (to help urlparse)
         if conn_str.startswith("jdbc:"):
             conn_str = conn_str[5:]
-            
+
+        # Normalise oracle+cx_oracle:// -> oracle://
+        conn_str = re.sub(r'^oracle\+[a-z_]+://', 'oracle://', conn_str)
+
+        # oracle://user:pass@//host:port/SERVICE  ->  oracle://user:pass@host:port/SERVICE
+        # The double-slash after @ is valid Oracle syntax but breaks urlparse,
+        # causing hostname=None and the rest landing in path.
+        conn_str = conn_str.replace('@//', '@')
+
         # Parse the connection string
         parsed = urlparse(conn_str)
         
@@ -1362,11 +1370,18 @@ class DBTargetHandler(TargetHandler):
         """
         import re
         from urllib.parse import urlparse, parse_qs, unquote
-        
+
         # Remove jdbc: prefix if present
         if conn_str.startswith("jdbc:"):
             conn_str = conn_str[5:]
-            
+
+        # Normalise oracle+cx_oracle:// -> oracle://
+        conn_str = re.sub(r'^oracle\+[a-z_]+://', 'oracle://', conn_str)
+
+        # oracle://user:pass@//host:port/SERVICE  ->  oracle://user:pass@host:port/SERVICE
+        # The double-slash after @ is valid Oracle syntax but breaks urlparse.
+        conn_str = conn_str.replace('@//', '@')
+
         # Parse the connection string
         parsed = urlparse(conn_str)
 
@@ -1856,15 +1871,11 @@ class ETLEngine:
 
         # Resolve audit path against ETL_BASE_DIR (backend/) so relative paths
         # like ./audit always write to backend/audit, never to C:\audit on Windows.
-        raw_audit_path = self.config.get('audit', {}).get('path', './audit')
-        if os.path.isabs(raw_audit_path):
-            abs_audit_path = raw_audit_path
-        else:
-            clean = raw_audit_path.lstrip('./').lstrip('.\\')
-            abs_audit_path = os.path.join(ETL_BASE_DIR, clean)
-
-        os.makedirs(abs_audit_path, exist_ok=True)
-        audit_file = os.path.join(abs_audit_path, f"{metrics.get('pipeline_id', 'audit')}.csv")
+        # Get paths
+        backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        audit_dir = os.path.join(backend_dir, 'audit')
+        os.makedirs(audit_dir, exist_ok=True)
+        audit_file = os.path.join(audit_dir, f"{metrics.get('pipeline_id', 'audit')}.csv")
         logging.info(f"Writing audit metrics to: {audit_file}")
         try:
             import pandas as pd
