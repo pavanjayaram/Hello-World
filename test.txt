@@ -1,1173 +1,1819 @@
 """
-JSON Generator API
-Connects frontend UI to backend ETL engine by generating pipeline JSON configurations
+Config-Driven PySpark ETL Engine
+A generic, reusable ETL runtime that executes pipelines based on JSON configuration.
+Supports: FILE→FILE, FILE→DB, DB→DB, DB→FILE
 """
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from typing import Dict, List, Any
-import json
-import os
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType
+from abc import ABC, abstractmethod
+from typing import Dict, List, Any, Optional
 from datetime import datetime
+import json
+import logging
+import sys
+import time
+import time
+import os
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend communication
 
-# Configuration paths
-CONFIG_DIR = os.path.join(os.path.dirname(__file__), 'config')
-os.makedirs(CONFIG_DIR, exist_ok=True)
-
-
-def _parse_oracle_connection(cs: str):
-    """Parse Oracle connection string into (username, password, host, port, service_name).
-    Handles formats:
-      - oracle://user:pass@host:1521/SERVICE
-      - oracle+cx_oracle://user:pass@host:1521/SERVICE
-      - jdbc:oracle:thin:user/pass@host:1521:SID
-      - jdbc:oracle:thin:@//host:1521/SERVICE
-      - jdbc:oracle:thin:@host:1521:SID
-    """
-    import re
-    from urllib.parse import urlparse, unquote
-
-    if cs.startswith('jdbc:oracle:thin:'):
-        after = cs[len('jdbc:oracle:thin:'):]
-        m = re.match(r'^([^@/]+)/([^@]+)@(.+)$', after)
-        if m:
-            uname, pwd, rest = m.group(1), m.group(2), m.group(3)
-        else:
-            uname, pwd = '', ''
-            rest = after.lstrip('@')
-
-        if rest.startswith('//'):
-            inner = rest[2:]
-            host_port, _, svc = inner.partition('/')
-            host, _, port_str = host_port.partition(':')
-            port = int(port_str) if port_str.isdigit() else 1521
-        else:
-            parts = rest.split(':')
-            host = parts[0] if len(parts) > 0 else 'localhost'
-            port = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1521
-            svc = parts[2] if len(parts) > 2 else ''
-
-        return uname, pwd, host, port, svc
-
-    normalised = re.sub(r'^oracle\+[a-z_]+://', 'oracle://', cs)
-    if not normalised.startswith('oracle://'):
-        normalised = 'oracle://' + normalised.lstrip('/')
-
-    # oracle://user:pass@//host:port/SERVICE  →  oracle://user:pass@host:port/SERVICE
-    # The double-slash after @ is valid Oracle syntax but breaks urlparse
-    normalised = normalised.replace('@//', '@')
-
-    parsed = urlparse(normalised)
-    uname = unquote(parsed.username or '')
-    pwd   = unquote(parsed.password or '')
-    host  = parsed.hostname or 'localhost'
-    port  = parsed.port or 1521
-    svc   = parsed.path.lstrip('/') if parsed.path else ''
-    return uname, pwd, host, port, svc
+# Global debug buffer to ensure logs are visible in truncated API output
+CDC_DEBUG_LOGS = []
+def log_cdc(msg):
+    """Log to global buffer and stderr"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    CDC_DEBUG_LOGS.append(formatted_msg)
+    # Also print to stdout for immediate feedback in local runs
+    print(f"CDC_LIVE: {formatted_msg}")
 
 
-class PipelineConfigGenerator:
-    """Generates ETL pipeline JSON configurations from frontend requests"""
+class ETLConfig:
+    """Configuration parser and validator"""
     
-    @staticmethod
-    def generate_pipeline_config(data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Generate complete pipeline configuration from frontend data
-        
-        Args:
-            data: Frontend form data containing pipeline details
-            
-        Returns:
-            Complete pipeline JSON configuration
-        """
-        config = {
-            "pipeline": PipelineConfigGenerator._build_pipeline_section(data),
-            "source": PipelineConfigGenerator._build_source_section(data.get('source', {})),
-            "transformations": PipelineConfigGenerator._build_transformations(data.get('transformations', [])),
-            "target": PipelineConfigGenerator._build_target_section(data.get('target', {})),
-            "audit": PipelineConfigGenerator._build_audit_section(data.get('audit', {})),
-            "reject": PipelineConfigGenerator._build_reject_section(data.get('reject', {}))
-        }
-        
-        return config
+    def __init__(self, config_path: str):
+        self.config = self._load_config(config_path)
+        self._validate_config()
     
-    @staticmethod
-    def _build_pipeline_section(data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build pipeline metadata section"""
-        pipeline_data = data.get('pipeline', {})
-        return {
-            "pipeline_id": pipeline_data.get('pipeline_id', f"PIPELINE_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
-            "pipeline_type": pipeline_data.get('pipeline_type', 'FILE_TO_FILE'),
-            "execution_mode": pipeline_data.get('execution_mode', 'BATCH'),
-            "run_date": pipeline_data.get('run_date', datetime.now().strftime('%Y-%m-%d')),
-            "version": pipeline_data.get('version', '1.0'),
-            "log_level": pipeline_data.get('log_level', 'INFO')
-        }
+    def _load_config(self, path: str) -> Dict:
+        """Load JSON configuration"""
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            raise ValueError(f"Failed to load config: {str(e)}")
     
-    @staticmethod
-    def _build_source_section(source_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build source configuration section"""
-        source_type = source_data.get('type', 'FILE')
-        
-        if source_type == 'FILE':
-            return {
-                "type": "FILE",
-                "format": source_data.get('format', 'csv'),
-                "path": source_data.get('path', ''),
-                "options": source_data.get('options', {})
-            }
-        else:  # DB
-            return {
-                "type": "DB",
-                "db_type": source_data.get('db_type', 'postgres'),
-                "table": source_data.get('table', ''),
-                "connection": source_data.get('connection', 'pg_conn')
-            }
-    
-    @staticmethod
-    def _build_transformations(transformations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Build transformations array"""
-        result = []
-        
-        for transform in transformations:
-            transform_type = transform.get('type')
-            
-            if transform_type == 'column':
-                result.append({
-                    "type": "column",
-                    "action": transform.get('action'),
-                    "column": transform.get('column'),
-                    **{k: v for k, v in transform.items() 
-                       if k not in ['type', 'action', 'column'] and v is not None}
-                })
-            
-            elif transform_type == 'row':
-                result.append({
-                    "type": "row",
-                    "action": transform.get('action'),
-                    **{k: v for k, v in transform.items() 
-                       if k not in ['type', 'action'] and v is not None}
-                })
-            
-            elif transform_type == 'lookup':
-                lookup_config = {
-                    "type": "lookup",
-                    "lookup_table": transform.get('lookup_table'),
-                    "source_type": transform.get('source_type', 'FILE'),
-                    "path": transform.get('path'),
-                    "join_keys": transform.get('join_keys', {}),
-                    "join_type": transform.get('join_type', 'left'),
-                    "columns": transform.get('columns', []),
-                    "on_missing": transform.get('on_missing', 'default'),
-                    "broadcast": transform.get('broadcast', False)
-                }
-                
-                # Add conditional fields based on source type
-                if transform.get('source_type') == 'DB':
-                    lookup_config['db_type'] = transform.get('db_type')
-                    # Map frontend 'connection_string' to backend 'connectionString' if needed, 
-                    # or keep consistent. Backend uses 'connectionString' in ad-hoc loading.
-                    lookup_config['connection_string'] = transform.get('connection_string')
-                else:
-                    lookup_config['file_format'] = transform.get('file_format', 'csv')
-                    
-                result.append(lookup_config)
-            
-            elif transform_type == 'cdc':
-                result.append({
-                    "type": "cdc",
-                    "mode": transform.get('mode', 'SCD_TYPE_2'),
-                    "business_keys": transform.get('business_keys', []),
-                    "compare_columns": transform.get('compare_columns', 'ALL'),
-                    "effective_start": transform.get('effective_start', 'eff_start_dt'),
-                    "effective_end": transform.get('effective_end', 'eff_end_dt'),
-                    "current_flag": transform.get('current_flag', 'is_current'),
-                    "operation_flag": transform.get('operation_flag', 'op_type')
-                })
-        
-        return result
-    
-    @staticmethod
-    def _build_target_section(target_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build target configuration section"""
-        target_type = target_data.get('type', 'FILE')
-        
-        if target_type == 'FILE':
-            config = {
-                "type": "FILE",
-                "format": target_data.get('format', 'parquet'),
-                "path": target_data.get('path', ''),
-                "mode": target_data.get('mode', 'overwrite')
-            }
-            
-            if target_data.get('partition_by'):
-                config['partition_by'] = target_data['partition_by']
-            
-            if target_data.get('options'):
-                config['options'] = target_data['options']
-            
-            return config
-        else:  # DB
-            return {
-                "type": "DB",
-                "db_type": target_data.get('db_type', 'postgres'),
-                "table": target_data.get('table', ''),
-                "connection": target_data.get('connection', 'pg_conn'),
-                "mode": target_data.get('mode', 'append')
-            }
-    
-    @staticmethod
-    def _build_audit_section(audit_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build audit configuration section"""
-        return {
-            "enable": audit_data.get('enable', True),
-            "capture_row_count": audit_data.get('capture_row_count', True),
-            "capture_duration": audit_data.get('capture_duration', True),
-            "path": audit_data.get('path', '/data/audit')
-        }
-    
-    @staticmethod
-    def _build_reject_section(reject_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build reject handling configuration section"""
-        return {
-            "enable": reject_data.get('enable', True),
-            "path": reject_data.get('path', '/data/reject'),
-            "include_reason": reject_data.get('include_reason', True)
-        }
-
-
-# API Endpoints
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "healthy",
-        "service": "JSON Generator API",
-        "version": "1.0"
-    })
-
-
-@app.route('/api/generate-config', methods=['POST'])
-def generate_config():
-    """
-    Generate pipeline JSON configuration from frontend data
-    
-    Request body: Pipeline configuration data from frontend
-    Response: Generated JSON configuration
-    """
-    try:
-        data = request.json
-        
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
-        
-        # Generate configuration
-        config = PipelineConfigGenerator.generate_pipeline_config(data)
-        
-        return jsonify({
-            "success": True,
-            "config": config
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route('/api/save-config', methods=['POST'])
-def save_config():
-    """
-    Save generated configuration to file
-    
-    Request body: {
-        "config": {...},
-        "filename": "pipeline_name.json"
-    }
-    """
-    try:
-        data = request.json
-        config = data.get('config')
-        filename = data.get('filename', f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-        
-        if not config:
-            return jsonify({"error": "No configuration provided"}), 400
-        
-        # Ensure filename ends with .json
-        if not filename.endswith('.json'):
-            filename += '.json'
-        
-        # Save to config directory
-        filepath = os.path.join(CONFIG_DIR, filename)
-        with open(filepath, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        return jsonify({
-            "success": True,
-            "message": f"Configuration saved to {filename}",
-            "filepath": filepath
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route('/api/list-configs', methods=['GET'])
-def list_configs():
-    """List all saved pipeline configurations"""
-    try:
-        configs = []
-        
-        if os.path.exists(CONFIG_DIR):
-            for filename in os.listdir(CONFIG_DIR):
-                if filename.endswith('.json'):
-                    filepath = os.path.join(CONFIG_DIR, filename)
-                    with open(filepath, 'r') as f:
-                        config = json.load(f)
-                    
-                    configs.append({
-                        "filename": filename,
-                        "pipeline_id": config.get('pipeline', {}).get('pipeline_id'),
-                        "pipeline_type": config.get('pipeline', {}).get('pipeline_type'),
-                        "created": datetime.fromtimestamp(os.path.getctime(filepath)).isoformat()
-                    })
-        
-        return jsonify({
-            "success": True,
-            "configs": configs
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route('/api/get-config/<filename>', methods=['GET'])
-def get_config(filename):
-    """Get a specific configuration by filename"""
-    try:
-        filepath = os.path.join(CONFIG_DIR, filename)
-        
-        if not os.path.exists(filepath):
-            return jsonify({"error": "Configuration not found"}), 404
-        
-        with open(filepath, 'r') as f:
-            config = json.load(f)
-        
-        return jsonify({
-            "success": True,
-            "config": config
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route('/api/delete-config/<filename>', methods=['DELETE'])
-def delete_config(filename):
-    """Delete a configuration file"""
-    try:
-        filepath = os.path.join(CONFIG_DIR, filename)
-        
-        if not os.path.exists(filepath):
-            return jsonify({"error": "Configuration not found"}), 404
-        
-        os.remove(filepath)
-        
-        return jsonify({
-            "success": True,
-            "message": f"Configuration {filename} deleted"
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route('/api/validate-config', methods=['POST'])
-def validate_config():
-    """Validate a pipeline configuration"""
-    try:
-        config = request.json
-        
-        if not config:
-            return jsonify({"error": "No configuration provided"}), 400
-        
-        # Basic validation
-        required_sections = ['pipeline', 'source', 'target']
-        missing = [s for s in required_sections if s not in config]
-        
+    def _validate_config(self):
+        """Validate required configuration sections"""
+        required = ['pipeline', 'source', 'target']
+        missing = [k for k in required if k not in self.config]
         if missing:
-            return jsonify({
-                "valid": False,
-                "errors": [f"Missing required section: {s}" for s in missing]
-            })
+            raise ValueError(f"Missing required config sections: {missing}")
         
         # Validate pipeline type
         valid_types = ['FILE_TO_FILE', 'FILE_TO_DB', 'DB_TO_DB', 'DB_TO_FILE']
-        pipeline_type = config['pipeline'].get('pipeline_type')
-        
+        pipeline_type = self.config['pipeline'].get('pipeline_type')
         if pipeline_type not in valid_types:
-            return jsonify({
-                "valid": False,
-                "errors": [f"Invalid pipeline_type: {pipeline_type}. Must be one of {valid_types}"]
-            })
-        
-        return jsonify({
-            "valid": True,
-            "message": "Configuration is valid"
-        })
+            raise ValueError(f"Invalid pipeline_type: {pipeline_type}")
     
-    except Exception as e:
-        return jsonify({
-            "valid": False,
-            "errors": [str(e)]
-        }), 500
+    def get(self, key: str, default=None):
+        return self.config.get(key, default)
 
 
-@app.route('/api/execute-pipeline', methods=['POST'])
-def execute_pipeline():
-    """
-    Execute a pipeline configuration
+class SourceHandler(ABC):
+    """Abstract base class for source handlers"""
     
-    This endpoint saves the config and triggers the ETL engine execution.
-    """
-    try:
-        config = request.json
+    @abstractmethod
+    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
+        pass
+
+
+class FileSourceHandler(SourceHandler):
+    """Handler for file-based sources"""
+    
+    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
+        format_type = config.get('format', 'csv')
+        path = config.get('path')
+        options = config.get('options', {})
         
-        if not config:
-            return jsonify({"error": "No configuration provided"}), 400
+        if not path:
+            raise ValueError("Source path is required for FILE type")
         
-        # Validate configuration first
-        required_sections = ['pipeline', 'source', 'target']
-        missing = [s for s in required_sections if s not in config]
+        # Map text-based formats to CSV (Spark doesn't have native txt/dat support)
+        format_mapping = {
+            'txt': 'csv',
+            'dat': 'csv',
+            'text': 'csv'
+        }
         
-        if missing:
-            return jsonify({
-                "success": False,
-                "error": f"Missing required sections: {missing}"
-            }), 400
+        actual_format = format_mapping.get(format_type.lower(), format_type)
         
-        pipeline_id = config['pipeline'].get('pipeline_id', f"PIPELINE_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        logging.info(f"Reading {format_type} (as {actual_format}) from {path}")
+        return spark.read.format(actual_format).options(**options).load(path)
+
+
+class DBSourceHandler(SourceHandler):
+    """Handler for database sources"""
+    
+    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
+        db_type = config.get('db_type')
+        table = config.get('table')
+        schema = config.get('schema', 'public')
+        connection = config.get('connection')
+        connection_string = config.get('connectionString')
         
-        # Save configuration
-        filename = f"{pipeline_id}.json"
-        filepath = os.path.join(CONFIG_DIR, filename)
-        with open(filepath, 'w') as f:
-            json.dump(config, f, indent=2)
+        # Resolve env var if connection_string matches a key
+        if connection_string and connection_string in os.environ:
+             connection_string = os.environ[connection_string]
         
-        # Execute the PySpark ETL engine
-        import subprocess
-        import time
+        if not db_type or not table:
+            raise ValueError("db_type and table are required for DB source")
         
-        start_time = time.time()
-        
-        # Get paths
-        backend_dir = os.path.dirname(__file__)
-        etl_engine_path = os.path.join(backend_dir, 'core', 'etl_engine.py')
-        
-        # Check if running in virtual environment
-        venv_python = os.path.join(backend_dir, '.venv', 'bin', 'python')
-        if os.path.exists(venv_python):
-            python_cmd = venv_python
+        # Qualify table with schema if provided (for PostgreSQL, SQL Server, etc.)
+        if schema and db_type in ['postgres', 'sqlserver', 'oracle']:
+            qualified_table = f"{schema}.{table}"
         else:
-            python_cmd = 'python3'
+            qualified_table = table
         
-        # For development: Run with Python directly (not spark-submit)
-        # In production, this should use: spark-submit etl_engine.py config.json
-        stdout_log = None
-        stderr_log = None
-        try:
-            # Find JARs
-            jars_dir = os.path.join(backend_dir, 'jars')
-            jar_files = []
-            if os.path.exists(jars_dir):
-                jar_files = [os.path.join(jars_dir, f) for f in os.listdir(jars_dir) if f.endswith('.jar')]
+        # Support two modes: connection name (from registry) or direct connection string
+        if connection:
+            # Mode 1: Use pre-registered connection from .env
+            conn_props = ConnectionRegistry.get_connection(connection)
+            jdbc_url = conn_props['url']
+            properties = conn_props['properties']
+        elif connection_string:
+            # Mode 2: Parse connection string directly from config
+            jdbc_url, properties = self._parse_connection_string(connection_string, db_type)
+        else:
+            raise ValueError("Either 'connection' (name) or 'connectionString' is required for DB source")
+        
+        # Add fetchsize to properties if provided
+        fetch_size = config.get('fetchsize')
+        if fetch_size:
+            properties['fetchsize'] = str(fetch_size)
             
-            cmd = ['spark-submit']
-            
-            # Add driver extra class path for both driver and executor
-            if jar_files:
-                jars_arg = ",".join(jar_files)
-                cmd.extend(['--jars', jars_arg])
-                cmd.extend(['--conf', f'spark.driver.extraClassPath={jars_arg}'])
-                cmd.extend(['--conf', f'spark.executor.extraClassPath={jars_arg}'])
-            
-            cmd.extend([etl_engine_path, filepath])
-
-            # Java 17+ compatibility: set JAVA_TOOL_OPTIONS in this (parent) process
-            # so the JVM launched by spark-submit inherits it before it starts.
-            # setdefault preserves any value the user may have already set.
-            os.environ.setdefault('JAVA_TOOL_OPTIONS', (
-                "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
-                "--add-opens=java.base/java.lang=ALL-UNNAMED "
-                "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
-                "--add-opens=java.base/java.io=ALL-UNNAMED "
-                "--add-opens=java.base/java.util=ALL-UNNAMED "
-                "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED "
-                "--add-exports=java.base/javax.security.auth=ALL-UNNAMED"
-            ))
-
-            # Try to execute with spark-submit if available
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minute timeout
+        logging.info(f"Reading from {db_type} table: {qualified_table}")
+        
+        # Check for partitioning configuration
+        partition_col = config.get('partitionColumn')
+        lower_bound = config.get('lowerBound')
+        upper_bound = config.get('upperBound')
+        num_partitions = config.get('numPartitions')
+        
+        if partition_col and lower_bound and upper_bound and num_partitions:
+            logging.info(f"Using read partitioning on {partition_col} (Range: {lower_bound}-{upper_bound}, Partitions: {num_partitions})")
+            return spark.read.jdbc(
+                url=jdbc_url,
+                table=qualified_table,
+                column=partition_col,
+                lowerBound=int(lower_bound) if str(lower_bound).isdigit() else lower_bound, # basic typing
+                upperBound=int(upper_bound) if str(upper_bound).isdigit() else upper_bound,
+                numPartitions=int(num_partitions),
+                properties=properties
             )
-            
-            execution_successful = result.returncode == 0
-            execution_output = result.stdout
-            execution_error = result.stderr
-            
-            # Write full logs to debug files for inspection
-            debug_log_dir = os.path.join(backend_dir, 'logs')
-            os.makedirs(debug_log_dir, exist_ok=True)
-            
-            stdout_log = os.path.join(debug_log_dir, f'{pipeline_id}_stdout.log')
-            stderr_log = os.path.join(debug_log_dir, f'{pipeline_id}_stderr.log')
-            
-            with open(stdout_log, 'w') as f:
-                f.write(execution_output or '')
-            with open(stderr_log, 'w') as f:
-                f.write(execution_error or '')
-            
-        except FileNotFoundError:
-            # spark-submit not found, return informative message
-            execution_successful = False
-            execution_output = ""
-            execution_error = "spark-submit not found. PySpark is not installed or not in PATH."
+        else:
+            return spark.read.jdbc(
+                url=jdbc_url,
+                table=qualified_table,
+                properties=properties
+            )
+    
+    def _parse_connection_string(self, conn_str: str, db_type: str) -> tuple:
+        """
+        Parse connection string and return (jdbc_url, properties)
+        Supports formats like: postgresql://user:password@host:port/database
+        """
+        import re
+        from urllib.parse import urlparse, parse_qs
         
-        except subprocess.TimeoutExpired:
-            execution_successful = False
-            execution_output = ""
-            execution_error = "Pipeline execution timed out after 5 minutes"
+        # Remove jdbc: prefix if present (to help urlparse)
+        if conn_str.startswith("jdbc:"):
+            conn_str = conn_str[5:]
+            
+        # Parse the connection string
+        parsed = urlparse(conn_str)
         
-        duration = time.time() - start_time
+        # Basic validation
+        if not parsed.scheme and not parsed.netloc and "=" not in conn_str:
+             if "localhost" in conn_str and ":" not in conn_str and "/" not in conn_str:
+                 raise ValueError("Invalid connection string. Please provide a full URL (e.g. postgresql://user:pass@host:port/db), not just a hostname.")
+
         
-        if execution_successful:
-            # Parse actual metrics from PySpark output
-            source_count = 0
-            target_count = 0
-            reject_count = 0
-            cdc_insert_count = None
-            cdc_update_count = None
-            cdc_delete_count = None
+        # Extract components
+        username = parsed.username or ''
+        password = parsed.password or ''
+        hostname = parsed.hostname or 'localhost'
+        port = parsed.port
+        database = parsed.path.lstrip('/') if parsed.path else ''
+        
+        # Build JDBC URL based on database type
+        driver_map = {
+            'postgres': ('org.postgresql.Driver', f"jdbc:postgresql://{hostname}:{port or 5432}/{database}"),
+            'mysql': ('com.mysql.cj.jdbc.Driver', f"jdbc:mysql://{hostname}:{port or 3306}/{database}"),
+            'oracle': ('oracle.jdbc.driver.OracleDriver', f"jdbc:oracle:thin:@//{hostname}:{port or 1521}/{database}"),
+            'sqlserver': ('com.microsoft.sqlserver.jdbc.SQLServerDriver', 
+                         f"jdbc:sqlserver://{hostname}:{port or 1433};databaseName={database}")
+        }
+        
+        if db_type not in driver_map:
+            raise ValueError(f"Unsupported database type: {db_type}")
+        
+        driver, jdbc_url = driver_map[db_type]
+        
+        properties = {
+            'user': username,
+            'password': password,
+            'driver': driver
+        }
+        
+        logging.info(f"Parsed connection string for {db_type}: {hostname}:{port}/{database}")
+        return jdbc_url, properties
 
-            import re
-            if execution_output:
-                source_match = re.search(r'Source row count:\s*(\d+)', execution_output)
-                if source_match:
-                    source_count = int(source_match.group(1))
 
-                target_match = re.search(r'Target row count:\s*(\d+)', execution_output)
-                if target_match:
-                    target_count = int(target_match.group(1))
+class SourceFactory:
+    """Factory for creating source handlers"""
+    
+    _handlers = {
+        'FILE': FileSourceHandler,
+        'DB': DBSourceHandler
+    }
+    
+    @classmethod
+    def get_handler(cls, source_type: str) -> SourceHandler:
+        handler_class = cls._handlers.get(source_type)
+        if not handler_class:
+            raise ValueError(f"Unsupported source type: {source_type}")
+        return handler_class()
 
-                reject_match = re.search(r"'reject_row_count':\s*(\d+)", execution_output)
-                if reject_match:
-                    reject_count = int(reject_match.group(1))
 
-                # CDC breakdown metrics
-                ins_match = re.search(r'CDC insert row count:\s*(\d+)', execution_output)
-                if ins_match:
-                    cdc_insert_count = int(ins_match.group(1))
+class TransformationHandler(ABC):
+    """Abstract base class for transformation handlers"""
+    
+    @abstractmethod
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        pass
 
-                upd_match = re.search(r'CDC update row count:\s*(\d+)', execution_output)
-                if upd_match:
-                    cdc_update_count = int(upd_match.group(1))
 
-                del_match = re.search(r'CDC delete row count:\s*(\d+)', execution_output)
-                if del_match:
-                    cdc_delete_count = int(del_match.group(1))
+class ColumnTransformationHandler(TransformationHandler):
+    """Handler for column-level transformations"""
+    
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        action = config.get('action')
+        column = config.get('column')
+        
+        # For row_number, literal, and current_date, column doesn't need to exist yet
+        if action not in ['row_number', 'literal', 'current_date'] and (not column or column not in df.columns):
+            raise ValueError(f"Invalid column: {column}")
+        
+        logging.info(f"Applying column transformation: {action} on {column}")
+        
+        if action == 'upper':
+            return df.withColumn(column, F.upper(F.col(column)))
+        elif action == 'lower':
+            return df.withColumn(column, F.lower(F.col(column)))
+        elif action == 'trim':
+            return df.withColumn(column, F.trim(F.col(column)))
+        elif action == 'cast':
+            target_type = config.get('target_type')
+            formats = config.get('formats')
+            fmt = config.get('format')
+            
+            # Handle list of formats if provided (for multiple potential formats)
+            if formats and isinstance(formats, list) and target_type in ['timestamp', 'date', 'TimestampType', 'DateType']:
+                # Determine function name
+                func_name = "try_to_timestamp" if target_type in ['timestamp', 'TimestampType'] else "try_to_date"
+                
+                # Construct coalesce of try_to_timestamp/try_to_date expressions
+                # We need to quote the format strings properly
+                cols = [F.expr(f"{func_name}({column}, '{f}')") for f in formats]
+                
+                # Coalesce the results (takes the first non-null)
+                return df.withColumn(column, F.coalesce(*cols))
+                
+            # Handle single format if provided
+            elif fmt and target_type in ['timestamp', 'date', 'TimestampType', 'DateType']:
+                func = F.to_timestamp if target_type in ['timestamp', 'TimestampType'] else F.to_date
+                return df.withColumn(column, func(F.col(column), fmt))
+                
+            # Default cast behavior
+            else:
+                return df.withColumn(column, F.col(column).cast(target_type))
+        elif action == 'rename':
+            new_name = config.get('new_name')
+            return df.withColumnRenamed(column, new_name)
+        elif action == 'add':
+            expression = config.get('expression')
+            return df.withColumn(column, F.expr(expression))
+        elif action == 'drop':
+            return df.drop(column)
+        elif action == 'row_number':
+            # Add row number column
+            from pyspark.sql.window import Window
+            order_by = config.get('order_by', '')
+            
+            if order_by and order_by in df.columns:
+                # Order by specified column
+                window_spec = Window.orderBy(F.col(order_by))
+            else:
+                # No specific order - use monotonically_increasing_id
+                window_spec = Window.orderBy(F.monotonically_increasing_id())
+            
+            return df.withColumn(column, F.row_number().over(window_spec))
+        elif action == 'literal':
+            # Add column with literal/constant value
+            value = config.get('value', '')
+            data_type = config.get('data_type', 'string')
+            
+            # Cast the literal value to the specified type
+            if data_type == 'integer':
+                lit_value = F.lit(int(value) if value else 0)
+            elif data_type == 'double' or data_type == 'float':
+                lit_value = F.lit(float(value) if value else 0.0)
+            elif data_type == 'boolean':
+                lit_value = F.lit(str(value).lower() in ['true', '1', 'yes'])
+            elif data_type == 'date':
+                # cast literal string to date
+                lit_value = F.to_date(F.lit(value))
+            elif data_type == 'timestamp':
+                # cast literal string to timestamp
+                lit_value = F.to_timestamp(F.lit(value))
+            else:
+                lit_value = F.lit(str(value))
+            
+            return df.withColumn(column, lit_value)
+        elif action == 'current_date':
+            # Add column with current date
+            return df.withColumn(column, F.current_date())
+        elif action == 'if_then_else':
+            # Conditional value: if(condition, true_val, false_val)
+            condition = config.get('condition')
+            true_val = config.get('trueValue')
+            false_val = config.get('falseValue')
+            
+            # Use expr() to allow SQL expressions (literals must be quoted by user if string)
+            # However, for robustness, if true_val/false_val look like simple strings and not columns,
+            # we might want to lit() them? 
+            # Design decision: The UI placeholder says "e.g. 'Adult'", implying user provides SQL literal syntax.
+            # So F.expr() is the correct approach.
+            
+            return df.withColumn(column, 
+                F.when(F.expr(condition), F.expr(true_val))
+                 .otherwise(F.expr(false_val))
+            )
+        elif action == 'data_masking':
+            mask_type = config.get('masking_type', 'full')
+            
+            if mask_type == 'full':
+                # Replace entirely with asterisks
+                return df.withColumn(column, F.lit('****'))
+            elif mask_type == 'hash':
+                # MD5 hash of the column
+                return df.withColumn(column, F.md5(F.col(column).cast('string')))
+            elif mask_type == 'null':
+                # Set to null
+                return df.withColumn(column, F.lit(None).cast('string'))
+            elif mask_type == 'partial':
+                # Show first N and last M characters, mask middle
+                show_first = config.get('show_first', 2)
+                show_last = config.get('show_last', 2)
+                
+                # Convert to string first
+                str_col = F.col(column).cast('string')
+                length = F.length(str_col)
+                
+                return df.withColumn(column, F.when(
+                    F.col(column).isNull(), F.lit(None).cast('string')
+                ).when(
+                    length <= (show_first + show_last), F.lit('****')
+                ).otherwise(
+                    F.concat(
+                        F.substring(str_col, 1, show_first),
+                        F.lit('****'),
+                        F.substring(str_col, length - show_last + 1, show_last)
+                    )
+                ))
+            elif mask_type == 'base64':
+                # Encode string to Base64
+                return df.withColumn(column, F.base64(F.encode(F.col(column).cast('string'), 'utf-8')))
+            elif mask_type == 'aes':
+                # AES Encrypt (Stored as Base64 encoded string so it can be written to text/csv)
+                key = config.get('key', '')
+                if not key or len(key) not in [16, 24, 32]:
+                    raise ValueError("AES encryption requires a 16, 24, or 32 character 'key'.")
+                # Using expr() as aes_encrypt is heavily tied to SQL functions in Spark 3.3+
+                return df.withColumn(column, F.expr(f"base64(aes_encrypt(cast({column} as string), '{key}'))"))
+            else:
+                logging.warning(f"Unknown masking_type {mask_type}, returning original column")
+                return df
+        elif action == 'data_unmasking':
+            unmask_type = config.get('unmasking_type', 'base64')
+            
+            if unmask_type == 'base64':
+                # Decode Base64 string back to standard string
+                return df.withColumn(column, F.decode(F.unbase64(F.col(column)), 'utf-8'))
+            elif unmask_type == 'aes':
+                # AES Decrypt (Assumes the stored value was base64 encoded after AES encryption)
+                key = config.get('key', '')
+                if not key or len(key) not in [16, 24, 32]:
+                    raise ValueError("AES decryption requires a 16, 24, or 32 character 'key'.")
+                return df.withColumn(column, F.expr(f"cast(aes_decrypt(unbase64({column}), '{key}') as string)"))
+            else:
+                logging.warning(f"Unknown unmasking_type {unmask_type}, returning original column")
+                return df
+        else:
+            raise ValueError(f"Unsupported column action: {action}")
 
-            metrics = {
-                "source_row_count": source_count,
-                "target_row_count": target_count,
-                "reject_row_count": reject_count
-            }
-            # Only add CDC breakdown when CDC was actually used
-            if cdc_insert_count is not None:
-                metrics["cdc_insert_row_count"] = cdc_insert_count
-                metrics["cdc_update_row_count"] = cdc_update_count or 0
-                metrics["cdc_delete_row_count"] = cdc_delete_count or 0
 
-            result = {
-                "success": True,
-                "pipeline_id": pipeline_id,
-                "status": "completed",
-                "duration": round(duration, 2),
-                "metrics": metrics,
-                "message": f"Pipeline {pipeline_id} executed successfully",
-                "config_path": filepath,
-                "execution_log": execution_output[-10000:] if execution_output else "",
-                "full_log_path": stdout_log if execution_output else None
+class RowTransformationHandler(TransformationHandler):
+    """Handler for row-level transformations"""
+    
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        action = config.get('action')
+        
+        logging.info(f"Applying row transformation: {action}")
+        
+        if action == 'filter':
+            condition = config.get('condition')
+            capture_rejects = config.get('capture_rejects', False)
+            
+            # Capture rejects if enabled
+            if capture_rejects and context and 'reject_handler' in context:
+                reject_handler = context['reject_handler']
+                reject_reason = config.get('reject_reason', f"Failed filter: {condition}")
+                
+                # Identify rejected rows (those that DO NOT match the condition)
+                rejects = df.filter(f"NOT ({condition})")
+                reject_handler.write_rejects(rejects, reject_reason)
+                
+            return df.filter(condition)
+        elif action == 'if':
+            condition = config.get('condition')
+            column = config.get('column')
+            value = config.get('value')
+            return df.withColumn(column, 
+                F.when(F.expr(condition), value).otherwise(F.col(column)))
+        elif action == 'deduplicate' or action == 'distinct':
+            raw_cols = config.get('columns', [])
+            # Robustly accept both a JSON array and a comma-separated string
+            if isinstance(raw_cols, str):
+                columns = [c.strip() for c in raw_cols.replace(';', ',').split(',') if c.strip()]
+            else:
+                columns = raw_cols
+            handling = config.get('duplicate_handling', 'drop')
+            
+            logging.info(f"Applying deduplication on columns {columns} with handling '{handling}'")
+            
+            if handling == 'fail':
+                # Check for duplicates without dropping them first
+                dup_counts = df.groupBy(columns).count().filter("count > 1")
+                if dup_counts.count() > 0:
+                    dup_sample = dup_counts.limit(5).collect()
+                    raise ValueError(f"Duplicate records found in columns {columns}. Sample: {dup_sample}")
+                return df
+                
+            elif handling == 'capture':
+                # Use window details to identify duplicates
+                from pyspark.sql.window import Window
+                
+                # If no columns specified, use all columns
+                part_cols = [F.col(c) for c in columns] if columns else [F.col(c) for c in df.columns]
+                
+                # Add row number to identify duplicates
+                # We need a stable sort for consistent results, use monotonically_increasing_id if nothing else
+                window = Window.partitionBy(*part_cols).orderBy(F.monotonically_increasing_id())
+                
+                df_windowed = df.withColumn("_row_num", F.row_number().over(window))
+                
+                # Split into unique and duplicates
+                unique_rows = df_windowed.filter(F.col("_row_num") == 1).drop("_row_num")
+                duplicate_rows = df_windowed.filter(F.col("_row_num") > 1).drop("_row_num")
+                
+                # Log duplicates if handler is available
+                if context and 'reject_handler' in context:
+                    reject_handler = context['reject_handler']
+                    reject_handler.write_rejects(duplicate_rows, f"Duplicate record based on {columns}")
+                
+                return unique_rows
+                
+            else: # mode == 'drop' or default
+                return df.dropDuplicates(columns) if columns else df.dropDuplicates()
+        elif action == 'sort':
+            columns = config.get('columns', [])
+            ascending = config.get('ascending', True)
+            
+            if not columns:
+                raise ValueError("Sort requires at least one column")
+            
+            # Build sort expressions
+            sort_exprs = []
+            for col in columns:
+                if col in df.columns:
+                    if ascending:
+                        sort_exprs.append(F.col(col).asc())
+                    else:
+                        sort_exprs.append(F.col(col).desc())
+                else:
+                    logging.warning(f"Sort column '{col}' not found in DataFrame - skipping")
+            
+            if sort_exprs:
+                return df.orderBy(*sort_exprs)
+            else:
+                logging.warning("No valid sort columns found - returning original DataFrame")
+                return df
+        elif action == 'sample':
+            fraction = config.get('fraction', 0.1)
+            return df.sample(fraction=fraction)
+        else:
+            raise ValueError(f"Unsupported row action: {action}")
+
+
+class LookupTransformationHandler(TransformationHandler):
+    """Handler for lookup/join transformations"""
+    
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        lookup_table = config.get('lookup_table')
+        operation = config.get('operation', 'join')
+        
+        # --- SURROGATE KEY GENERATION (MAX + 1) ---
+        if operation == 'surrogate_key':
+            source_col = config.get('source_column') # Column in Lookup Table (to find MAX)
+            target_col = config.get('target_column') # Column in Current DF (to populate)
+            
+            if not source_col or not target_col:
+                raise ValueError("Surrogate Key operation requires 'source_column' (lookup max) and 'target_column' (populate)")
+                
+            logging.info(f"Generating Surrogate Keys for {target_col} based on MAX({source_col}) from {lookup_table}")
+            
+            # Calculate MAX value
+            start_val = 0
+            try:
+                 # Get lookup DataFrame
+                 try:
+                      lookup_df = DataFrameRegistry.get_dataframe(lookup_table)
+                 except ValueError:
+                      # Try to load ad-hoc if config provided
+                      source_type = config.get('source_type')
+                      path = config.get('path')
+              
+                      if source_type and path:
+                          logging.info(f"Loading ad-hoc lookup table from {path} for Surrogate Key")
+                          source_config = {
+                              'type': source_type,
+                              'path': path,
+                              'table': config.get('table') or path, # For DB: Prefer table name if available
+                              'schema': config.get('schema'), # For DB: Pass schema explicitly
+                              'db_type': config.get('db_type'), # For DB
+                              'connectionString': os.environ.get(config.get('connection_string')) if config.get('connection_string') in os.environ else config.get('connection_string'), # For DB with Env Var support
+                              'format': config.get('file_format', 'csv'),
+                              'options': config.get('options', {'header': 'true', 'inferSchema': 'true'})
+                          }
+                  
+                          handler = SourceFactory.get_handler(source_type)
+                          # Get SparkSession from input df
+                          spark = df.sparkSession
+                          lookup_df = handler.read(spark, source_config)
+                  
+                          # Register for future use
+                          DataFrameRegistry.register(lookup_table, lookup_df)
+                      else:
+                          raise ValueError(f"Lookup table '{lookup_table}' not found for surrogate key generation and no source config provided")
+         
+                 # Verify column exists
+                 if source_col not in lookup_df.columns:
+                     logging.warning(f"Column '{source_col}' not found in lookup table. Defaulting start value to 0.")
+                 else:
+                     max_row = lookup_df.agg(F.max(source_col)).collect()[0]
+                     max_val = max_row[0]
+                     start_val = (max_val if max_val is not None else 0)
+             
+            except Exception as e:
+                 logging.warning(f"Could not load or read lookup table '{lookup_table}': {str(e)}. Defaulting start value to 0 (Sequence starts at 1).")
+                 start_val = 0
+
+            logging.info(f"Surrogate Key: Current MAX({source_col}) is {start_val}. Sequencing from {start_val + 1}")
+        
+            # Determine if we should generate a Batch ID (Constant) or Surrogate Key (Sequence)
+            # Heuristic: If column name suggests Load/Batch ID, use constant value.
+            is_batch_id = any(x in target_col.upper() for x in ['LOAD_ID', 'BATCH_ID', 'JOB_ID', 'EXECUTION_ID'])
+    
+            if is_batch_id:
+                # Batch Mode: Same ID for all rows (e.g. Load ID)
+                logging.info(f"Generating Batch ID (Constant) for {target_col}: {start_val + 1}")
+                df = df.withColumn(target_col, F.lit(start_val + 1))
+            else:
+                # Sequence Mode: Unique ID per row (Standard Surrogate Key)
+                # using row_number() ensures consecutive numbers, assuming data fits in reasonable windows
+                from pyspark.sql import Window
+                w = Window.orderBy(F.monotonically_increasing_id())
+                df = df.withColumn(target_col, F.lit(start_val) + F.row_number().over(w))
+    
+            return df
+            
+        # --- STANDARD JOIN LOOKUP ---
+        join_keys = config.get('join_keys', {}) # List or Dict
+        join_type = config.get('join_type', 'left')
+        columns = config.get('columns', [])
+        broadcast_join = config.get('broadcast', False)
+        
+        logging.info(f"Applying lookup join from {lookup_table} (Broadcast: {broadcast_join})")
+        
+        # Get lookup DataFrame
+        try:
+            lookup_df = DataFrameRegistry.get_dataframe(lookup_table)
+        except ValueError:
+            # Try to load ad-hoc if config provided
+            source_type = config.get('source_type')
+            path = config.get('path')
+            
+            if source_type and path:
+                logging.info(f"Loading ad-hoc lookup table from {path}")
+                source_config = {
+                    'type': source_type,
+                    'path': path,
+                    'table': config.get('table') or path, # For DB: Prefer table name if available
+                    'schema': config.get('schema'), # For DB: Pass schema explicitly
+                    'db_type': config.get('db_type'), # For DB
+                    'connectionString': os.environ.get(config.get('connection_string')) if config.get('connection_string') in os.environ else config.get('connection_string'), # For DB
+                    'format': config.get('file_format', 'csv'),
+                    'options': config.get('options', {'header': 'true', 'inferSchema': 'true'})
+                }
+                
+                handler = SourceFactory.get_handler(source_type)
+                # We need a SparkSession. In a real scenario, we'd pass it or get it from context/global.
+                # For now, get it from the input dataframe
+                spark = df.sparkSession
+                lookup_df = handler.read(spark, source_config)
+                
+                # Register for future use
+                DataFrameRegistry.register(lookup_table, lookup_df)
+            else:
+                raise ValueError(f"Lookup table '{lookup_table}' not found and no source config provided")
+
+        # ---------------------------------------------------------------------------
+        # lookup_filter: optional SQL filter expression(s) applied to the lookup
+        # DataFrame BEFORE the join. This is the correct way to restrict lookup-side
+        # rows (e.g. only active records) without polluting join_keys with literals.
+        #
+        # Config examples:
+        #   "lookup_filter": "Active_Flag = 'Y'"
+        #   "lookup_filter": ["Active_Flag = 'Y'", "end_date = '9999-12-31'"]
+        # ---------------------------------------------------------------------------
+        lookup_filter = config.get('lookup_filter')
+        if lookup_filter:
+            filters = [lookup_filter] if isinstance(lookup_filter, str) else lookup_filter
+            for flt in filters:
+                logging.info(f"Applying lookup pre-filter: {flt}")
+                lookup_df = lookup_df.filter(F.expr(flt))
+
+        # Apply Aggregation if configured
+        aggregation = config.get('aggregation')
+        if aggregation and isinstance(aggregation, dict) and aggregation.get('type'):
+            agg_type = aggregation.get('type')
+            agg_col = aggregation.get('column')
+            group_by = aggregation.get('group_by')
+            
+            if group_by and agg_col:
+                logging.info(f"Aggregating lookup: {agg_type}({agg_col}) group by {group_by}")
+                
+                # Perform aggregation
+                if agg_type == 'max':
+                    lookup_df = lookup_df.groupBy(group_by).agg(F.max(agg_col).alias(agg_col))
+                elif agg_type == 'min':
+                    lookup_df = lookup_df.groupBy(group_by).agg(F.min(agg_col).alias(agg_col))
+                elif agg_type == 'avg':
+                    lookup_df = lookup_df.groupBy(group_by).agg(F.avg(agg_col).alias(agg_col))
+                elif agg_type == 'sum':
+                    lookup_df = lookup_df.groupBy(group_by).agg(F.sum(agg_col).alias(agg_col))
+                elif agg_type == 'count':
+                    lookup_df = lookup_df.groupBy(group_by).agg(F.count(agg_col).alias(agg_col))
+                    
+        # Apply Column Mapping / Selection
+        column_mapping = config.get('column_mapping')
+
+        # Collect raw lookup-side join keys from config (may be literals like 'Y' or column refs like 'employee.EMP_ID')
+        lookup_join_keys_raw = set()
+        if isinstance(join_keys, dict):
+            lookup_join_keys_raw = set(join_keys.values())
+        elif isinstance(join_keys, list):
+            for key_pair in join_keys:
+                if key_pair.get('lookup'):
+                    lookup_join_keys_raw.add(key_pair.get('lookup'))
+
+        # ---------------------------------------------------------------------------
+        # Helper: resolve a raw config string to a PySpark Column expression.
+        # - Strips SQL-style table prefix  (e.g. 'employee.EMP_ID' -> 'EMP_ID')
+        # - If the bare name exists as a column in `frame`, returns frame[name]
+        # - Otherwise treats the raw value as a string literal  ->  F.lit(value)
+        # This single helper is the only place in the engine that makes this decision,
+        # so adding new join-key patterns (quoted literals, numeric literals, etc.)
+        # only requires a change here.
+        # ---------------------------------------------------------------------------
+        def resolve_col_or_lit(raw_value: str, frame):
+            bare = raw_value.split('.')[-1] if '.' in raw_value else raw_value
+            bare = bare.strip('"').strip("'")
+            if bare in frame.columns:
+                return frame[bare], bare, False   # (Column, bare_name, is_literal)
+            return F.lit(bare), bare, True        # (Column, bare_name, is_literal)
+
+        if column_mapping:
+            from pyspark.sql.functions import col
+            select_cols = []
+            mapped_srcs = set()
+
+            # Mapped columns: bring them from the lookup DF with the target name
+            for map_item in column_mapping:
+                src = map_item.get('lookup')
+                tgt = map_item.get('target')
+                if src and tgt:
+                    clean_src = src.split('.')[-1] if '.' in src else src
+                    clean_tgt = tgt.split('.')[-1] if '.' in tgt else tgt
+                    select_cols.append(col(clean_src).alias(clean_tgt))
+                    mapped_srcs.add(clean_src)
+
+            # Join keys: include only real columns (literals are injected at condition time)
+            for raw_key in lookup_join_keys_raw:
+                _, bare, is_literal = resolve_col_or_lit(raw_key, lookup_df)
+                if bare not in mapped_srcs and not is_literal:
+                    select_cols.append(col(bare))
+                    mapped_srcs.add(bare)
+
+            if select_cols:
+                lookup_df = lookup_df.select(*select_cols)
+
+        elif columns:
+            # Legacy/Simple column selection
+            cleaned_cols = [c.split('.')[-1] if '.' in c else c for c in columns]
+            # Only include join keys that are real columns (not literals)
+            cleaned_lookup_keys = []
+            for raw_key in lookup_join_keys_raw:
+                _, bare, is_literal = resolve_col_or_lit(raw_key, lookup_df)
+                if not is_literal:
+                    cleaned_lookup_keys.append(bare)
+
+            cols_to_select = set(cleaned_cols) | set(cleaned_lookup_keys)
+            existing_cols = set(lookup_df.columns)
+            valid_cols = [c for c in cols_to_select if c in existing_cols]
+            if valid_cols:
+                lookup_df = lookup_df.select(*valid_cols)
+
+        # Drop mapped target columns from source DF before join to prevent duplicate columns
+        if column_mapping:
+            src_join_key_names = set()
+            if isinstance(join_keys, list):
+                for jp in join_keys:
+                    s = jp.get('source')
+                    if s:
+                        _, bare, _ = resolve_col_or_lit(s, df)
+                        src_join_key_names.add(bare)
+            elif isinstance(join_keys, dict):
+                for s in join_keys.keys():
+                    _, bare, _ = resolve_col_or_lit(s, df)
+                    src_join_key_names.add(bare)
+
+            for map_item in column_mapping:
+                tgt = map_item.get('target')
+                if tgt:
+                    clean_tgt = tgt.split('.')[-1] if '.' in tgt else tgt
+                    if clean_tgt in df.columns and clean_tgt not in src_join_key_names:
+                        df = df.drop(clean_tgt)
+
+        # Build join conditions using the helper — literals auto-detected, no extra handling needed
+        join_conditions = []
+        if isinstance(join_keys, dict):
+            for src_raw, tgt_raw in join_keys.items():
+                src_expr, _, _ = resolve_col_or_lit(src_raw, df)
+                tgt_expr, _, _ = resolve_col_or_lit(tgt_raw, lookup_df)
+                join_conditions.append(src_expr == tgt_expr)
+        elif isinstance(join_keys, list):
+            for key_pair in join_keys:
+                src_raw = key_pair.get('source')
+                tgt_raw = key_pair.get('lookup')
+                if src_raw and tgt_raw:
+                    src_expr, _, _ = resolve_col_or_lit(src_raw, df)
+                    tgt_expr, _, _ = resolve_col_or_lit(tgt_raw, lookup_df)
+                    join_conditions.append(src_expr == tgt_expr)
+
+        if not join_conditions:
+            raise ValueError("No valid join keys provided")
+
+        # Combine conditions with AND
+        final_condition = join_conditions[0]
+        for cond in join_conditions[1:]:
+            final_condition = final_condition & cond
+
+        # Apply broadcast if requested
+        if broadcast_join:
+            from pyspark.sql.functions import broadcast
+            lookup_df = broadcast(lookup_df)
+
+        # Perform join
+        result = df.join(lookup_df, final_condition, join_type)
+
+        # Drop overlapping real join-key columns from the result to avoid duplicates
+        # Literal join keys are never in the dataframe, so helper naturally skips them
+        if isinstance(join_keys, list):
+            for key_pair in join_keys:
+                tgt_raw = key_pair.get('lookup')
+                if tgt_raw:
+                    col_expr, bare, is_literal = resolve_col_or_lit(tgt_raw, lookup_df)
+                    if not is_literal:
+                        result = result.drop(lookup_df[bare])
+
+        # Handle missing values if specified
+        on_missing = config.get('on_missing')
+        if on_missing == 'default' and columns:
+            for col in columns:
+                result = result.fillna({col: 'UNKNOWN'})
+
+        return result
+
+
+class CDCTransformationHandler(TransformationHandler):
+    """Handler for CDC (Change Data Capture) transformations"""
+    
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        mode = config.get('mode')
+        transform_type = config.get('type')
+        
+        if mode == 'SCD_TYPE_2':
+            return self._apply_scd_type2(df, config)
+        elif transform_type == 'cdc_compare' or mode == 'CDC_COMPARE':
+             return self._apply_cdc_compare(df, config)
+        else:
+            raise ValueError(f"Unsupported CDC mode: {mode}")
+
+    def _apply_cdc_compare(self, df: DataFrame, config: Dict) -> DataFrame:
+        target_type = config.get('target_type', 'FILE')
+        path = config.get('target_path') # table or file path
+        key_cols = config.get('key_columns', [])
+        if key_cols:
+            key_cols = [k.split('.')[-1].strip().strip('"').strip("'") if '.' in k else k.strip().strip('"').strip("'") for k in key_cols]
+        compare_cols = config.get('compare_columns', [])
+        if compare_cols:
+            compare_cols = [c.split('.')[-1] if '.' in c else c for c in compare_cols]
+        exclude_cols = config.get('exclude_columns', [])
+        if exclude_cols:
+            exclude_cols = [e.split('.')[-1] if '.' in e else e for e in exclude_cols]
+        op_col = config.get('op_column', 'op_type')
+        
+        if not path:
+             raise ValueError("Target path/table is required for CDC Compare")
+        
+        if not key_cols:
+             raise ValueError("Key columns are required for CDC Compare")
+             
+        logging.info(f"Applying CDC Compare against {target_type}: {path}")
+        
+        # Load Target DataFrame
+        source_config = {
+            'type': target_type,
+            'path': path,
+            'table': path, # for DB
+            'schema': config.get('schema'), # Add schema parameter
+            'db_type': config.get('db_type'),
+            'connectionString': config.get('connection_string'),
+            'format': config.get('format', 'parquet'),
+            'options': config.get('options', {'header': 'true', 'inferSchema': 'true'})
+        }
+        
+        # We need a SparkSession. 
+        spark = df.sparkSession
+        
+        try:
+            handler = SourceFactory.get_handler(target_type)
+            target_df = handler.read(spark, source_config)
+        except Exception as e:
+            logging.warning(f"Failed to load comparison target: {e}. Assuming empty target (Full Load/Insert).")
+            # If target doesn't exist, everything is an INSERT
+            from pyspark.sql.types import StructType
+            # Fallback to empty DF with same schema if possible, or just error?
+            # For robustness, if target is missing, treat all as INSERT
+            target_df = spark.createDataFrame([], df.schema)
+
+        # Alias Source Columns to avoid collision
+        source_df_aliased = df.select([F.col(c).alias(f"__src_{c}") for c in df.columns])
+
+        # Alias Target Columns to avoid collision
+        target_df_aliased = target_df.select([F.col(c).alias(f"__tgt_{c}") for c in target_df.columns])
+        
+        # Join Conditions
+        join_cond = [source_df_aliased[f"__src_{c}"] == target_df_aliased[f"__tgt_{c}"] for c in key_cols]
+        # Combine
+        final_cond = join_cond[0]
+        for c in join_cond[1:]:
+            final_cond = final_cond & c
+            
+        # Perform Full Outer Join
+        joined_df = source_df_aliased.join(target_df_aliased, final_cond, "full_outer")
+        
+        # Determine Comparison Columns (if empty, use all common columns minus keys and excludes)
+        if not compare_cols:
+            common_cols = set(df.columns).intersection(set(target_df.columns))
+            compare_cols = [c for c in common_cols if c not in key_cols and c not in exclude_cols]
+            
+        # Build Hash for Comparison
+        # Check schemas for robust comparison - Check BOTH sides
+        src_schema = {f.name: str(f.dataType).lower() for f in df.schema.fields}
+        tgt_schema = {f.name: str(f.dataType).lower() for f in target_df.schema.fields}
+
+        def get_norm_expr(col_name, is_tgt=False):
+            ex = F.col(f"__tgt_{col_name}") if is_tgt else F.col(f"__src_{col_name}")
+            
+            # Determine combined type strategy
+            s_type = src_schema.get(col_name, '')
+            t_type = tgt_schema.get(col_name, '')
+            
+            is_date_time = ('date' in s_type or 'timestamp' in s_type or 
+                            'date' in t_type or 'timestamp' in t_type)
+                            
+            is_numeric = (('double' in s_type or 'float' in s_type or 'decimal' in s_type) or
+                          ('double' in t_type or 'float' in t_type or 'decimal' in t_type))
+            
+            try:
+                if is_date_time:
+                    ex_str = ex.cast("string")
+                    cleaned_ex = F.regexp_replace(ex_str, r" [\+\-]\d{2}(:\d{2})?$", "")
+                    return F.date_format(cleaned_ex.cast("timestamp"), "yyyy-MM-dd HH:mm:ss")
+                elif is_numeric:
+                    return ex.cast("decimal(20,2)").cast("string")
+                else:
+                    return ex.cast("string")
+            except:
+                return ex.cast("string")
+
+        src_exprs = [F.coalesce(get_norm_expr(c, False), F.lit("")) for c in compare_cols]
+        tgt_exprs = [F.coalesce(get_norm_expr(c, True), F.lit("")) for c in compare_cols]
+        
+        src_str_expr = F.concat_ws("||", *src_exprs)
+        tgt_str_expr = F.concat_ws("||", *tgt_exprs)
+        
+        src_hash_expr = F.md5(src_str_expr)
+        tgt_hash_expr = F.md5(tgt_str_expr)
+        
+        # Determine row status
+        src_exists = F.col(f"__src_{key_cols[0]}").isNotNull() 
+        tgt_exists = F.col(f"__tgt_{key_cols[0]}").isNotNull()
+        
+        joined_df = joined_df.withColumn(op_col, 
+            F.when(src_exists & (~tgt_exists), F.lit("I")) # Insert
+             .when((~src_exists) & tgt_exists, F.lit("D")) # Delete
+             .when(src_exists & tgt_exists & (src_hash_expr != tgt_hash_expr), F.lit("U")) # Update
+             .otherwise(F.lit("NC")) # No Change
+        ).withColumn("__debug_src", src_str_expr).withColumn("__debug_tgt", tgt_str_expr)
+        
+        # Coalesce columns for Output
+        final_cols = []
+        for c in df.columns:
+            # If it's a delete (source is empty), use target values
+            final_cols.append(F.when(F.col(op_col) == 'D', F.col(f"__tgt_{c}")).otherwise(F.col(f"__src_{c}")).alias(c))
+            
+        final_cols.append(F.col(op_col))
+        final_cols.append(F.col("__debug_src"))
+        final_cols.append(F.col("__debug_tgt"))
+        
+        return joined_df.select(*final_cols)
+    
+    def _apply_scd_type2(self, df: DataFrame, config: Dict) -> DataFrame:
+        business_keys = config.get('business_keys', [])
+        compare_columns = config.get('compare_columns', 'ALL')
+        eff_start = config.get('effective_start', 'eff_start_dt')
+        eff_end = config.get('effective_end', 'eff_end_dt')
+        current_flag = config.get('current_flag', 'is_current')
+        op_flag = config.get('operation_flag', 'op_type')
+        
+        logging.info("Applying SCD Type 2 transformation")
+        
+        # Add SCD columns
+        df = df.withColumn(eff_start, F.current_timestamp())
+        df = df.withColumn(eff_end, F.lit(None).cast('timestamp'))
+        df = df.withColumn(current_flag, F.lit(True))
+        df = df.withColumn(op_flag, F.lit('INSERT'))
+        
+        return df
+
+
+class TransformationFactory:
+    """Factory for creating transformation handlers"""
+    
+    _handlers = {
+        'column': ColumnTransformationHandler,
+        'row': RowTransformationHandler,
+        'lookup': LookupTransformationHandler,
+        'cdc': CDCTransformationHandler,
+        'cdc_compare': CDCTransformationHandler
+    }
+    
+    @classmethod
+    def get_handler(cls, transform_type: str) -> TransformationHandler:
+        handler_class = cls._handlers.get(transform_type)
+        if not handler_class:
+            raise ValueError(f"Unsupported transformation type: {transform_type}")
+        return handler_class()
+
+
+class TargetHandler(ABC):
+    """Abstract base class for target handlers"""
+    
+    @abstractmethod
+    def write(self, df: DataFrame, config: Dict):
+        pass
+
+
+class FileTargetHandler(TargetHandler):
+    """Handler for file-based targets"""
+    
+    def write(self, df: DataFrame, config: Dict):
+        format_type = config.get('format', 'parquet')
+        path = config.get('path')
+        mode = config.get('mode', 'overwrite')
+        partition_by = config.get('partition_by', [])
+        options = config.get('options', {})
+        
+        if not path:
+            raise ValueError("Target path is required for FILE type")
+        
+        if format_type.lower() in ['excel', 'xlsx']:
+            logging.info(f"Writing excel to {path} using pandas")
+            try:
+                import pandas as pd
+                import openpyxl
+                # Convert to pandas and write
+                pdf = df.toPandas()
+                pdf.to_excel(path, index=False)
+                logging.info(f"Successfully wrote excel file to {path}")
+                return
+            except ImportError:
+                logging.error("openpyxl or pandas not installed. Please pip install openpyxl pandas")
+                raise
+            except Exception as e:
+                logging.error(f"Failed to write excel: {e}")
+                raise
+
+        # Map text-based formats to CSV (Spark doesn't have native txt/dat support)
+        format_mapping = {
+            'txt': 'csv',
+            'dat': 'csv',
+            'text': 'csv'
+        }
+        
+        actual_format = format_mapping.get(format_type.lower(), format_type)
+        
+        import os
+        import glob
+        import shutil
+        import tempfile
+
+        logging.info(f"Writing {format_type} (as {actual_format}) to {path} with mode {mode}")
+
+        # Resolve to an absolute OS path first
+        abs_path = os.path.abspath(path)
+        target_dir = os.path.dirname(abs_path)
+
+        # Use a non-hidden temp dir name (avoid dot-prefix — Hadoop winutils can't
+        # delete hidden directories on Windows, causing o89.save failures)
+        temp_dir_name = f"_tmp_{os.path.basename(abs_path)}_{int(time.time())}"
+        temp_dir = os.path.join(target_dir, temp_dir_name)
+
+        # Ensure target directory exists for text-based outputs
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+
+        # Convert the temp_dir native OS path to a forward-slash URI that
+        # PySpark/Hadoop understands on Windows (e.g. file:///C:/Users/foo/_tmp_bar)
+        def to_spark_uri(p: str) -> str:
+            p = os.path.abspath(p).replace("\\", "/")
+            if len(p) > 1 and p[1] == ':':          # Windows drive letter, e.g. C:/...
+                return "file:///" + p
+            return p                                  # Already Unix-style
+
+        spark_temp_dir = to_spark_uri(temp_dir)
+
+        # We coerce the format to a single partition to guarantee one part-* file
+        writer = df.coalesce(1).write.format(actual_format).mode(mode).options(**options)
+
+        if partition_by:
+            writer = writer.partitionBy(*partition_by)
+
+        try:
+            # 1. Write the DataFrame to the temporary PySpark directory (URI path)
+            logging.info(f"PySpark writing to temp URI: {spark_temp_dir}")
+            writer.save(spark_temp_dir)
+
+            # 2. Find the single partitioned file it created
+            # e.g., temp_dir/part-00000-xxxxx.csv
+            part_files = glob.glob(os.path.join(temp_dir, 'part-*'))
+
+            if not part_files:
+                raise FileNotFoundError(f"Failed to find part-* file in PySpark output directory: {temp_dir}")
+
+            actual_part_file = part_files[0]
+
+            # 3. Handle overwrites: remove the existing target if it's there
+            if mode == 'overwrite' and os.path.exists(abs_path):
+                if os.path.isfile(abs_path):
+                    os.remove(abs_path)
+                elif os.path.isdir(abs_path):
+                    shutil.rmtree(abs_path)
+
+            # 4. Move and rename the part- file to the exact requested path
+            shutil.move(actual_part_file, abs_path)
+            logging.info(f"Successfully consolidated output to single file: {abs_path}")
+
+        finally:
+            # 5. Destroy the temporary PySpark directory (and the _SUCCESS flag)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
+
+
+class DBTargetHandler(TargetHandler):
+    """Handler for database targets"""
+    
+    def write(self, df: DataFrame, config: Dict):
+        db_type = config.get('db_type')
+        table = config.get('table')
+        schema = config.get('schema', 'public')
+        connection = config.get('connection')
+        connection_string = config.get('connectionString')
+        
+        # Resolve env var if connection_string matches a key
+        if connection_string and connection_string in os.environ:
+             connection_string = os.environ[connection_string]
+        mode = config.get('mode', 'append')
+        
+        if not db_type or not table:
+            raise ValueError("db_type and table are required for DB target")
+        
+        # Qualify table with schema if provided (for PostgreSQL, SQL Server, etc.)
+        if schema and db_type in ['postgres', 'sqlserver', 'oracle']:
+            qualified_table = f"{schema}.{table}"
+        else:
+            qualified_table = table
+        
+        # Support two modes: connection name (from registry) or direct connection string
+        if connection:
+            # Mode 1: Use pre-registered connection from .env
+            conn_props = ConnectionRegistry.get_connection(connection)
+            jdbc_url = conn_props['url']
+            properties = conn_props['properties']
+        elif connection_string:
+            # Mode 2: Parse connection string directly from config
+            jdbc_url, properties = self._parse_connection_string(connection_string, db_type)
+        else:
+            raise ValueError("Either 'connection' (name) or 'connectionString' is required for DB target")
+        
+        # Add performance options
+        batch_size = config.get('batchsize')
+        if batch_size:
+            properties['batchsize'] = str(batch_size)
+            
+        isolation_level = config.get('isolationLevel')
+        if isolation_level and isolation_level != 'NONE':
+            properties['isolationLevel'] = isolation_level
+            
+        logging.info(f"Writing to {db_type} table: {qualified_table} with mode {mode}")
+        
+
+        # DEBUG CDC
+        import sys
+        log_cdc(f"Checking for op_type. Columns: {df.columns}")
+        if 'op_type' in df.columns:
+            try:
+                op_counts = df.groupBy('op_type').count().collect()
+                log_cdc(f"op_type counts: {op_counts}")
+            except Exception as e:
+                log_cdc(f"Failed to count op_types: {e}")
+        else:
+            log_cdc("op_type NOT found in columns.")
+
+        # Check for CDC operation column
+        if 'op_type' in df.columns:
+            logging.info("CDC Operation detected - Applying SCD Type 2 logic")
+
+            primary_key = config.get('primary_key')
+            if not primary_key:
+                raise ValueError("Primary Key is required for CDC operations (op_type column present)")
+
+            # Normalize primary_key to list if comma-separated
+            if isinstance(primary_key, str):
+                if ',' in primary_key:
+                    pk_cols = [k.strip().strip('"').strip("'") for k in primary_key.split(',')]
+                else:
+                    pk_cols = [primary_key.strip().strip('"').strip("'")]
+            elif isinstance(primary_key, list):
+                pk_cols = [str(k).strip().strip('"').strip("'") for k in primary_key]
+            else:
+                pk_cols = [str(primary_key).strip().strip('"').strip("'")]
+
+            # --- Count each CDC operation type ---
+            op_counts_raw = df.groupBy('op_type').count().collect()
+            op_counts = {row['op_type']: row['count'] for row in op_counts_raw}
+            rows_insert = op_counts.get('I', 0)
+            rows_update = op_counts.get('U', 0)
+            rows_delete = op_counts.get('D', 0)
+            logging.info(f"CDC breakdown — Inserts: {rows_insert}, Updates: {rows_update}, Deletes: {rows_delete}")
+
+            # 1. Handle Updates/Deletes (Close old records)
+            # Filter rows that need to be closed (U or D)
+            updates_df = df.filter(F.col('op_type').isin(['U', 'D']))
+
+            if updates_df.count() > 0:
+                log_cdc(f"Processing {updates_df.count()} updates/deletes")
+
+                # DEBUG CDC MISMATCH
+                if '__debug_src' in df.columns:
+                    print("CDC DEBUG: Sample Mismatch (Source vs Target String)")
+                    mismatch_df = updates_df.filter("op_type = 'U'")
+                    if mismatch_df.count() > 0:
+                        debug_cols = pk_cols[:1] + ["__debug_src", "__debug_tgt"]
+                        mismatch_df.select(*debug_cols).show(1, truncate=False)
+
+                # Extract Primary Keys to a temporary staging table
+                staging_table = f"temp_staging_keys_{int(time.time())}"
+                keys_df = updates_df.select(*pk_cols).distinct()
+
+                # Write keys to staging table
+                keys_df.write.jdbc(
+                    url=jdbc_url,
+                    table=staging_table,
+                    mode='overwrite',
+                    properties=properties
+                )
+
+                # Execute SQL Update using psycopg2 (for Postgres)
+                if db_type == 'postgres':
+                    try:
+                        import psycopg2
+                        from urllib.parse import urlparse, unquote
+
+                        clean_url = jdbc_url
+                        if clean_url.startswith("jdbc:"):
+                            clean_url = clean_url[5:]
+                        parsed = urlparse(clean_url)
+                        db_host = parsed.hostname
+                        db_port = parsed.port or 5432
+                        db_name = parsed.path.lstrip('/')
+                        db_user = properties.get('user') or (unquote(parsed.username) if parsed.username else None)
+                        db_pass = properties.get('password') or (unquote(parsed.password) if parsed.password else None)
+
+                        conn = psycopg2.connect(
+                            host=db_host, port=db_port,
+                            database=db_name, user=db_user, password=db_pass
+                        )
+                        cur = conn.cursor()
+
+                        join_cond = " AND ".join([f'T."{k}" = S."{k}"' for k in pk_cols])
+                        schema_prefix = f"{schema}." if schema else ""
+                        update_sql = f"""
+                        UPDATE {schema_prefix}{table} T
+                        SET end_date = CURRENT_DATE, "Active_Flag" = 'N'
+                        FROM {staging_table} S
+                        WHERE {join_cond} AND T."Active_Flag" = 'Y'
+                        """
+                        logging.info(f"Executing SQL Update: {update_sql}")
+                        try:
+                            cur.execute(update_sql)
+                            conn.commit()
+                        except Exception as sql_err:
+                            print(f"CDC DEBUG: SQL Execution Error: {str(sql_err)}")
+                            raise sql_err
+
+                        cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+                        logging.info("Successfully updated existing records (SCD Type 2)")
+
+                    except ImportError:
+                        logging.error("psycopg2 not found - cannot execute SQL update for CDC. Skipping update step.")
+                    except Exception as e:
+                        logging.error(f"Failed to execute SQL update: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                        raise
+                else:
+                    logging.warning(f"CDC Update logic not implemented for DB type: {db_type}")
+
+            # 2. Handle Inserts/Updates (Insert new/updated rows)
+            inserts_df = df.filter(F.col('op_type').isin(['I', 'U']))
+            inserts_df = inserts_df.drop('op_type')
+            for col in ['__debug_src', '__debug_tgt']:
+                if col in inserts_df.columns:
+                    inserts_df = inserts_df.drop(col)
+
+            # Deduplicate by primary key to prevent constraint violations
+            if pk_cols:
+                valid_pk_cols = [c for c in pk_cols if c in inserts_df.columns]
+                if valid_pk_cols:
+                    before_count = inserts_df.count()
+                    inserts_df = inserts_df.dropDuplicates(valid_pk_cols)
+                    after_count = inserts_df.count()
+                    if before_count != after_count:
+                        logging.warning(
+                            f"CDC Insert: Dropped {before_count - after_count} duplicate rows "
+                            f"(by PK {valid_pk_cols}) before writing to prevent constraint violations."
+                        )
+
+            if inserts_df.count() > 0:
+                logging.info(f"Inserting {inserts_df.count()} new records")
+                inserts_df.write.jdbc(
+                    url=jdbc_url,
+                    table=qualified_table,
+                    mode='append',
+                    properties=properties
+                )
+
+            # Emit named log lines parsed by json_generator.py
+            logging.info(f"CDC insert row count: {rows_insert}")
+            logging.info(f"CDC update row count: {rows_update}")
+            logging.info(f"CDC delete row count: {rows_delete}")
+            logging.info(f"Target row count: {rows_insert + rows_update}")
+
+            return {
+                'rows_inserted': rows_insert,
+                'rows_updated': rows_update,
+                'rows_deleted': rows_delete,
             }
         else:
-            result = {
-                "success": False,
-                "pipeline_id": pipeline_id,
-                "status": "failed",
-                "duration": round(duration, 2),
-                "error": execution_error[-10000:] if execution_error else "Pipeline execution failed",  # Last 10000 chars
-                "message": f"Pipeline {pipeline_id} execution failed",
-                "config_path": filepath,
-                "execution_log": execution_output[-10000:] if execution_output else "",  # Include stdout even on failure
-                "full_log_path": stderr_log if execution_error else None,
-                "note": "To run pipelines, install PySpark: pip install pyspark"
-            }
-        
-        return jsonify(result)
+            # Standard append (no CDC)
+            rows_written = df.count()
+            df.write.jdbc(
+                url=jdbc_url,
+                table=qualified_table,
+                mode=mode,
+                properties=properties
+            )
+            return rows_written
     
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route('/api/connections', methods=['GET'])
-def list_connections():
-    """List available connection strings from environment variables"""
-    connections = []
-    # Filter for env vars that look like DB connections (Full URLs only)
-    patterns = ['_URL', '_CONN', '_STRING', '_JDBC']
-    for key, value in os.environ.items():
-        if any(pat in key for pat in patterns):
-            # Mask value
-            masked = f"{value[:8]}..." if len(value) > 8 else "***"
-            connections.append({"key": key, "value": masked})
-    return jsonify({"success": True, "connections": connections})
-
-
-@app.route('/api/test-connection', methods=['POST'])
-def test_connection():
-    """
-    Test database connection
-    
-    Request body: {
-        "type": "postgres",
-        "connectionString": "postgresql://user:pass@host:port/db",
-        "schema": "public",
-        "table": "employees"
-    }
-    
-    Returns: {
-        "success": true/false,
-        "error": "error message if failed"
-    }
-    """
-    try:
-        data = request.json
-        db_type = data.get('type')
-        connection_string = data.get('connectionString')
-        
-        if not db_type:
-            return jsonify({"success": False, "error": "Database type is required"}), 400
-        
-        if not connection_string:
-            return jsonify({"success": False, "error": "Connection string is required"}), 400
-            
-        # Check if connection_string is an environment variable key
-        if connection_string in os.environ:
-            connection_string = os.environ[connection_string]
-        
-        # Import required modules
-        from urllib.parse import urlparse, unquote
+    def _parse_connection_string(self, conn_str: str, db_type: str) -> tuple:
+        """
+        Parse connection string and return (jdbc_url, properties)
+        Supports formats like: postgresql://user:password@host:port/database
+        """
+        import re
+        from urllib.parse import urlparse, parse_qs, unquote
         
         # Remove jdbc: prefix if present
-        if connection_string.startswith("jdbc:"):
-            connection_string = connection_string[5:]
+        if conn_str.startswith("jdbc:"):
+            conn_str = conn_str[5:]
             
-        # Parse connection string
-        parsed = urlparse(connection_string)
-        
-        # Validate that it looks like a URL (must have scheme or netloc)
-        if not parsed.scheme or not parsed.netloc:
-            # Fallback checks?
-            if db_type == 'postgres' and "=" in connection_string:
-                 # Allow DSN style for postgres? 
-                 pass
-            else:
-                 return jsonify({"success": False, "error": "Invalid connection string format. Expected URL (e.g. postgresql://user:pass@host:port/db)"})
+        # Parse the connection string
+        parsed = urlparse(conn_str)
 
+        # Basic validation
+        if not parsed.scheme and not parsed.netloc and "=" not in conn_str:
+             if "localhost" in conn_str and ":" not in conn_str and "/" not in conn_str:
+                 raise ValueError("Invalid connection string. Please provide a full URL (e.g. postgresql://user:pass@host:port/db), not just a hostname.")
+        
+        # Extract components
         username = unquote(parsed.username) if parsed.username else ''
         password = unquote(parsed.password) if parsed.password else ''
         hostname = parsed.hostname or 'localhost'
         port = parsed.port
         database = parsed.path.lstrip('/') if parsed.path else ''
         
-        # Ensure database is not empty if required
-        if not database and db_type in ['postgres', 'mysql', 'oracle', 'sqlserver'] and parsed.scheme:
-             # handle case where path is empty
-             pass
-        
-        # Test connection based on database type
-        if db_type == 'postgres':
-            try:
-                import psycopg2
-                conn = psycopg2.connect(
-                    host=hostname,
-                    port=port or 5432,
-                    database=database,
-                    user=username,
-                    password=password,
-                    connect_timeout=5
-                )
-                conn.close()
-                return jsonify({"success": True})
-            except ImportError:
-                return jsonify({
-                    "success": False,
-                    "error": "PostgreSQL driver not installed. Run: pip install psycopg2-binary"
-                })
-            except Exception as e:
-                return jsonify({"success": False, "error": str(e)})
-                
-        elif db_type == 'mysql':
-            try:
-                import pymysql
-                conn = pymysql.connect(
-                    host=hostname,
-                    port=port or 3306,
-                    database=database,
-                    user=username,
-                    password=password,
-                    connect_timeout=5
-                )
-                conn.close()
-                return jsonify({"success": True})
-            except ImportError:
-                return jsonify({
-                    "success": False,
-                    "error": "MySQL driver not installed. Run: pip install pymysql"
-                })
-            except Exception as e:
-                return jsonify({"success": False, "error": str(e)})
-                
-        elif db_type == 'oracle':
-            try:
-                import oracledb
-                o_user, o_pwd, o_host, o_port, o_svc = _parse_oracle_connection(connection_string)
-                if not o_svc:
-                    return jsonify({
-                        "success": False,
-                        "error": "Oracle service name / SID is missing from connection string. "
-                                 "Expected format: oracle://user:pass@host:1521/SERVICE_NAME"
-                    })
-                conn = oracledb.connect(
-                    user=o_user, password=o_pwd,
-                    host=o_host, port=o_port,
-                    service_name=o_svc
-                )
-                conn.close()
-                return jsonify({"success": True})
-            except ImportError:
-                return jsonify({
-                    "success": False,
-                    "error": "Oracle driver not installed. Run: pip install oracledb"
-                })
-            except oracledb.DatabaseError as e:
-                err_str = str(e)
-                if 'DPY-6005' in err_str or 'TNS:' in err_str:
-                    return jsonify({
-                        "success": False,
-                        "error": f"Cannot reach Oracle DB at {o_host}:{o_port} (service: {o_svc}). "
-                                 f"Check host, port, service name, and that the DB listener is running. Detail: {err_str}"
-                    })
-                return jsonify({"success": False, "error": err_str})
-            except Exception as e:
-                return jsonify({"success": False, "error": str(e)})
-            
-        elif db_type == 'sqlserver':
-            return jsonify({
-                "success": False,
-                "error": "SQL Server connection testing not yet implemented. Install pyodbc and try executing a pipeline."
-            })
-            
-        else:
-            return jsonify({
-                "success": False,
-                "error": f"Unsupported database type: {db_type}"
-            })
-    
-    except Exception as e:
-        return jsonify({"success": False, "error": f"Connection test failed: {str(e)}"})
-
-
-@app.route('/api/preview/file-headers', methods=['POST'])
-def get_file_headers():
-    """
-    Get column headers from a file
-    
-    Request body (format 1 - frontend format):
-    {
-        "type": "csv",
-        "path": "/path/to/file.csv",
-        "delimiter": ","
-    }
-    
-    OR (format 2 - legacy format):
-    {
-        "path": "/path/to/file.csv",
-        "format": "csv",
-        "options": {"header": true, "delimiter": ","}
-    }
-    
-    Returns: {
-        "headers": ["col1", "col2", ...]
-    }
-    """
-    try:
-        data = request.json
-        
-        # Support both frontend format and legacy format
-        file_path = data.get('path')
-        file_format = data.get('format') or data.get('type', 'csv')
-        
-        # Get delimiter from either location
-        delimiter = data.get('delimiter')
-        if not delimiter and 'options' in data:
-            delimiter = data['options'].get('delimiter', ',')
-        if not delimiter:
-            delimiter = ','
-        
-        # Get header option
-        options = data.get('options', {})
-        has_header = options.get('header', True)
-        
-        if not file_path:
-            return jsonify({"error": "File path is required"}), 400
-        
-        if not os.path.exists(file_path):
-            return jsonify({"error": f"File not found: {file_path}"}), 404
-        
-        headers = []
-        
-        if file_format in ['csv', 'txt', 'dat']:
-            import csv
-            
-            with open(file_path, 'r') as f:
-                reader = csv.reader(f, delimiter=delimiter)
-                first_row = next(reader, None)
-                
-                if first_row:
-                    if has_header:
-                        headers = first_row
-                    else:
-                        # Generate column names like col0, col1, etc.
-                        headers = [f"col{i}" for i in range(len(first_row))]
-        
-        elif file_format == 'json':
-            with open(file_path, 'r') as f:
-                file_data = json.load(f)
-                if isinstance(file_data, list) and len(file_data) > 0:
-                    headers = list(file_data[0].keys())
-                elif isinstance(file_data, dict):
-                    headers = list(file_data.keys())
-        
-        elif file_format in ['parquet', 'orc', 'avro', 'excel']:
-            # For these formats, we'd need PySpark or pyarrow
-            # For now, return a message
-            return jsonify({
-                "error": f"Preview for {file_format} format requires PySpark. Please use manual column names."
-            }), 501
-        
-        else:
-            return jsonify({"error": f"Unsupported format: {file_format}"}), 400
-        
-        return jsonify({"headers": headers})
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/preview/db-columns', methods=['POST'])
-def get_db_columns():
-    """
-    Get column names from a database table
-    
-    Request body: {
-        "db_type": "postgres",
-        "table": "employees",
-        "schema": "public",
-        "connectionString": "postgresql://user:pass@host:port/db"
-        OR
-        "connection": "pg_conn"  (for pre-registered connections)
-    }
-    
-    Returns: {
-        "columns": ["col1", "col2", ...]
-    }
-    """
-    try:
-        data = request.json
-        db_type = data.get('db_type')
-        table = data.get('table')
-        schema = data.get('schema', 'public')
-        connection = data.get('connection')
-        connection_string = data.get('connectionString')
-        
-        if not all([db_type, table]):
-            return jsonify({"error": "db_type and table are required"}), 400
-        
-        if not connection and not connection_string:
-            return jsonify({"error": "Either connection or connectionString is required"}), 400
-        
-        # Import required modules
-        from urllib.parse import urlparse, unquote
-        # Drivers will be imported based on db_type
-        
-        columns = []
-        
-        # Parse connection string if provided
-        if connection_string:
-            # Check if connection_string is an environment variable key
-            if connection_string in os.environ:
-                connection_string = os.environ[connection_string]
-            
-            # Remove jdbc: prefix if present
-            if connection_string.startswith("jdbc:"):
-                connection_string = connection_string[5:]
-                
-            parsed = urlparse(connection_string)
-            username = unquote(parsed.username) if parsed.username else ''
-            password = unquote(parsed.password) if parsed.password else ''
-            hostname = parsed.hostname or 'localhost'
-            port = parsed.port
-            database = parsed.path.lstrip('/') if parsed.path else ''
-            
-            # Connect based on database type
-            if db_type == 'postgres':
-                import psycopg2
-                conn = psycopg2.connect(
-                    host=hostname,
-                    port=port or 5432,
-                    database=database,
-                    user=username,
-                    password=password
-                )
-                cursor = conn.cursor()
-                
-                # Query to get column names
-                qualified_table = f"{schema}.{table}" if schema else table
-                cursor.execute(f"""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_schema = %s AND table_name = %s
-                    ORDER BY ordinal_position
-                """, (schema, table))
-                
-                columns = [row[0] for row in cursor.fetchall()]
-                cursor.close()
-                conn.close()
-                
-            elif db_type == 'mysql':
-                import pymysql
-                conn = pymysql.connect(
-                    host=hostname,
-                    port=port or 3306,
-                    database=database,
-                    user=username,
-                    password=password
-                )
-                cursor = conn.cursor()
-                
-                # Query to get column names
-                cursor.execute(f"""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_schema = %s AND table_name = %s
-                    ORDER BY ordinal_position
-                """, (database, table))
-                
-                columns = [row[0] for row in cursor.fetchall()]
-                cursor.close()
-                conn.close()
-                
-            elif db_type == 'oracle':
-                import oracledb
-                o_user, o_pwd, o_host, o_port, o_svc = _parse_oracle_connection(connection_string)
-                conn = oracledb.connect(
-                    user=o_user, password=o_pwd,
-                    host=o_host, port=o_port,
-                    service_name=o_svc
-                )
-                cursor = conn.cursor()
-
-                # Oracle stores object names in UPPERCASE by default
-                cursor.execute("""
-                    SELECT COLUMN_NAME
-                    FROM ALL_TAB_COLUMNS
-                    WHERE UPPER(OWNER) = UPPER(:owner)
-                      AND UPPER(TABLE_NAME) = UPPER(:table_name)
-                    ORDER BY COLUMN_ID
-                """, owner=schema or o_user, table_name=table)
-
-                columns = [row[0] for row in cursor.fetchall()]
-                cursor.close()
-                conn.close()
-
-            else:
-                return jsonify({
-                    "error": f"Database type '{db_type}' not yet supported for column preview",
-                    "supported": ["postgres", "mysql", "oracle"]
-                }), 400
-        else:
-            # Using pre-registered connection (not implemented in this endpoint yet)
-            return jsonify({
-                "error": "Pre-registered connections not supported in column preview yet. Please use connectionString."
-            }), 400
-        
-        if not columns:
-            return jsonify({
-                "error": f"Table '{table}' not found or has no columns"
-            }), 404
-        
-        return jsonify({"columns": columns})
-    
-    except ImportError as e:
-        # Database drivers not installed - return helpful error with mock data
-        return jsonify({
-            "error": f"Database driver not installed: {str(e)}",
-            "hint": "Install required package: pip install psycopg2-binary pymysql oracledb",
-            "columns": ["id", "name", "email", "created_at", "updated_at"],  # Mock data as fallback
-            "note": "Showing mock columns - install database drivers for real column names"
-        }), 200  # Return 200 so UI doesn't break
-    except Exception as e:
-        return jsonify({"error": f"Failed to retrieve columns: {str(e)}"}), 500
-
-
-@app.route('/api/fs/list', methods=['GET'])
-def list_directory():
-    """
-    List files and directories in a given path
-    
-    Query params:
-        path: Directory path to list (optional, defaults to user home or current directory)
-    
-    Returns:
-        {
-            "current_path": "/absolute/path",
-            "parent_path": "/parent/path" or null,
-            "items": [
-                {
-                    "name": "filename.txt",
-                    "path": "/absolute/path/filename.txt",
-                    "is_dir": false,
-                    "size": 1024,
-                    "modified": "2024-01-01T12:00:00"
-                }
-            ]
+        # Build JDBC URL based on database type
+        driver_map = {
+            'postgres': ('org.postgresql.Driver', f"jdbc:postgresql://{hostname}:{port or 5432}/{database}"),
+            'mysql': ('com.mysql.cj.jdbc.Driver', f"jdbc:mysql://{hostname}:{port or 3306}/{database}"),
+            'oracle': ('oracle.jdbc.driver.OracleDriver', f"jdbc:oracle:thin:@//{hostname}:{port or 1521}/{database}"),
+            'sqlserver': ('com.microsoft.sqlserver.jdbc.SQLServerDriver', 
+                         f"jdbc:sqlserver://{hostname}:{port or 1433};databaseName={database}")
         }
-    """
-    try:
-        # Get requested path from query params
-        requested_path = request.args.get('path', '')
         
-        # Security: Resolve to absolute path and prevent directory traversal
-        if not requested_path:
-            # Default to user home directory
-            current_path = os.path.expanduser('~')
+        if db_type not in driver_map:
+            raise ValueError(f"Unsupported database type: {db_type}")
+        
+        driver, jdbc_url = driver_map[db_type]
+        
+        properties = {
+            'user': username,
+            'password': password,
+            'driver': driver
+        }
+        
+        logging.info(f"Parsed connection string for {db_type}: {hostname}:{port}/{database}")
+        return jdbc_url, properties
+
+
+class TargetFactory:
+    """Factory for creating target handlers"""
+    
+    _handlers = {
+        'FILE': FileTargetHandler,
+        'DB': DBTargetHandler
+    }
+    
+    @classmethod
+    def get_handler(cls, target_type: str) -> TargetHandler:
+        handler_class = cls._handlers.get(target_type)
+        if not handler_class:
+            raise ValueError(f"Unsupported target type: {target_type}")
+        return handler_class()
+
+
+class ConnectionRegistry:
+    """Registry for database connections"""
+    
+    _connections = {}
+    
+    @classmethod
+    def register(cls, name: str, url: str, properties: Dict):
+        cls._connections[name] = {
+            'url': url,
+            'properties': properties
+        }
+    
+    @classmethod
+    def get_connection(cls, name: str) -> Dict:
+        if name not in cls._connections:
+            raise ValueError(f"Connection not found: {name}")
+        return cls._connections[name]
+
+
+class DataFrameRegistry:
+    """Registry for lookup DataFrames"""
+    
+    _dataframes = {}
+    
+    @classmethod
+    def register(cls, name: str, df: DataFrame):
+        cls._dataframes[name] = df
+    
+    @classmethod
+    def get_dataframe(cls, name: str) -> DataFrame:
+        if name not in cls._dataframes:
+            raise ValueError(f"DataFrame not found: {name}")
+        return cls._dataframes[name]
+
+
+class AuditMetrics:
+    """Capture and track audit metrics"""
+    
+    def __init__(self):
+        self.metrics = {
+            'pipeline_id': None,
+            'start_time': None,
+            'end_time': None,
+            'duration_seconds': None,
+            'source_row_count': 0,
+            'target_row_count': 0,
+            'reject_row_count': 0,
+            'status': 'RUNNING'
+        }
+    
+    def start(self, pipeline_id: str):
+        self.metrics['pipeline_id'] = pipeline_id
+        self.metrics['start_time'] = datetime.now()
+        self.metrics['status'] = 'RUNNING'
+    
+    def end(self, status: str = 'SUCCESS'):
+        self.metrics['end_time'] = datetime.now()
+        self.metrics['status'] = status
+        if self.metrics['start_time']:
+            duration = self.metrics['end_time'] - self.metrics['start_time']
+            self.metrics['duration_seconds'] = duration.total_seconds()
+    
+    def set_counts(self, source: int = 0, target: int = 0, reject: int = 0):
+        self.metrics['source_row_count'] = source
+        self.metrics['target_row_count'] = target
+        self.metrics['reject_row_count'] = reject
+    
+    def get_metrics(self) -> Dict:
+        return self.metrics
+
+
+class RejectHandler:
+    """Handle rejected rows"""
+    
+    def __init__(self, config: Dict):
+        self.enabled = config.get('enable', False)
+        self.path = config.get('path')
+        self.include_reason = config.get('include_reason', True)
+        self.reject_count = 0  # Track total rejected rows
+    
+    def write_rejects(self, df: DataFrame, reason: str = 'VALIDATION_FAILED'):
+        if not self.enabled or df.count() == 0:
+            return
+
+        count = df.count()
+        self.reject_count += count  # Increment total reject count
+
+        if self.include_reason:
+            df = df.withColumn('reject_reason', F.lit(reason))
+            df = df.withColumn('reject_timestamp', F.current_timestamp())
+
+        logging.info(f"Writing {count} rejected rows to {self.path}")
+
+        # Convert path to a forward-slash URI so PySpark/Hadoop works on Windows
+        import os
+        abs_reject_path = os.path.abspath(self.path)
+        fwd = abs_reject_path.replace("\\", "/")
+        if len(fwd) > 1 and fwd[1] == ':':   # Windows drive letter (e.g. C:/...)
+            spark_reject_path = "file:///" + fwd
         else:
-            # Resolve to absolute path
-            current_path = os.path.abspath(os.path.expanduser(requested_path))
+            spark_reject_path = fwd
+
+        df.write.mode('append').parquet(spark_reject_path)
+
+    
+    def get_reject_count(self) -> int:
+        """Get total count of rejected rows"""
+        return self.reject_count
+
+
+class ETLEngine:
+    """Main ETL Engine - orchestrates the entire pipeline"""
+    
+    def __init__(self, config_path: str):
+        self.config = ETLConfig(config_path)
+        self.spark = self._create_spark_session()
+        self.audit = AuditMetrics()
+        self.reject_handler = RejectHandler(self.config.get('reject', {}))
         
-        # Check if path exists and is a directory
-        if not os.path.exists(current_path):
-            return jsonify({
-                "error": f"Path does not exist: {current_path}"
-            }), 404
+        # Error handling configuration
+        error_handling_config = self.config.get('error_handling', {})
+        self.error_handling_mode = error_handling_config.get('mode', 'reject_and_continue')
+        self.has_errors = False  # Track if errors occurred
         
-        if not os.path.isdir(current_path):
-            return jsonify({
-                "error": f"Path is not a directory: {current_path}"
-            }), 400
+        self._setup_logging()
+    
+    def _create_spark_session(self) -> SparkSession:
+        """Create Spark session"""
+        pipeline_id = self.config.get('pipeline', {}).get('pipeline_id', 'ETL_ENGINE')
+        import tempfile
+        import os as _os
         
-        # Get parent directory
-        parent_path = os.path.dirname(current_path)
-        # If we're at root, parent is None
-        if parent_path == current_path:
-            parent_path = None
+        # Java 17+ compatibility: set JAVA_TOOL_OPTIONS before the JVM starts.
+        _os.environ.setdefault('JAVA_TOOL_OPTIONS', (
+            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
+            "--add-opens=java.base/java.lang=ALL-UNNAMED "
+            "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
+            "--add-opens=java.base/java.io=ALL-UNNAMED "
+            "--add-opens=java.base/java.util=ALL-UNNAMED "
+            "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED "
+            "--add-exports=java.base/javax.security.auth=ALL-UNNAMED"
+        ))
         
-        # List directory contents
-        items = []
-        try:
-            entries = os.listdir(current_path)
+        # Java 21+ bypass for Hadoop UserGroupInformation 'getSubject' error
+        # Setting HADOOP_USER_NAME forces Hadoop to use Simple auth directly
+        # and bypasses the LDAP/Kerberos Subject.getSubject() call entirely.
+        _os.environ['HADOOP_USER_NAME'] = 'spark'
+        
+        return SparkSession.builder \
+            .appName(f"ETL_Engine_{pipeline_id}") \
+            .config("spark.hadoop.hadoop.native.lib", "false") \
+            .config("spark.hadoop.io.nativeio.NativeIO.Windows.access0", "false") \
+            .config("spark.hadoop.hadoop.security.authentication", "simple") \
+            .config("spark.hadoop.hadoop.security.authorization", "false") \
+            .config("spark.local.dir", tempfile.gettempdir()) \
+            .getOrCreate()
+    
+    def _setup_logging(self):
+        """Setup logging configuration"""
+        log_level = self.config.get('pipeline', {}).get('log_level', 'INFO')
+        logger = logging.getLogger()
+        
+        # Clear any existing handlers (e.g., set by PySpark)
+        if logger.hasHandlers():
+            logger.handlers.clear()
             
-            for entry_name in sorted(entries):
-                entry_path = os.path.join(current_path, entry_name)
+        logger.setLevel(getattr(logging, log_level))
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        
+        # Handler for INFO and DEBUG (stdout)
+        class InfoFilter(logging.Filter):
+            def filter(self, rec):
+                return rec.levelno < logging.WARNING
                 
-                try:
-                    # Get file stats
-                    stat_info = os.stat(entry_path)
-                    is_dir = os.path.isdir(entry_path)
-                    
-                    items.append({
-                        "name": entry_name,
-                        "path": entry_path,
-                        "is_dir": is_dir,
-                        "size": stat_info.st_size if not is_dir else 0,
-                        "modified": datetime.fromtimestamp(stat_info.st_mtime).isoformat()
-                    })
-                except (OSError, PermissionError):
-                    # Skip files we can't access
-                    continue
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(formatter)
+        stdout_handler.addFilter(InfoFilter())
+        logger.addHandler(stdout_handler)
         
-        except PermissionError:
-            return jsonify({
-                "error": f"Permission denied: {current_path}"
-            }), 403
-        
-        return jsonify({
-            "current_path": current_path,
-            "parent_path": parent_path,
-            "items": items
-        })
+        # Handler for WARNING, ERROR, CRITICAL (stderr)
+        # Use sys.__stderr__ to bypass any PySpark redirection of sys.stderr
+        stderr_handler = logging.StreamHandler(sys.__stderr__)
+        stderr_handler.setLevel(logging.WARNING)
+        stderr_handler.setFormatter(formatter)
+        logger.addHandler(stderr_handler)
     
+    def execute(self):
+        """Execute the ETL pipeline"""
+        pipeline_id = self.config.get('pipeline', {}).get('pipeline_id')
+        
+        try:
+            logging.info(f"Starting pipeline: {pipeline_id}")
+            self.audit.start(pipeline_id)
+            
+            # Step 1: Read from source
+            df = self._read_source()
+            source_count = df.count()
+            logging.info(f"Source row count: {source_count}")
+            
+            # Step 2: Apply transformations
+            df = self._apply_transformations(df)
+            
+            # Step 3: Apply field mappings (column selection, renaming, ordering)
+            df = self._apply_field_mappings(df)
+            
+            # Step 4: Write to target - returns rows written (int) or CDC dict {rows_inserted, rows_updated, rows_deleted}
+            write_result = self._write_target(df)
+            if isinstance(write_result, dict):
+                # CDC pipeline: extract individual counts
+                cdc_inserts = write_result.get('rows_inserted', 0)
+                cdc_updates = write_result.get('rows_updated', 0)
+                cdc_deletes = write_result.get('rows_deleted', 0)
+                target_count = cdc_inserts + cdc_updates
+                logging.info(f"CDC insert row count: {cdc_inserts}")
+                logging.info(f"CDC update row count: {cdc_updates}")
+                logging.info(f"CDC delete row count: {cdc_deletes}")
+            else:
+                target_count = write_result or 0
+            logging.info(f"Target row count: {target_count}")
+            
+            # Step 5: Check error handling mode and reject count
+            reject_count = self.reject_handler.get_reject_count() if hasattr(self.reject_handler, 'get_reject_count') else 0
+            if reject_count > 0:
+                self.has_errors = True
+                logging.warning(f"Pipeline encountered {reject_count} rejected rows")
+                
+                # If mode is reject_and_fail, fail the pipeline after capturing errors
+                if self.error_handling_mode == 'reject_and_fail':
+                    error_msg = f"Pipeline failed due to error handling mode 'reject_and_fail'. {reject_count} rows were rejected. Check reject files for details."
+                    logging.error(error_msg)
+                    self.audit.end('FAILED')
+                    raise RuntimeError(error_msg)
+            
+            # Step 6: Capture audit metrics
+            self.audit.set_counts(source=source_count, target=target_count, reject=reject_count)
+            self.audit.end('SUCCESS')
+            
+            if self.config.get('audit', {}).get('enable', False):
+                self._write_audit_metrics()
+            
+            logging.info(f"Pipeline {pipeline_id} completed successfully")
+            
+        except Exception as e:
+            logging.error(f"Pipeline {pipeline_id} failed: {str(e)}")
+            self.audit.end('FAILED')
+            raise
+        finally:
+            self.spark.stop()
+    
+    def _read_source(self) -> DataFrame:
+        """Read data from source"""
+        source_config = self.config.get('source')
+        source_type = source_config.get('type')
+        
+        handler = SourceFactory.get_handler(source_type)
+        return handler.read(self.spark, source_config)
+    
+    def _apply_transformations(self, df: DataFrame) -> DataFrame:
+        """Apply all transformations in sequence"""
+        transformations = self.config.get('transformations', [])
+        
+        if not transformations:
+            logging.info("No transformations configured")
+            return df
+        
+        logging.info(f"Applying {len(transformations)} transformations")
+        
+        for idx, transform_config in enumerate(transformations):
+            transform_type = transform_config.get('type')
+            logging.info(f"Transformation {idx + 1}/{len(transformations)}: {transform_type}")
+            
+            handler = TransformationFactory.get_handler(transform_type)
+            
+            # Prepare context
+            context = {
+                'reject_handler': self.reject_handler
+            }
+            
+            df = handler.apply(df, transform_config, context)
+        
+        return df
+    
+    def _apply_field_mappings(self, df: DataFrame) -> DataFrame:
+        """
+        Apply field mappings: column selection, renaming, and ordering
+        This ensures only selected columns are written to target in the correct order
+        """
+        field_mappings = self.config.get('field_mappings', [])
+        
+        if not field_mappings:
+            logging.info("No field mappings configured - writing all columns")
+            return df
+        
+        logging.info(f"Applying field mappings for {len(field_mappings)} columns")
+        
+        # Sort by order to maintain column sequence
+        sorted_mappings = sorted(field_mappings, key=lambda x: x.get('order', 0))
+        
+        # Build select expressions with renaming
+        select_exprs = []
+        for mapping in sorted_mappings:
+            source_col = mapping.get('source_column')
+            target_col = mapping.get('target_column', source_col)
+            
+            if source_col in df.columns:
+                # Column exists - select and rename if needed
+                if source_col != target_col:
+                    select_exprs.append(F.col(source_col).alias(target_col))
+                    logging.info(f"Mapping: {source_col} -> {target_col}")
+                else:
+                    select_exprs.append(F.col(source_col))
+                    logging.info(f"Selecting: {source_col}")
+            else:
+                logging.warning(f"Source column '{source_col}' not found in DataFrame - skipping")
+        
+        if not select_exprs:
+            logging.warning("No valid columns to select - returning original DataFrame")
+            return df
+        
+        # CRITICAL FIX: Preserve CDC metadata column if present
+        # The op_type column is added by CDC transformations but not in field_mappings
+        # We must preserve it for the DBTargetHandler to detect CDC operations
+        if 'op_type' in df.columns:
+            select_exprs.append(F.col('op_type'))
+            logging.info("Preserving CDC metadata column: op_type")
+            
+        # Preserve Debug Columns
+        for debug_col in ['__debug_src', '__debug_tgt']:
+            if debug_col in df.columns:
+                select_exprs.append(F.col(debug_col))
+        
+        # Select and reorder columns
+        df = df.select(*select_exprs)
+        logging.info(f"Final column order: {df.columns}")
+        
+        return df
+    
+    def _write_target(self, df: DataFrame):
+        """Write data to target"""
+        target_config = self.config.get('target')
+        target_type = target_config.get('type')
+        
+        # --- VALIDATION STEP ---
+        # Provide specialized validation for Database targets to handle constraints
+        # Spark JDBC batch inserts fail completely if ANY row violates a constraint.
+        # We must filter bad rows BEFORE writing if error handling is enabled.
+        if target_type in ['postgres', 'mysql', 'oracle', 'sqlserver']:
+             primary_key = target_config.get('primary_key')
+             if primary_key and primary_key in df.columns:
+                 # Check for NULLs in Primary Key
+                 null_pk_filter = F.col(primary_key).isNull()
+                 null_pk_count = df.filter(null_pk_filter).count()
+                 
+                 if null_pk_count > 0:
+                     logging.warning(f"Validation: Found {null_pk_count} rows with NULL Primary Key '{primary_key}'")
+                     
+                     if self.error_handling_mode == 'reject_and_continue':
+                         # Log to reject handler
+                         bad_rows_df = df.filter(null_pk_filter)
+                         self.reject_handler.write_rejects(bad_rows_df, f"Constraint Violation: NULL Primary Key '{primary_key}'")
+                         
+                         # Filter them out from main DF
+                         df = df.filter(F.col(primary_key).isNotNull())
+                         logging.info(f"Rejected {null_pk_count} rows due to likely constraint violations. Proceeding with {df.count()} rows.")
+                         
+                     elif self.error_handling_mode == 'reject_and_fail':
+                         # Fail immediately
+                         msg = f"Found {null_pk_count} rows with NULL Primary Key '{primary_key}'. Pipeline failed due to mode 'reject_and_fail'."
+                         logging.error(msg)
+                         raise ValueError(msg)
+        # --- END VALIDATION STEP ---
+
+        handler = TargetFactory.get_handler(target_type)
+        return handler.write(df, target_config)
+    
+    def _write_audit_metrics(self):
+        """Write audit metrics"""
+        metrics = self.audit.get_metrics()
+        logging.info(f"Audit Metrics: {metrics}")
+        
+        # Convert to DataFrame and write
+        metrics_df = self.spark.createDataFrame([metrics])
+        audit_path = self.config.get('audit', {}).get('path', '/data/audit')
+        metrics_df.write.mode('append').parquet(audit_path)
+
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) < 2:
+        print("Usage: spark-submit etl_engine.py <config_json_path>")
+        sys.exit(1)
+    
+    config_path = sys.argv[1]
+    
+    try:
+        engine = ETLEngine(config_path)
+        engine.execute()
     except Exception as e:
-        return jsonify({
-            "error": str(e)
-        }), 500
+        # Fallback logging if _setup_logging wasn't called or failed
+        logger = logging.getLogger()
+        if not logger.handlers:
+            stderr_handler = logging.StreamHandler(sys.__stderr__)
+            stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logger.addHandler(stderr_handler)
+        
+        logging.error(f"ETL Engine failed: {str(e)}")
+        sys.exit(1)
+    finally:
+        # Print buffered CDC logs at the very end to ensure they appear in truncated API logs
+        if 'CDC_DEBUG_LOGS' in globals() and CDC_DEBUG_LOGS:
+            print("\n" + "="*50)
+            print("CDC DEBUG SUMMARY (LAST 1000 CHARS SAFE)")
+            print("="*50)
+            for msg in CDC_DEBUG_LOGS:
+                print(msg)
+            print("="*50 + "\n")
 
 
-if __name__ == '__main__':
-    print("=" * 60)
-    print("JSON Generator API Server")
-    print("=" * 60)
-    print("Starting server on http://localhost:9001")
-    print("\nAvailable endpoints:")
-    print("  GET  /api/health              - Health check")
-    print("  POST /api/generate-config     - Generate pipeline config")
-    print("  POST /api/save-config         - Save config to file")
-    print("  GET  /api/list-configs        - List all configs")
-    print("  GET  /api/get-config/<id>     - Get specific config")
-    print("  DELETE /api/delete-config/<id> - Delete config")
-    print("  POST /api/validate-config     - Validate config")
-    print("  POST /api/execute-pipeline    - Execute pipeline")
-    print("  POST /api/test-connection     - Test database connection")
-    print("  POST /api/preview/file-headers - Get file column headers")
-    print("  POST /api/preview/db-columns  - Get database columns")
-    print("  GET  /api/fs/list             - Browse server files")
-    print("=" * 60)
-    
-    app.run(debug=True, host='0.0.0.0', port=9001)
+if __name__ == "__main__":
+    main()
