@@ -22,6 +22,53 @@ CONFIG_DIR = os.path.join(os.path.dirname(__file__), 'config')
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 
+def _parse_oracle_connection(cs: str):
+    """Parse Oracle connection string into (username, password, host, port, service_name).
+    Handles formats:
+      - oracle://user:pass@host:1521/SERVICE
+      - oracle+cx_oracle://user:pass@host:1521/SERVICE
+      - jdbc:oracle:thin:user/pass@host:1521:SID
+      - jdbc:oracle:thin:@//host:1521/SERVICE
+      - jdbc:oracle:thin:@host:1521:SID
+    """
+    import re
+    from urllib.parse import urlparse, unquote
+
+    if cs.startswith('jdbc:oracle:thin:'):
+        after = cs[len('jdbc:oracle:thin:'):]
+        m = re.match(r'^([^@/]+)/([^@]+)@(.+)$', after)
+        if m:
+            uname, pwd, rest = m.group(1), m.group(2), m.group(3)
+        else:
+            uname, pwd = '', ''
+            rest = after.lstrip('@')
+
+        if rest.startswith('//'):
+            inner = rest[2:]
+            host_port, _, svc = inner.partition('/')
+            host, _, port_str = host_port.partition(':')
+            port = int(port_str) if port_str.isdigit() else 1521
+        else:
+            parts = rest.split(':')
+            host = parts[0] if len(parts) > 0 else 'localhost'
+            port = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1521
+            svc = parts[2] if len(parts) > 2 else ''
+
+        return uname, pwd, host, port, svc
+
+    normalised = re.sub(r'^oracle\+[a-z_]+://', 'oracle://', cs)
+    if not normalised.startswith('oracle://'):
+        normalised = 'oracle://' + normalised.lstrip('/')
+
+    parsed = urlparse(normalised)
+    uname = unquote(parsed.username or '')
+    pwd   = unquote(parsed.password or '')
+    host  = parsed.hostname or 'localhost'
+    port  = parsed.port or 1521
+    svc   = parsed.path.lstrip('/') if parsed.path else ''
+    return uname, pwd, host, port, svc
+
+
 class PipelineConfigGenerator:
     """Generates ETL pipeline JSON configurations from frontend requests"""
     
@@ -716,9 +763,18 @@ def test_connection():
         elif db_type == 'oracle':
             try:
                 import oracledb
-                # The 'database' variable here corresponds to the Oracle service name
-                dsn_tns = oracledb.makedsn(hostname, port or 1521, service_name=database)
-                conn = oracledb.connect(user=username, password=password, dsn=dsn_tns)
+                o_user, o_pwd, o_host, o_port, o_svc = _parse_oracle_connection(connection_string)
+                if not o_svc:
+                    return jsonify({
+                        "success": False,
+                        "error": "Oracle service name / SID is missing from connection string. "
+                                 "Expected format: oracle://user:pass@host:1521/SERVICE_NAME"
+                    })
+                conn = oracledb.connect(
+                    user=o_user, password=o_pwd,
+                    host=o_host, port=o_port,
+                    service_name=o_svc
+                )
                 conn.close()
                 return jsonify({"success": True})
             except ImportError:
@@ -726,6 +782,15 @@ def test_connection():
                     "success": False,
                     "error": "Oracle driver not installed. Run: pip install oracledb"
                 })
+            except oracledb.DatabaseError as e:
+                err_str = str(e)
+                if 'DPY-6005' in err_str or 'TNS:' in err_str:
+                    return jsonify({
+                        "success": False,
+                        "error": f"Cannot reach Oracle DB at {o_host}:{o_port} (service: {o_svc}). "
+                                 f"Check host, port, service name, and that the DB listener is running. Detail: {err_str}"
+                    })
+                return jsonify({"success": False, "error": err_str})
             except Exception as e:
                 return jsonify({"success": False, "error": str(e)})
             
@@ -937,8 +1002,12 @@ def get_db_columns():
                 
             elif db_type == 'oracle':
                 import oracledb
-                dsn_tns = oracledb.makedsn(hostname, port or 1521, service_name=database)
-                conn = oracledb.connect(user=username, password=password, dsn=dsn_tns)
+                o_user, o_pwd, o_host, o_port, o_svc = _parse_oracle_connection(connection_string)
+                conn = oracledb.connect(
+                    user=o_user, password=o_pwd,
+                    host=o_host, port=o_port,
+                    service_name=o_svc
+                )
                 cursor = conn.cursor()
 
                 # Oracle stores object names in UPPERCASE by default
@@ -948,7 +1017,7 @@ def get_db_columns():
                     WHERE UPPER(OWNER) = UPPER(:owner)
                       AND UPPER(TABLE_NAME) = UPPER(:table_name)
                     ORDER BY COLUMN_ID
-                """, owner=schema or username, table_name=table)
+                """, owner=schema or o_user, table_name=table)
 
                 columns = [row[0] for row in cursor.fetchall()]
                 cursor.close()
