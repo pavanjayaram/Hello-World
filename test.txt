@@ -1034,80 +1034,98 @@ class FileTargetHandler(TargetHandler):
                 logging.error(f"Failed to write excel: {e}")
                 raise
 
-        # Map text-based formats to CSV (Spark doesn't have native txt/dat support)
-        format_mapping = {
-            'txt': 'csv',
-            'dat': 'csv',
-            'text': 'csv'
-        }
-        
-        actual_format = format_mapping.get(format_type.lower(), format_type)
-        
         import os
-        import glob
         import shutil
-        import tempfile
 
-        logging.info(f"Writing {format_type} (as {actual_format}) to {path} with mode {mode}")
-
-        # Resolve to an absolute OS path first
+        # Resolve to an absolute OS path
         abs_path = os.path.abspath(path)
         target_dir = os.path.dirname(abs_path)
-
-        # Use a non-hidden temp dir name (avoid dot-prefix — Hadoop winutils can't
-        # delete hidden directories on Windows, causing o89.save failures)
-        temp_dir_name = f"_tmp_{os.path.basename(abs_path)}_{int(time.time())}"
-        temp_dir = os.path.join(target_dir, temp_dir_name)
-
-        # Ensure target directory exists for text-based outputs
         if target_dir:
             os.makedirs(target_dir, exist_ok=True)
 
-        # Convert the temp_dir native OS path to a forward-slash URI that
-        # PySpark/Hadoop understands on Windows (e.g. file:///C:/Users/foo/_tmp_bar)
+        fmt = format_type.lower()
+
+        # -----------------------------------------------------------------------
+        # Use pandas for text-based formats (CSV / TXT / DAT / JSON).
+        # This completely avoids PySpark's Hadoop file writer which requires
+        # winutils.exe on Windows ("FileFormatWriter: Aborting Job" error).
+        # -----------------------------------------------------------------------
+        if fmt in ['csv', 'txt', 'dat', 'text', 'json']:
+            logging.info(f"Writing {format_type} to {abs_path} via pandas (bypasses Hadoop)")
+            try:
+                import pandas as pd
+                pdf = df.toPandas()
+
+                write_mode = 'w' if mode == 'overwrite' else 'a'
+                include_header = options.get('header', 'true')
+                # Accept both boolean and string 'true'/'false'
+                if isinstance(include_header, str):
+                    include_header = include_header.lower() != 'false'
+
+                delimiter = options.get('delimiter', options.get('sep', ','))
+
+                if fmt == 'json':
+                    pdf.to_json(abs_path, orient='records', lines=True,
+                                mode=write_mode, index=False)
+                else:
+                    # csv / txt / dat all write as delimited text
+                    pdf.to_csv(abs_path, index=False, header=include_header,
+                               sep=delimiter, mode=write_mode)
+
+                logging.info(f"Successfully wrote {len(pdf)} rows to {abs_path}")
+                return
+
+            except ImportError:
+                logging.error("pandas not installed. Run: pip install pandas")
+                raise
+            except Exception as e:
+                logging.error(f"Failed to write {format_type} via pandas: {e}")
+                raise
+
+        # -----------------------------------------------------------------------
+        # For binary formats (parquet, orc, avro) — use the Spark writer.
+        # Convert path to a forward-slash file:/// URI so Spark/Hadoop works on
+        # Windows when winutils IS available.
+        # -----------------------------------------------------------------------
+        import glob
+
         def to_spark_uri(p: str) -> str:
             p = os.path.abspath(p).replace("\\", "/")
-            if len(p) > 1 and p[1] == ':':          # Windows drive letter, e.g. C:/...
+            if len(p) > 1 and p[1] == ':':      # Windows drive letter, e.g. C:/...
                 return "file:///" + p
-            return p                                  # Already Unix-style
+            return p                              # Already Unix-style
 
+        temp_dir = os.path.join(target_dir, f"_tmp_{os.path.basename(abs_path)}_{int(time.time())}")
         spark_temp_dir = to_spark_uri(temp_dir)
 
-        # We coerce the format to a single partition to guarantee one part-* file
-        writer = df.coalesce(1).write.format(actual_format).mode(mode).options(**options)
+        logging.info(f"Writing {format_type} to {abs_path} via Spark (temp URI: {spark_temp_dir})")
 
+        writer = df.coalesce(1).write.format(format_type).mode(mode).options(**options)
         if partition_by:
             writer = writer.partitionBy(*partition_by)
 
         try:
-            # 1. Write the DataFrame to the temporary PySpark directory (URI path)
-            logging.info(f"PySpark writing to temp URI: {spark_temp_dir}")
             writer.save(spark_temp_dir)
 
-            # 2. Find the single partitioned file it created
-            # e.g., temp_dir/part-00000-xxxxx.csv
             part_files = glob.glob(os.path.join(temp_dir, 'part-*'))
-
             if not part_files:
-                raise FileNotFoundError(f"Failed to find part-* file in PySpark output directory: {temp_dir}")
+                raise FileNotFoundError(
+                    f"Failed to find part-* file in PySpark output directory: {temp_dir}"
+                )
 
-            actual_part_file = part_files[0]
-
-            # 3. Handle overwrites: remove the existing target if it's there
             if mode == 'overwrite' and os.path.exists(abs_path):
                 if os.path.isfile(abs_path):
                     os.remove(abs_path)
                 elif os.path.isdir(abs_path):
                     shutil.rmtree(abs_path)
 
-            # 4. Move and rename the part- file to the exact requested path
-            shutil.move(actual_part_file, abs_path)
+            shutil.move(part_files[0], abs_path)
             logging.info(f"Successfully consolidated output to single file: {abs_path}")
 
         finally:
-            # 5. Destroy the temporary PySpark directory (and the _SUCCESS flag)
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+
 
 
 
