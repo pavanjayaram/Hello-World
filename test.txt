@@ -1549,10 +1549,21 @@ class ETLEngine:
     """Main ETL Engine - orchestrates the entire pipeline"""
     
     def __init__(self, config_path: str):
+        import os as _os
+        # Store config directory so relative paths (./audit, ./reject) resolve
+        # next to the config file, not against spark-submit's working directory
+        # (which on Windows is often C:\ — a protected system folder).
+        self.config_dir = _os.path.dirname(_os.path.abspath(config_path))
+
         self.config = ETLConfig(config_path)
         self.spark = self._create_spark_session()
         self.audit = AuditMetrics()
-        self.reject_handler = RejectHandler(self.config.get('reject', {}))
+
+        # Resolve reject path relative to the config file's directory
+        reject_cfg = dict(self.config.get('reject', {}))
+        if reject_cfg.get('path') and not _os.path.isabs(reject_cfg['path']):
+            reject_cfg['path'] = _os.path.join(self.config_dir, reject_cfg['path'])
+        self.reject_handler = RejectHandler(reject_cfg)
         
         # Error handling configuration
         error_handling_config = self.config.get('error_handling', {})
@@ -1686,11 +1697,20 @@ class ETLEngine:
     
     def _read_source(self) -> DataFrame:
         """Read data from source"""
-        source_config = self.config.get('source')
+        import os
+        source_config = dict(self.config.get('source'))
         source_type = source_config.get('type')
-        
+
+        # Resolve relative FILE source paths against config file's directory,
+        # not spark-submit's cwd (which on Windows is often C:\ — access denied).
+        if source_type == 'FILE' and source_config.get('path'):
+            p = source_config['path']
+            if not os.path.isabs(p):
+                source_config['path'] = os.path.join(self.config_dir, p)
+
         handler = SourceFactory.get_handler(source_type)
         return handler.read(self.spark, source_config)
+
     
     def _apply_transformations(self, df: DataFrame) -> DataFrame:
         """Apply all transformations in sequence"""
@@ -1774,9 +1794,17 @@ class ETLEngine:
     
     def _write_target(self, df: DataFrame):
         """Write data to target"""
-        target_config = self.config.get('target')
+        import os
+        target_config = dict(self.config.get('target'))
         target_type = target_config.get('type')
-        
+
+        # Resolve relative FILE target paths against config file's directory,
+        # not spark-submit's cwd (which on Windows is often C:\ — access denied).
+        if target_type == 'FILE' and target_config.get('path'):
+            p = target_config['path']
+            if not os.path.isabs(p):
+                target_config['path'] = os.path.join(self.config_dir, p)
+
         # --- VALIDATION STEP ---
         # Provide specialized validation for Database targets to handle constraints
         # Spark JDBC batch inserts fail completely if ANY row violates a constraint.
@@ -1809,16 +1837,18 @@ class ETLEngine:
 
         handler = TargetFactory.get_handler(target_type)
         return handler.write(df, target_config)
+
     
     def _write_audit_metrics(self):
         """Write audit metrics"""
+        import os
         metrics = self.audit.get_metrics()
         logging.info(f"Audit Metrics: {metrics}")
-        
-        # Use pandas to write audit metrics — avoids Hadoop/winutils requirement on Windows
 
-        import os, json
+        # Resolve audit path relative to config file directory (not spark-submit cwd)
         audit_path = self.config.get('audit', {}).get('path', './audit')
+        if not os.path.isabs(audit_path):
+            audit_path = os.path.join(self.config_dir, audit_path)
         abs_audit_path = os.path.abspath(audit_path)
         os.makedirs(abs_audit_path, exist_ok=True)
         audit_file = os.path.join(abs_audit_path, f"{metrics.get('pipeline_id', 'audit')}.csv")
