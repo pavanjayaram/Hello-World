@@ -1,14 +1,21 @@
 
+        else:  # DB
+            # Try to get db_type from frontend payload (could be db_type or database_type)
+            db_type = target_data.get('db_type') or target_data.get('database_type')
             
-            # Support both connection (registry) and connectionString (direct)
-            if 'connection' in target_data:
-                config['connection'] = target_data['connection']
-            if 'connectionString' in target_data:
-                config['connectionString'] = target_data['connectionString']
-                
-            # Add optional DB properties
-            for key in ['schema', 'primary_key', 'batchsize', 'isolationLevel']:
-                if key in target_data:
-                    config[key] = target_data[key]
+            # If not provided, try to infer from connectionString
+            conn_str = target_data.get('connectionString', '')
+            if not db_type and conn_str:
+                if 'oracle' in conn_str.lower():
+                    db_type = 'oracle'
+                elif 'mysql' in conn_str.lower():
+                    db_type = 'mysql'
+                elif 'sqlserver' in conn_str.lower():
+                    db_type = 'sqlserver'
                     
-            return config
+            config = {
+                "type": "DB",
+                "db_type": db_type or 'postgres',  # Fallback to postgres
+                "table": target_data.get('table', ''),
+                "mode": target_data.get('mode', 'append')
+            }
