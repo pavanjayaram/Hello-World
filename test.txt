@@ -1,6 +1,17 @@
 
-            # PySpark JDBC requires queries to be wrapped in parens with an alias.
-            # CRITICAL: Oracle SQL does not support the "AS" keyword for table aliases.
-            if db_type == 'oracle':
-                db_source = f"({query}) query_source"
-            else:
+        {isSource && (
+          <div className="form-group" style={{ marginTop: '10px' }}>
+            <label>SQL Query (Optional)</label>
+            <textarea
+              value={(currentConfig as DatabaseSource)?.query || ''}
+              onChange={(e) => updateHandler({ query: e.target.value })}
+              className="form-control"
+              placeholder="SELECT * FROM table WHERE condition..."
+              rows={3}
+              style={{ fontFamily: 'monospace' }}
+            />
+            <small className="form-text text-muted">
+              If provided, this query will be pushed down to the database instead of reading the full table.
+            </small>
+          </div>
+        )}
