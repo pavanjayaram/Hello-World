@@ -143,6 +143,13 @@ class DBSourceHandler(SourceHandler):
         fetch_size = config.get('fetchsize')
         if fetch_size:
             properties['fetchsize'] = str(fetch_size)
+
+        # Add performance options for reading if not present or to set defaults
+        if 'fetchsize' not in properties:
+            properties['fetchsize'] = '1000'
+        if db_type == 'oracle':
+            properties['oracle.net.CONNECT_TIMEOUT'] = '10000'
+            properties['oracle.jdbc.ReadTimeout'] = '60000'
             
         logging.info(f"Reading from {db_type} table: {qualified_table}")
         
@@ -210,7 +217,7 @@ class DBSourceHandler(SourceHandler):
         driver_map = {
             'postgres': ('org.postgresql.Driver', f"jdbc:postgresql://{hostname}:{port or 5432}/{database}"),
             'mysql': ('com.mysql.cj.jdbc.Driver', f"jdbc:mysql://{hostname}:{port or 3306}/{database}"),
-            'oracle': ('oracle.jdbc.driver.OracleDriver', f"jdbc:oracle:thin:@//{hostname}:{port or 1521}/{database}"),
+            'oracle': ('oracle.jdbc.OracleDriver', f"jdbc:oracle:thin:@//{hostname}:{port or 1521}/{database}"),
             'sqlserver': ('com.microsoft.sqlserver.jdbc.SQLServerDriver', 
                          f"jdbc:sqlserver://{hostname}:{port or 1433};databaseName={database}")
         }
@@ -1173,21 +1180,27 @@ class DBTargetHandler(TargetHandler):
             # Mode 1: Use pre-registered connection from .env
             conn_props = ConnectionRegistry.get_connection(connection)
             jdbc_url = conn_props['url']
-            properties = conn_props['properties']
+            properties = conn_props.get('properties', {}).copy()
         elif connection_string:
             # Mode 2: Parse connection string directly from config
             jdbc_url, properties = self._parse_connection_string(connection_string, db_type)
         else:
             raise ValueError("Either 'connection' (name) or 'connectionString' is required for DB target")
-        
+
         # Add performance options
-        batch_size = config.get('batchsize')
-        if batch_size:
-            properties['batchsize'] = str(batch_size)
-            
+        batch_size = config.get('batchsize', 1000)
+        properties['batchsize'] = str(batch_size)
+
+        if db_type == 'oracle':
+            properties['oracle.jdbc.useFetchSizeWithLongColumn'] = 'true'
+            # Disable Oracle JDBC batching standard bug in PySpark
+            # by forcing batchsize explicitly and setting fast string binding
+            properties['oracle.jdbc.defaultExecuteBatch'] = str(batch_size)
+
         isolation_level = config.get('isolationLevel')
         if isolation_level and isolation_level != 'NONE':
             properties['isolationLevel'] = isolation_level
+
             
         logging.info(f"Writing to {db_type} table: {qualified_table} with mode {mode}")
         
@@ -1401,7 +1414,7 @@ class DBTargetHandler(TargetHandler):
         driver_map = {
             'postgres': ('org.postgresql.Driver', f"jdbc:postgresql://{hostname}:{port or 5432}/{database}"),
             'mysql': ('com.mysql.cj.jdbc.Driver', f"jdbc:mysql://{hostname}:{port or 3306}/{database}"),
-            'oracle': ('oracle.jdbc.driver.OracleDriver', f"jdbc:oracle:thin:@//{hostname}:{port or 1521}/{database}"),
+            'oracle': ('oracle.jdbc.OracleDriver', f"jdbc:oracle:thin:@//{hostname}:{port or 1521}/{database}"),
             'sqlserver': ('com.microsoft.sqlserver.jdbc.SQLServerDriver', 
                          f"jdbc:sqlserver://{hostname}:{port or 1433};databaseName={database}")
         }
