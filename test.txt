@@ -4,6 +4,35 @@ A generic, reusable ETL runtime that executes pipelines based on JSON configurat
 Supports: FILE→FILE, FILE→DB, DB→DB, DB→FILE
 """
 
+# ============================================================
+# CRITICAL: Set PYSPARK_SUBMIT_ARGS *before* importing PySpark
+# so the JVM launcher picks up the JDBC driver jars.
+# Once pyspark is imported the JVM process arguments are fixed.
+# ============================================================
+import os as _pre_os
+import sys as _pre_sys
+import glob as _pre_glob
+
+def _configure_pyspark_jars():
+    """Find backend/jars/*.jar and configure PySpark's JVM launch args."""
+    _this_dir = _pre_os.path.dirname(_pre_os.path.abspath(__file__))
+    _jars_dir = _pre_os.path.normpath(_pre_os.path.join(_this_dir, '..', 'jars'))
+    _jars = _pre_glob.glob(_pre_os.path.join(_jars_dir, '*.jar'))
+    if not _jars:
+        return  # No jars — nothing to configure
+    _sep = ';' if _pre_sys.platform == 'win32' else ':'
+    _classpath = _sep.join(_jars)
+    _jars_csv = ','.join(_jars)
+    if 'PYSPARK_SUBMIT_ARGS' not in _pre_os.environ:
+        _pre_os.environ['PYSPARK_SUBMIT_ARGS'] = (
+            f'--driver-class-path "{_classpath}" '
+            f'--jars "{_jars_csv}" '
+            'pyspark-shell'
+        )
+
+_configure_pyspark_jars()
+# ============================================================
+
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType
@@ -20,6 +49,7 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
 
 
 # ---------------------------------------------------------------------------
@@ -1644,11 +1674,36 @@ class ETLEngine:
         _os.environ['HADOOP_USER_NAME'] = 'spark'
         
         # Find all JDBC driver jars in the backend/jars directory
-        import glob
+        import glob, sys as _sys
         jars_dir = _os.path.join(ETL_BASE_DIR, 'jars')
         jar_files = glob.glob(_os.path.join(jars_dir, '*.jar'))
-        jars_path = ",".join(jar_files) if jar_files else ""
-        
+
+        # On Windows, backslash paths break PySpark's JAR parser.
+        # Convert every path to forward-slash form and wrap in file:/// URI.
+        def _to_uri(path):
+            """Convert an OS path to a file:/// URI with forward slashes."""
+            return 'file:///' + path.replace('\\', '/')
+
+        if jar_files:
+            uris = [_to_uri(f) for f in jar_files]
+            jars_csv = ','.join(uris)
+            # --driver-class-path must be passed to the JVM BEFORE it starts.
+            # PYSPARK_SUBMIT_ARGS is read by PySpark's launch script before the
+            # JVM process begins, making it the only reliable method on Windows.
+            classpath_sep = ';' if _sys.platform == 'win32' else ':'
+            raw_classpath = classpath_sep.join(jar_files)  # OS native paths for classpath
+            submit_args = (
+                f'--driver-class-path "{raw_classpath}" '
+                f'--jars "{",".join(jar_files)}" '
+                'pyspark-shell'
+            )
+            if 'PYSPARK_SUBMIT_ARGS' not in _os.environ:
+                _os.environ['PYSPARK_SUBMIT_ARGS'] = submit_args
+                logging.info(f"Set PYSPARK_SUBMIT_ARGS for Oracle jars: {submit_args}")
+        else:
+            jars_csv = ''
+            logging.warning(f"No JDBC jars found in: {jars_dir}")
+
         builder = SparkSession.builder \
             .appName(f"ETL_Engine_{pipeline_id}") \
             .config("spark.hadoop.hadoop.native.lib", "false") \
@@ -1656,13 +1711,15 @@ class ETLEngine:
             .config("spark.hadoop.hadoop.security.authentication", "simple") \
             .config("spark.hadoop.hadoop.security.authorization", "false") \
             .config("spark.local.dir", tempfile.gettempdir())
-            
-        if jars_path:
-            builder = builder.config("spark.jars", jars_path) \
-                             .config("spark.driver.extraClassPath", jars_path) \
-                             .config("spark.executor.extraClassPath", jars_path)
-                             
+
+        if jars_csv:
+            builder = builder \
+                .config("spark.jars", jars_csv) \
+                .config("spark.driver.extraClassPath", ','.join(jar_files).replace('\\', '/')) \
+                .config("spark.executor.extraClassPath", ','.join(jar_files).replace('\\', '/'))
+
         return builder.getOrCreate()
+
     
     def _setup_logging(self):
         """Setup logging configuration"""
