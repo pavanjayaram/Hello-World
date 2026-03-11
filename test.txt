@@ -1,110 +1,14 @@
-import os
-import sys
-import glob
 
-# Try to find pyspark in the environment
-try:
-    from pyspark.sql import SparkSession
-except ImportError:
-    print("Error: PySpark is not installed in the current environment.")
-    print("Please activate your virtual environment (e.g., 'source .venv/bin/activate') and try again.")
-    sys.exit(1)
-
-# Configuration Variables
-# Replace these with your actual Oracle database details
-ORACLE_HOST = "localhost.com"
-ORACLE_PORT = "3203"
-ORACLE_SERVICE = "d04ewse_dev"
-ORACLE_USER = "test_user"
-ORACLE_PASS = "testpassword"
-
-# The table or query you want to read
-TARGET_TABLE = "YOUR_TABLE_NAME"
-
-def main():
-    print(f"--- PySpark Oracle JDBC Test Script ---")
-    
-    # 1. Locate the Oracle JDBC jar in your backend/jars/ folder
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    jars_dir = os.path.join(current_dir, "jars")
-    
-    # Check if directory exists
-    if not os.path.exists(jars_dir):
-        print(f"Error: Jars directory not found at {jars_dir}")
-        sys.exit(1)
-        
-    # Find all jars (specifically looking for ojdbc)
-    jar_files = glob.glob(os.path.join(jars_dir, "*.jar"))
-    if not jar_files:
-        print(f"Error: No .jar files found in {jars_dir}")
-        print("Please ensure ojdbc8.jar is placed in this directory.")
-        sys.exit(1)
-        
-    jars_path = ",".join(jar_files)
-    print(f"Found JARs: {jars_path}")
-
-    # 2. Build the correct Oracle JDBC URL
-    # Using the OracleDriver syntax: jdbc:oracle:thin:@//host:port/service
-    jdbc_url = f"jdbc:oracle:thin:@//{ORACLE_HOST}:{ORACLE_PORT}/{ORACLE_SERVICE}"
-    print(f"Connecting to URL: {jdbc_url}")
-
-    # 3. Create the Spark Session and inject the jars
-    try:
-        print("\nInitializing Spark Session...")
-        # Add basic windows compatibility flags if running on windows
-        spark = SparkSession.builder \
-            .appName("Oracle_JDBC_Test") \
-            .config("spark.jars", jars_path) \
-            .config("spark.driver.extraClassPath", jars_path) \
-            .config("spark.executor.extraClassPath", jars_path) \
-            .config("spark.hadoop.io.nativeio.NativeIO.Windows.access0", "false") \
-            .config("spark.hadoop.hadoop.native.lib", "false") \
-            .getOrCreate()
             
-        print("Spark Session created successfully.")
-    except Exception as e:
-        print(f"Failed to create Spark Session: {e}")
-        sys.exit(1)
-
-    # 4. Attempt to read from the Oracle Database using JDBC
-    print(f"\nAttempting to read from table: {TARGET_TABLE}...")
-    try:
-        df = spark.read \
-            .format("jdbc") \
-            .option("url", jdbc_url) \
-            .option("dbtable", TARGET_TABLE) \
-            .option("user", ORACLE_USER) \
-            .option("password", ORACLE_PASS) \
-            .option("driver", "oracle.jdbc.OracleDriver") \
-            .option("fetchsize", "1000") \
-            .option("oracle.net.CONNECT_TIMEOUT", "10000") \
-            .load()
-            
-        # Execute a show() action to trigger the actual JDBC computation
-        print("\nSchema:")
-        df.printSchema()
-        
-        print("\nData Preview (first 5 rows):")
-        df.show(5, truncate=False)
-        
-        row_count = df.count()
-        print(f"\nSuccess! Total rows counted: {row_count}")
-        
-    except Exception as e:
-        print("\n" + "="*50)
-        print("JDBC READ FAILED")
-        print("="*50)
-        print("This usually happens due to:")
-        print(" 1. The Oracle Database is not reachable from this machine.")
-        print(" 2. Invalid credentials or service name.")
-        print(' 3. The "oracle.jdbc.OracleDriver" class could not be loaded from the JAR.')
-        print(" 4. Invalid TARGET_TABLE name.")
-        print("\nRaw Error Trace:")
-        print(str(e))
-        
-    finally:
-        if 'spark' in locals():
-            spark.stop()
-
-if __name__ == "__main__":
-    main()
+            # Support both connection (registry) and connectionString (direct)
+            if 'connection' in target_data:
+                config['connection'] = target_data['connection']
+            if 'connectionString' in target_data:
+                config['connectionString'] = target_data['connectionString']
+                
+            # Add optional DB properties
+            for key in ['schema', 'primary_key', 'batchsize', 'isolationLevel']:
+                if key in target_data:
+                    config[key] = target_data[key]
+                    
+            return config
