@@ -1,32 +1,12 @@
 
-        try:
-            # Find JARs
-            jars_dir = os.path.join(backend_dir, 'jars')
-            jar_files = []
-            if os.path.exists(jars_dir):
-                jar_files = [os.path.join(jars_dir, f) for f in os.listdir(jars_dir) if f.endswith('.jar')]
-            
-            cmd = ['spark-submit']
-            
-            # Add driver extra class path for both driver and executor
-            if jar_files:
-                import sys as _sys
-                is_windows = _sys.platform == 'win32'
-
-                # Use forward slashes for ALL Spark/JVM arguments on all platforms.
-                # Backslash paths are silently ignored by spark-submit on Windows.
-                fwd_jar_files = [f.replace('\\', '/') for f in jar_files]
-                jars_arg = ','.join(fwd_jar_files)
-
-                # OS-native classpath separator (;  on Windows, : on Linux/Mac)
-                cp_sep = ';' if is_windows else ':'
-                classpath_arg = cp_sep.join(fwd_jar_files)  # forward slashes + correct separator
-
-                cmd.extend(['--jars', jars_arg])
-                # --driver-class-path is the most reliable way to get jars on driver JVM
-                cmd.extend(['--driver-class-path', classpath_arg])
-                cmd.extend(['--conf', f'spark.driver.extraClassPath={classpath_arg}'])
-                cmd.extend(['--conf', f'spark.executor.extraClassPath={classpath_arg}'])
-
-            
-            cmd.extend([etl_engine_path, filepath])
+        else:  # DB
+            config = {
+                "type": "DB",
+                "db_type": source_data.get('db_type', 'postgres'),
+                "connection": source_data.get('connection', 'pg_conn')
+            }
+            if 'query' in source_data and source_data['query']:
+                config['query'] = source_data['query']
+            else:
+                config['table'] = source_data.get('table', '')
+            return config
