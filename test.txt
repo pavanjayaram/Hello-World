@@ -1618,14 +1618,26 @@ class ETLEngine:
         # and bypasses the LDAP/Kerberos Subject.getSubject() call entirely.
         _os.environ['HADOOP_USER_NAME'] = 'spark'
         
-        return SparkSession.builder \
+        # Find all JDBC driver jars in the backend/jars directory
+        import glob
+        jars_dir = _os.path.join(ETL_BASE_DIR, 'jars')
+        jar_files = glob.glob(_os.path.join(jars_dir, '*.jar'))
+        jars_path = ",".join(jar_files) if jar_files else ""
+        
+        builder = SparkSession.builder \
             .appName(f"ETL_Engine_{pipeline_id}") \
             .config("spark.hadoop.hadoop.native.lib", "false") \
             .config("spark.hadoop.io.nativeio.NativeIO.Windows.access0", "false") \
             .config("spark.hadoop.hadoop.security.authentication", "simple") \
             .config("spark.hadoop.hadoop.security.authorization", "false") \
-            .config("spark.local.dir", tempfile.gettempdir()) \
-            .getOrCreate()
+            .config("spark.local.dir", tempfile.gettempdir())
+            
+        if jars_path:
+            builder = builder.config("spark.jars", jars_path) \
+                             .config("spark.driver.extraClassPath", jars_path) \
+                             .config("spark.executor.extraClassPath", jars_path)
+                             
+        return builder.getOrCreate()
     
     def _setup_logging(self):
         """Setup logging configuration"""
