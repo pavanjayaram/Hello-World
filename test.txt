@@ -1,31 +1,6 @@
 
-        else:  # DB
-            # Try to get db_type from frontend payload (could be db_type or database_type)
-            db_type = source_data.get('db_type') or source_data.get('database_type')
-            
-            # If not provided, try to infer from connection or connectionString
-            conn_str = source_data.get('connectionString', '') or source_data.get('connection', '')
-            if not db_type and conn_str:
-                if 'oracle' in conn_str.lower():
-                    db_type = 'oracle'
-                elif 'mysql' in conn_str.lower():
-                    db_type = 'mysql'
-                elif 'sqlserver' in conn_str.lower():
-                    db_type = 'sqlserver'
-                    
-            config = {
-                "type": "DB",
-                "db_type": db_type or 'postgres',  # Fallback to postgres
-            }
-            
-            # Support both connection (registry) and connectionString (direct)
-            if 'connection' in source_data:
-                config['connection'] = source_data['connection']
-            if 'connectionString' in source_data:
-                config['connectionString'] = source_data['connectionString']
-                
-            if 'query' in source_data and source_data['query']:
-                config['query'] = source_data['query']
+            # PySpark JDBC requires queries to be wrapped in parens with an alias.
+            # CRITICAL: Oracle SQL does not support the "AS" keyword for table aliases.
+            if db_type == 'oracle':
+                db_source = f"({query}) query_source"
             else:
-                config['table'] = source_data.get('table', '')
-            return config
