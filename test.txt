@@ -1,139 +1,31 @@
 
-    
-    def _load_config(self, path: str) -> Dict:
-        """Load JSON configuration"""
-        try:
-            with open(path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            raise ValueError(f"Failed to load config: {str(e)}")
-    
-    def _validate_config(self):
-        """Validate required configuration sections"""
-        required = ['pipeline', 'source', 'target']
-        missing = [k for k in required if k not in self.config]
-        if missing:
-            raise ValueError(f"Missing required config sections: {missing}")
-        
-        # Validate pipeline type
-        valid_types = ['FILE_TO_FILE', 'FILE_TO_DB', 'DB_TO_DB', 'DB_TO_FILE']
-        pipeline_type = self.config['pipeline'].get('pipeline_type')
-        if pipeline_type not in valid_types:
-            raise ValueError(f"Invalid pipeline_type: {pipeline_type}")
-    
-    def get(self, key: str, default=None):
-        return self.config.get(key, default)
-
-
-class SourceHandler(ABC):
-    """Abstract base class for source handlers"""
-    
-    @abstractmethod
-    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
-        pass
-
-
-class FileSourceHandler(SourceHandler):
-    """Handler for file-based sources"""
-    
-    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
-        format_type = config.get('format', 'csv')
-        path = config.get('path')
-        options = config.get('options', {})
-        
-        if not path:
-            raise ValueError("Source path is required for FILE type")
-        
-        # Map text-based formats to CSV (Spark doesn't have native txt/dat support)
-        format_mapping = {
-            'txt': 'csv',
-            'dat': 'csv',
-            'text': 'csv'
-        }
-        
-        actual_format = format_mapping.get(format_type.lower(), format_type)
-        
-        logging.info(f"Reading {format_type} (as {actual_format}) from {path}")
-        return spark.read.format(actual_format).options(**options).load(path)
-
-
-class DBSourceHandler(SourceHandler):
-    """Handler for database sources"""
-    
-    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
-        db_type = config.get('db_type')
-        table = config.get('table')
-        query = config.get('query')
-        schema = config.get('schema', 'public')
-        connection = config.get('connection')
-        connection_string = config.get('connectionString')
-        
-        # Resolve env var if connection_string matches a key
-        if connection_string and connection_string in os.environ:
-             connection_string = os.environ[connection_string]
-        
-        if not db_type:
-            raise ValueError("db_type is required for DB source")
-        if not table and not query:
-            raise ValueError("Either 'table' or 'query' is required for DB source")
-        
-        # Determine target source for PySpark's JDBC reader
-        if query:
-            # PySpark JDBC requires queries to be wrapped in parens with an alias
-            db_source = f"({query}) AS query_source"
-            logging.info(f"Reading from {db_type} query: {query}")
-        else:
-            # Qualify table with schema if provided (for PostgreSQL, SQL Server, etc.)
-            if schema and db_type in ['postgres', 'sqlserver', 'oracle']:
-                db_source = f"{schema}.{table}"
-            else:
-                db_source = table
-            logging.info(f"Reading from {db_type} table: {db_source}")
-        
-        # Support two modes: connection name (from registry) or direct connection string
-        if connection:
-            # Mode 1: Use pre-registered connection from .env
-            conn_props = ConnectionRegistry.get_connection(connection)
-            jdbc_url = conn_props['url']
-            properties = conn_props['properties']
-        elif connection_string:
-            # Mode 2: Parse connection string directly from config
-            jdbc_url, properties = self._parse_connection_string(connection_string, db_type)
-        else:
-            raise ValueError("Either 'connection' (name) or 'connectionString' is required for DB source")
-        
-        # Add fetchsize to properties if provided
-        fetch_size = config.get('fetchsize')
-        if fetch_size:
-            properties['fetchsize'] = str(fetch_size)
-
-        # Add performance options for reading if not present or to set defaults
-        if 'fetchsize' not in properties:
-            properties['fetchsize'] = '1000'
-        if db_type == 'oracle':
-            properties['oracle.net.CONNECT_TIMEOUT'] = '10000'
-            properties['oracle.jdbc.ReadTimeout'] = '60000'
+        else:  # DB
+            # Try to get db_type from frontend payload (could be db_type or database_type)
+            db_type = source_data.get('db_type') or source_data.get('database_type')
             
-        # Check for partitioning configuration
-        partition_col = config.get('partitionColumn')
-        lower_bound = config.get('lowerBound')
-        upper_bound = config.get('upperBound')
-        num_partitions = config.get('numPartitions')
-        
-        if partition_col and lower_bound and upper_bound and num_partitions:
-            logging.info(f"Using read partitioning on {partition_col} (Range: {lower_bound}-{upper_bound}, Partitions: {num_partitions})")
-            return spark.read.jdbc(
-                url=jdbc_url,
-                table=db_source,
-                column=partition_col,
-                lowerBound=int(lower_bound) if str(lower_bound).isdigit() else lower_bound, # basic typing
-                upperBound=int(upper_bound) if str(upper_bound).isdigit() else upper_bound,
-                numPartitions=int(num_partitions),
-                properties=properties
-            )
-        else:
-            return spark.read.jdbc(
-                url=jdbc_url,
-                table=db_source,
-                properties=properties
-            )
+            # If not provided, try to infer from connection or connectionString
+            conn_str = source_data.get('connectionString', '') or source_data.get('connection', '')
+            if not db_type and conn_str:
+                if 'oracle' in conn_str.lower():
+                    db_type = 'oracle'
+                elif 'mysql' in conn_str.lower():
+                    db_type = 'mysql'
+                elif 'sqlserver' in conn_str.lower():
+                    db_type = 'sqlserver'
+                    
+            config = {
+                "type": "DB",
+                "db_type": db_type or 'postgres',  # Fallback to postgres
+            }
+            
+            # Support both connection (registry) and connectionString (direct)
+            if 'connection' in source_data:
+                config['connection'] = source_data['connection']
+            if 'connectionString' in source_data:
+                config['connectionString'] = source_data['connectionString']
+                
+            if 'query' in source_data and source_data['query']:
+                config['query'] = source_data['query']
+            else:
+                config['table'] = source_data.get('table', '')
+            return config
