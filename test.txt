@@ -1,143 +1,181 @@
-import React, { useState } from 'react';
-import DataSourceConfigComponent from './components/DataSourceConfig';
-import TransformationBuilder from './components/TransformationBuilder';
-import ExecutePipeline from './components/ExecutePipeline';
-import CodeDisplay from './components/CodeDisplay';
-import { TransformationConfig, DataSourceConfig, FieldTransformation, RowTransformation } from './types';
-import './components/styles.css';
+import React from 'react';
+import { ApiError } from '../services/apiClient';
 
-const App: React.FC = () => {
-  console.log('App component rendering at:', new Date().toISOString());
+interface ErrorDisplayProps {
+  error: string | Error | ApiError | null;
+  title?: string;
+  showRetry?: boolean;
+  onRetry?: () => void;
+  className?: string;
+}
 
-  const [currentStep, setCurrentStep] = useState(1);
-  const [config, setConfig] = useState<TransformationConfig>({
-    dataSource: {
-      mode: 'file-to-file',
-      source: {
-        type: 'csv',
-        delimiter: ',',
-        path: ''
-      },
-      target: {
-        type: 'csv',
-        delimiter: ',',
-        path: ''
-      }
-    },
-    fieldTransforms: [],
-    rowTransforms: []
-  });
+const ErrorDisplay: React.FC<ErrorDisplayProps> = ({
+  error,
+  title = "Error",
+  showRetry = false,
+  onRetry,
+  className = ""
+}) => {
+  if (!error) return null;
 
-  const [spec, setSpec] = useState<any>(null);
-
-  const updateDataSource = (dataSource: DataSourceConfig) => {
-    setConfig(prev => ({ ...prev, dataSource }));
-  };
-
-  const updateFieldTransforms = (fieldTransforms: FieldTransformation[]) => {
-    console.log('App: updateFieldTransforms called with:', fieldTransforms.map(f => f.fieldName));
-    setConfig(prev => ({ ...prev, fieldTransforms }));
-  };
-
-  const updateRowTransforms = (rowTransforms: RowTransformation[]) => {
-    setConfig(prev => ({ ...prev, rowTransforms }));
-  };
-
-  const steps = [
-    { id: 1, title: 'Data Source Configuration', component: 'datasource' },
-    { id: 2, title: 'Transformation Builder', component: 'transformations' },
-    { id: 3, title: 'Review & Execute Pipeline', component: 'execute' },
-    { id: 4, title: 'AI Code Generation', component: 'codedisplay' }
-  ];
-
-  const renderCurrentStep = () => {
-    switch (currentStep) {
-      case 1:
-        return (
-          <DataSourceConfigComponent
-            config={config.dataSource}
-            onChange={updateDataSource}
-          />
-        );
-      case 2:
-        return (
-          <TransformationBuilder
-            config={config.dataSource}
-            fieldTransforms={config.fieldTransforms}
-            rowTransforms={config.rowTransforms}
-            onFieldTransformsChange={updateFieldTransforms}
-            onRowTransformsChange={updateRowTransforms}
-          />
-        );
-      case 3:
-        return <ExecutePipeline config={config} />;
-      case 4:
-        return (
-          <CodeDisplay
-            config={config}
-            spec={spec}
-            onSpecChange={setSpec}
-          />
-        );
-      default:
-        return <div>Unknown step</div>;
+  const getErrorMessage = (): string => {
+    if (typeof error === 'string') {
+      return error;
     }
+    if (error instanceof ApiError) {
+      return error.message;
+    }
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return 'An unknown error occurred';
   };
+
+  const getErrorCode = (): string | undefined => {
+    if (error instanceof ApiError) {
+      return error.errorCode;
+    }
+    return undefined;
+  };
+
+  const getErrorDetails = (): Record<string, any> | undefined => {
+    if (error instanceof ApiError) {
+      return error.details;
+    }
+    return undefined;
+  };
+
+  const getTroubleshootingSteps = (): string[] => {
+    if (error instanceof ApiError) {
+      const details = error.details;
+      
+      // LLM unavailability errors
+      if (error.isErrorCode('LLM_UNAVAILABLE') || error.isErrorCode('LLM_CONNECTION_ERROR')) {
+        return details?.troubleshooting || [
+          "Please start Ollama with 'ollama serve'",
+          "Ensure codellama:7b is pulled with 'ollama pull codellama:7b'",
+          "Check if the model endpoint is accessible",
+          "Verify firewall settings allow connection to the model endpoint"
+        ];
+      }
+      
+      // Network errors
+      if (error.isNetworkError()) {
+        return [
+          "Check your internet connection",
+          "Verify the backend server is running",
+          "Check if the API endpoint is accessible",
+          "Try refreshing the page"
+        ];
+      }
+      
+      // Server errors
+      if (error.isServerError()) {
+        return [
+          "The server encountered an internal error",
+          "Please try again in a few moments",
+          "If the problem persists, contact support"
+        ];
+      }
+      
+      // Configuration validation errors
+      if (error.isErrorCode('INVALID_CONFIG')) {
+        return [
+          "Review your configuration for missing or invalid fields",
+          "Ensure all required fields are filled out",
+          "Check that file paths and connection strings are correct",
+          "Verify delimiter settings for delimited files"
+        ];
+      }
+    }
+    
+    return [];
+  };
+
+  const errorCode = getErrorCode();
+  const errorDetails = getErrorDetails();
+  const troubleshootingSteps = getTroubleshootingSteps();
 
   return (
-    <div className="app">
-      <header className="app-header">
-        <h1>Config-Driven PySpark ETL Engine</h1>
-        <p>Design your data pipeline and execute it with PySpark</p>
-      </header>
-
-      <nav className="step-navigation">
-        <div className="steps">
-          {steps.map((step) => (
+    <div className={`error-display ${className}`}>
+      <div className="error-header">
+        <h4 className="error-title">{title}</h4>
+        {errorCode && (
+          <span className="error-code">Error Code: {errorCode}</span>
+        )}
+      </div>
+      
+      <div className="error-content">
+        <p className="error-message">{getErrorMessage()}</p>
+        
+        {/* Error Details */}
+        {errorDetails && Object.keys(errorDetails).length > 0 && (
+          <div className="error-details">
+            <h5>Details:</h5>
+            <div className="error-details-content">
+              {errorDetails.errors && Array.isArray(errorDetails.errors) && (
+                <div className="error-list">
+                  <strong>Validation Errors:</strong>
+                  <ul>
+                    {errorDetails.errors.map((err: string, idx: number) => (
+                      <li key={idx}>{err}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              
+              {errorDetails.warnings && Array.isArray(errorDetails.warnings) && (
+                <div className="warning-list">
+                  <strong>Warnings:</strong>
+                  <ul>
+                    {errorDetails.warnings.map((warning: string, idx: number) => (
+                      <li key={idx}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              
+              {errorDetails.endpoint && (
+                <div className="error-endpoint">
+                  <strong>Endpoint:</strong> <code>{errorDetails.endpoint}</code>
+                </div>
+              )}
+              
+              {errorDetails.request_id && (
+                <div className="error-request-id">
+                  <strong>Request ID:</strong> <code>{errorDetails.request_id}</code>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        
+        {/* Troubleshooting Steps */}
+        {troubleshootingSteps.length > 0 && (
+          <div className="troubleshooting">
+            <h5>Troubleshooting:</h5>
+            <ul className="troubleshooting-list">
+              {troubleshootingSteps.map((step, idx) => (
+                <li key={idx}>{step}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        
+        {/* Retry Button */}
+        {showRetry && onRetry && (
+          <div className="error-actions">
             <button
-              key={step.id}
-              className={`step ${currentStep === step.id ? 'active' : ''} enabled`}
-              onClick={() => setCurrentStep(step.id)}
+              onClick={onRetry}
+              className="btn btn-primary retry-button"
             >
-              <span className="step-number">{step.id}</span>
-              <span className="step-title">{step.title}</span>
+              Try Again
             </button>
-          ))}
-        </div>
-      </nav>
-
-      <main className="app-content">
-        <div className="step-content">
-          <h2>{steps.find(s => s.id === currentStep)?.title}</h2>
-          {renderCurrentStep()}
-        </div>
-
-        <div className="step-controls">
-          {currentStep > 1 && (
-            <button
-              className="btn btn-secondary"
-              onClick={() => setCurrentStep(currentStep - 1)}
-            >
-              Previous
-            </button>
-          )}
-
-          {currentStep < steps.length && (
-            <button
-              className="btn btn-primary"
-              onClick={() => setCurrentStep(currentStep + 1)}
-            >
-              Next
-            </button>
-          )}
-        </div>
-      </main>
-
-      <footer className="app-footer">
-        <p>Config-Driven PySpark ETL Engine - "Give me a JSON, I'll run your pipeline."</p>
-      </footer>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
 
-export default App;
+export default ErrorDisplay;
