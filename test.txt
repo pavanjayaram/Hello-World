@@ -1,17 +1,639 @@
+import React, { useState, useEffect, useRef } from 'react';
+// import Editor from '@monaco-editor/react';
+import { TransformationConfig, TransformationSpec } from '../types';
+import apiClient, { ApiError } from '../services/apiClient';
+import ErrorDisplay from './ErrorDisplay';
 
-        {isSource && (
-          <div className="form-group" style={{ marginTop: '10px' }}>
-            <label>SQL Query (Optional)</label>
-            <textarea
-              value={(currentConfig as DatabaseSource)?.query || ''}
-              onChange={(e) => updateHandler({ query: e.target.value })}
-              className="form-control"
-              placeholder="SELECT * FROM table WHERE condition..."
-              rows={3}
-              style={{ fontFamily: 'monospace' }}
+interface CodeDisplayProps {
+  config: TransformationConfig;
+  spec: TransformationSpec | null;
+  onSpecChange?: (spec: TransformationSpec) => void;
+  onCodeGenerated?: (code: string) => void;
+}
+
+const CodeDisplay: React.FC<CodeDisplayProps> = ({ config, spec, onSpecChange, onCodeGenerated }) => {
+  const [generatedCode, setGeneratedCode] = useState<string>('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<ApiError | null>(null);
+  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
+  const [llmProvider, setLlmProvider] = useState<'ollama' | 'gemini'>('ollama');
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Saved JSON config dropdown state
+  const [savedConfigs, setSavedConfigs] = useState<any[]>([]);
+  const [selectedConfigFile, setSelectedConfigFile] = useState<string>('');
+  const [loadedPipelineJson, setLoadedPipelineJson] = useState<any>(null);
+
+  // Get API URL from environment variable
+  const API_URL = (import.meta as any).env?.VITE_API_BASE_URL || 'http://localhost:9001';
+
+  // Fetch saved configs on mount
+  useEffect(() => {
+    const fetchSavedConfigs = async () => {
+      try {
+        const response = await fetch(`${API_URL}/api/list-configs`);
+        const data = await response.json();
+        if (data.success) {
+          setSavedConfigs(data.configs);
+        }
+      } catch (err) {
+        console.error('Error loading saved configs:', err);
+      }
+    };
+    fetchSavedConfigs();
+  }, []);
+
+  // Load a specific saved config by filename
+  const loadSavedConfig = async (filename: string) => {
+    if (!filename) {
+      setLoadedPipelineJson(null);
+      return;
+    }
+    try {
+      const response = await fetch(`${API_URL}/api/get-config/${filename}`);
+      const data = await response.json();
+      if (data.success) {
+        setLoadedPipelineJson(data.config);
+        console.log('Loaded saved config:', filename, data.config);
+      } else {
+        console.error('Failed to load config:', data.error);
+      }
+    } catch (err) {
+      console.error('Error loading config:', err);
+    }
+  };
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const content = e.target?.result as string;
+        const parsedSpec = JSON.parse(content);
+        if (onSpecChange) {
+          onSpecChange(parsedSpec);
+        }
+        setError(null);
+      } catch (err) {
+        setError(new ApiError('Invalid JSON file', 400, 'INVALID_JSON'));
+      }
+    };
+    reader.readAsText(file);
+    // Reset standard input value
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const generateCode = async () => {
+    // If a saved JSON config is loaded from the dropdown, send it directly to the LLM
+    if (loadedPipelineJson) {
+      setIsGenerating(true);
+      setProgress(0);
+      setError(null);
+      setGeneratedCode('');
+
+      try {
+        setProgress(25);
+        const endpoint = llmProvider === 'gemini' ? '/api/generate-gemini-code' : '/api/generate-ollama-code';
+        console.log(`Generating code with ${llmProvider} using saved JSON config`);
+        const response = await fetch(`${API_URL}${endpoint}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(loadedPipelineJson)
+        });
+        const result = await response.json();
+        setProgress(75);
+
+        if (result.success && result.code) {
+          setGeneratedCode(result.code);
+          setProgress(100);
+          if (onCodeGenerated) {
+            onCodeGenerated(result.code);
+          }
+        } else {
+          throw new Error(result.error || `${llmProvider} code generation failed`);
+        }
+        setIsGenerating(false);
+      } catch (err) {
+        handleError(err);
+      }
+      return;
+    }
+
+    if (!spec) {
+      // First generate JSON spec if not available
+      try {
+        setIsGenerating(true);
+        setProgress(0);
+        setError(null);
+        setGeneratedCode('');
+
+        // Quick client-side checks to avoid common 422 errors (e.g., empty paths and missing distinct fields)
+        try {
+          const missing: string[] = [];
+
+          if (config.dataSource.mode === 'file-to-file') {
+            const srcPath = (config.dataSource.source as any)?.path?.trim();
+            const tgtPath = (config.dataSource.target as any)?.path?.trim();
+            if (!srcPath) missing.push('Source file path cannot be empty');
+            if (!tgtPath) missing.push('Target file path cannot be empty');
+          }
+
+          // Validate 'distinct' row transforms have 'fields' parameter
+          (config.rowTransforms || []).forEach((rt) => {
+            if (rt.type === 'distinct') {
+              const fields = (rt.params && rt.params.fields) || [];
+              if (!Array.isArray(fields) || fields.length === 0) {
+                missing.push("Distinct transformation requires 'fields' parameter");
+              }
+            }
+          });
+
+          if (missing.length > 0) {
+            setError(new ApiError('Configuration validation failed', 422, 'INVALID_CONFIG', { errors: missing }));
+            setIsGenerating(false);
+            return;
+          }
+        } catch (e) {
+          // If client-side check fails for unexpected reason, fall back to server validation
+          console.warn('Client-side validation check failed', e);
+        }
+
+        console.log('Validating config:', config);
+        const validationResult = await apiClient.validateConfig(config);
+        if (!validationResult.valid) {
+          setError(new ApiError(
+            'Configuration validation failed',
+            422,
+            'INVALID_CONFIG',
+            { errors: validationResult.errors, warnings: validationResult.warnings }
+          ));
+          setIsGenerating(false);
+          return;
+        }
+
+        console.log('Generating JSON spec...');
+        const newSpec = await apiClient.generateJson(config);
+        if (onSpecChange) {
+          onSpecChange(newSpec);
+        }
+
+        // Now generate code using AI directly
+        setProgress(50);
+        console.log(`Generating code with ${llmProvider} using config:`, config);
+        const result = await apiClient.generateAICode(config, llmProvider);
+
+        if (result.status === 'success' && result.code) {
+          setGeneratedCode(result.code);
+          setProgress(100);
+          if (onCodeGenerated) {
+            onCodeGenerated(result.code);
+          }
+        } else {
+          throw new Error(`${llmProvider} code generation failed`);
+        }
+
+        setIsGenerating(false);
+
+      } catch (err) {
+        handleError(err);
+      }
+    } else {
+      // Generate code directly using Ollama
+      setIsGenerating(true);
+      setProgress(0);
+      setError(null);
+      setGeneratedCode('');
+
+      try {
+        setProgress(25);
+        console.log(`Generating code with ${llmProvider} using config:`, config);
+        const result = await apiClient.generateAICode(config, llmProvider);
+        setProgress(75);
+
+        if (result.status === 'success' && result.code) {
+          setGeneratedCode(result.code);
+          setProgress(100);
+          if (onCodeGenerated) {
+            onCodeGenerated(result.code);
+          }
+        } else {
+          throw new Error('Ollama code generation failed');
+        }
+
+        setIsGenerating(false);
+      } catch (err) {
+        handleError(err);
+      }
+    }
+  };
+
+  const handleError = (err: any) => {
+    console.error('Code generation error:', err);
+    if (err instanceof ApiError) {
+      setError(err);
+    } else {
+      setError(new ApiError(
+        err instanceof Error ? err.message : 'An unexpected error occurred',
+        0,
+        'UNKNOWN_ERROR'
+      ));
+    }
+    setIsGenerating(false);
+  };
+
+  const pollGenerationStatus = async (taskId: string) => {
+    try {
+      const response = await apiClient.getCodeStatus(taskId);
+
+      if (response.status === 'completed' && response.code) {
+        setGeneratedCode(response.code);
+        if (onCodeGenerated) {
+          onCodeGenerated(response.code);
+        }
+        setIsGenerating(false);
+        setProgress(100);
+        setCurrentTaskId(null);
+      } else if (response.status === 'failed') {
+        const errMsg = response.error || 'Code generation failed';
+        setError(new ApiError(errMsg, 500, 'GENERATION_FAILED'));
+        setIsGenerating(false);
+        setCurrentTaskId(null);
+      } else {
+        // Still processing
+        setProgress(response.progress || 50);
+      }
+    } catch (err) {
+      console.error('Error polling status:', err);
+    }
+  };
+
+  const cancelGeneration = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    setIsGenerating(false);
+    setCurrentTaskId(null);
+    setProgress(0);
+  };
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    // If we have an active task, start polling
+    if (currentTaskId && isGenerating) {
+      pollIntervalRef.current = setInterval(() => {
+        pollGenerationStatus(currentTaskId);
+      }, 2000);
+    }
+
+    // Cleanup interval on unmount or when task finishes
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, [currentTaskId, isGenerating]);
+
+  const getProgressMessage = () => {
+    const modelName = llmProvider === 'ollama' ? 'Ollama CodeLlama' : 'Google Gemini';
+    if (progress < 20) return `Connecting to ${modelName} model...`;
+    if (progress < 40) return 'Analyzing transformation configuration...';
+    if (progress < 60) return 'Generating Python (Polars) code with AI...';
+    if (progress < 80) return 'Optimizing and enhancing code...';
+    if (progress < 100) return 'Finalizing generated code...';
+    return 'Code generation complete!';
+  };
+
+  const canGenerateCode = () => {
+    // Enable if not generating AND (has a saved JSON config OR a spec OR manual transforms OR a valid loaded config)
+    return !isGenerating && (
+      loadedPipelineJson !== null ||
+      spec !== null ||
+      config.fieldTransforms.length > 0 ||
+      config.rowTransforms.length > 0 ||
+      (config as any).source?.type && (config as any).target?.type
+    );
+  };
+
+  const retryGeneration = () => {
+    generateCode();
+  };
+
+  return (
+    <div className="code-display">
+      <div className="provider-selection" style={{ marginBottom: '20px', padding: '15px', backgroundColor: '#e8f4fd', borderRadius: '4px' }}>
+        <h4 style={{ marginTop: 0, marginBottom: '10px' }}>Select LLM Provider</h4>
+        <div style={{ display: 'flex', gap: '20px' }}>
+          <label style={{ cursor: isGenerating ? 'not-allowed' : 'pointer' }}>
+            <input
+              type="radio"
+              value="ollama"
+              checked={llmProvider === 'ollama'}
+              onChange={(e) => setLlmProvider(e.target.value as 'ollama' | 'gemini')}
+              disabled={isGenerating}
+              style={{ marginRight: '8px' }}
             />
-            <small className="form-text text-muted">
-              If provided, this query will be pushed down to the database instead of reading the full table.
-            </small>
+            Ollama (Local CodeLlama)
+          </label>
+          <label style={{ cursor: isGenerating ? 'not-allowed' : 'pointer' }}>
+            <input
+              type="radio"
+              value="gemini"
+              checked={llmProvider === 'gemini'}
+              onChange={(e) => setLlmProvider(e.target.value as 'ollama' | 'gemini')}
+              disabled={isGenerating}
+              style={{ marginRight: '8px' }}
+            />
+            Google GenAI (Gemini)
+          </label>
+        </div>
+      </div>
+
+      {/* Saved JSON Config Dropdown */}
+      <div className="saved-config-selection" style={{ marginBottom: '20px', padding: '15px', backgroundColor: '#e8f4fd', borderRadius: '4px', border: '1px solid #c3dbc0' }}>
+        <h4 style={{ marginTop: 0, marginBottom: '10px' }}>📂 Load Saved JSON Configuration</h4>
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          <select
+            className="form-control"
+            value={selectedConfigFile}
+            onChange={(e) => {
+              setSelectedConfigFile(e.target.value);
+              loadSavedConfig(e.target.value);
+            }}
+            disabled={isGenerating}
+            style={{ flex: 1, padding: '8px 12px', borderRadius: '4px', border: '1px solid #ccc', fontSize: '14px' }}
+          >
+            <option value="">-- Select a saved configuration --</option>
+            {savedConfigs.map((cfg) => (
+              <option key={cfg.filename} value={cfg.filename}>
+                {cfg.pipeline_id || cfg.filename} ({cfg.pipeline_type || 'N/A'})
+              </option>
+            ))}
+          </select>
+          {loadedPipelineJson && (
+            <span style={{ color: '#28a745', fontWeight: 600, fontSize: '14px', whiteSpace: 'nowrap' }}>✓ Config Loaded</span>
+          )}
+        </div>
+        {savedConfigs.length === 0 && (
+          <p style={{ margin: '8px 0 0', fontSize: '13px', color: '#888' }}>
+            No saved configurations found. Save a pipeline config in the "Review & Execute Pipeline" tab first.
+          </p>
+        )}
+      </div>
+
+      <div className="code-display-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h3>Generated Python-Polars Code</h3>
+        <div className="code-display-controls" style={{ display: 'flex', gap: '10px' }}>
+          <input
+            type="file"
+            accept=".json"
+            style={{ display: 'none' }}
+            ref={fileInputRef}
+            onChange={handleFileUpload}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isGenerating}
+            className="btn btn-secondary"
+            title="Upload an existing JSON Configuration"
+          >
+            Upload JSON Config
+          </button>
+          <button
+            onClick={generateCode}
+            disabled={!canGenerateCode()}
+            className="btn btn-primary"
+            style={{ opacity: canGenerateCode() ? 1 : 0.5 }}
+          >
+            {isGenerating ? 'Generating...' : 'Generate Code'}
+          </button>
+          {isGenerating && (
+            <button
+              onClick={cancelGeneration}
+              className="btn btn-secondary"
+            >
+              Cancel
+            </button>
+          )}
+          {generatedCode && (
+            <>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(generatedCode);
+                  console.log('Code copied to clipboard');
+                }}
+                className="btn btn-secondary"
+              >
+                Copy Code
+              </button>
+              <button
+                onClick={() => {
+                  const blob = new Blob([generatedCode], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `transformation-code-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.py`;
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                }}
+                className="btn btn-secondary"
+              >
+                Export Code
+              </button>
+              {spec && (
+                <button
+                  onClick={() => {
+                    const blob = new Blob([JSON.stringify(spec, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `pipeline-spec-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                  }}
+                  className="btn btn-secondary"
+                >
+                  Export JSON
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Prerequisites Check */}
+      {
+        !spec && !(config.fieldTransforms.length > 0 || config.rowTransforms.length > 0) && (
+          <div className="prerequisites-message">
+            <h4>Prerequisites:</h4>
+            <p>Please complete the following steps before generating code:</p>
+            <ul>
+              <li>Configure data source and target</li>
+              <li>Add field and/or row transformations</li>
+            </ul>
+            <p>The system will automatically generate the JSON specification and Python-Polars code.</p>
+          </div>
+        )
+      }
+
+      {/* Error Display */}
+      <ErrorDisplay
+        error={error}
+        title="Code Generation Error"
+        showRetry={!isGenerating}
+        onRetry={retryGeneration}
+      />
+
+      {/* Loading State with Progress */}
+      {
+        isGenerating && (
+          <div className="loading-state">
+            <div className="progress-container">
+              <div className="progress-bar">
+                <div
+                  className="progress-fill"
+                  style={{ width: `${progress}%` }}
+                ></div>
+              </div>
+              <div className="progress-text">
+                {progress}% - {getProgressMessage()}
+              </div>
+            </div>
+
+            {currentTaskId && (
+              <div className="task-info">
+                <p>Task ID: <code>{currentTaskId}</code></p>
+              </div>
+            )}
+
+            <div className="loading-details">
+              <p>This may take 30-60 seconds depending on the complexity of your transformations.</p>
+              <p>The Ollama CodeLlama model is analyzing your configuration and generating optimized Python-Polars code.</p>
+            </div>
+          </div>
+        )
+      }
+
+      {/* Generated Code Display */}
+      {
+        generatedCode && (
+          <div className="code-editor-container">
+            <div className="code-editor-header">
+              <h4>Generated Python-Polars Code</h4>
+              <div className="code-metadata">
+                <span>Generated: {new Date().toLocaleString()}</span>
+                <span>Lines: {generatedCode.split('\n').length}</span>
+              </div>
+            </div>
+
+            <div className="code-editor">
+              {/* Temporarily using textarea instead of Monaco Editor */}
+              <textarea
+                style={{
+                  width: '100%',
+                  height: '600px',
+                  fontFamily: 'Consolas, Monaco, "Courier New", monospace',
+                  fontSize: '13px',
+                  padding: '15px',
+                  border: '1px solid #ccc',
+                  borderRadius: '4px',
+                  backgroundColor: '#b2b6bdff',
+                  color: '#e2e8f0',
+                  lineHeight: '1.4',
+                  resize: 'vertical'
+                }}
+                value={generatedCode}
+                readOnly
+              />
+            </div>
+
+            <div className="code-info">
+              <h5>Code Features:</h5>
+              <ul>
+                <li>✓ Optimized for large-scale data processing</li>
+                <li>✓ Includes parallel processing patterns</li>
+                <li>✓ Uses broadcast joins for lookup tables</li>
+                <li>✓ Implements caching strategies</li>
+                <li>✓ Includes error handling and logging</li>
+                <li>✓ Ready for production deployment</li>
+              </ul>
+            </div>
+
+            {/* Code Analysis */}
+            {generatedCode && (
+              <div className="code-analysis">
+                <h4>Code Analysis</h4>
+                <div className="analysis-grid">
+                  <div className="analysis-item">
+                    <label>Imports:</label>
+                    <span>{(generatedCode.match(/^import|^from/gm) || []).length} modules</span>
+                  </div>
+                  <div className="analysis-item">
+                    <label>Functions:</label>
+                    <span>{(generatedCode.match(/^def /gm) || []).length} functions</span>
+                  </div>
+                  <div className="analysis-item">
+                    <label>DataFrame Operations:</label>
+                    <span>{(generatedCode.match(/\.withColumn|\.select|\.filter|\.join/g) || []).length} operations</span>
+                  </div>
+                  <div className="analysis-item">
+                    <label>Optimizations:</label>
+                    <span>
+                      {[
+                        generatedCode.includes('broadcast(') ? 'Broadcast Joins' : null,
+                        generatedCode.includes('.cache()') || generatedCode.includes('.persist()') ? 'Caching' : null,
+                        generatedCode.includes('repartition(') || generatedCode.includes('coalesce(') ? 'Partitioning' : null,
+                      ].filter(Boolean).join(', ') || 'None detected'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Execution Instructions */}
+            {generatedCode && (
+              <div className="execution-instructions">
+                <h4>Execution Instructions</h4>
+                <div className="instructions-content">
+                  <h5>Prerequisites:</h5>
+                  <ul>
+                    <li>Python 3.8+ installed</li>
+                    <li>Polars Python package (<code>pip install polars</code>)</li>
+                    <li>Required database drivers — e.g. <code>cx_Oracle</code>, <code>psycopg2</code>, or <code>connectorx</code> (if using database sources/targets)</li>
+                    <li>Sufficient memory for in-memory processing of your dataset</li>
+                  </ul>
+
+                  <h5>Running the Code:</h5>
+                  <ol>
+                    <li>Save the generated code to a .py file</li>
+                    <li>Update connection strings and file paths as needed</li>
+                    <li>Run with: <code>python your_transformation.py</code></li>
+                    <li>Or execute in a Jupyter notebook with a standard Python kernel</li>
+                  </ol>
+
+                  <h5>Configuration:</h5>
+                  <ul>
+                    <li>Use LazyFrames (<code>.lazy()</code>) and <code>collect(streaming=True)</code> for large datasets</li>
+                    <li>Adjust batch sizes for database writes based on data volume</li>
+                    <li>Leverage Polars multi-threaded execution — no cluster setup required</li>
+                  </ul>
+                </div>
+              </div>
+            )}
           </div>
         )}
+    </div>
+  );
+};
+
+export default CodeDisplay;
