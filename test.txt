@@ -1,260 +1,143 @@
 import React, { useState } from 'react';
-import { TransformationConfig, TransformationSpec } from '../types';
+import DataSourceConfigComponent from './components/DataSourceConfig';
+import TransformationBuilder from './components/TransformationBuilder';
+import ExecutePipeline from './components/ExecutePipeline';
+import CodeDisplay from './components/CodeDisplay';
+import { TransformationConfig, DataSourceConfig, FieldTransformation, RowTransformation } from './types';
+import './components/styles.css';
 
-interface CodeExportProps {
-  config: TransformationConfig;
-  spec: TransformationSpec | null;
-  generatedCode: string;
-}
+const App: React.FC = () => {
+  console.log('App component rendering at:', new Date().toISOString());
 
-const CodeExport: React.FC<CodeExportProps> = ({ config, generatedCode }) => {
-  const [copySuccess, setCopySuccess] = useState<string | null>(null);
-  const [downloadSuccess, setDownloadSuccess] = useState<string | null>(null);
-
-  const code = generatedCode;
-
-  const generateFilename = (): string => {
-    // Generate filename with timestamp and source info
-    const timestamp = new Date().toISOString()
-      .slice(0, 19)
-      .replace(/:/g, '-')
-      .replace('T', '_');
-
-    const sourceType = config.dataSource.source?.type || 'unknown';
-    const targetType = config.dataSource.target?.type || 'unknown';
-
-    return `transformation_${sourceType}_to_${targetType}_${timestamp}.py`;
-  };
-
-  const copyToClipboard = async () => {
-    try {
-      await navigator.clipboard.writeText(code);
-      setCopySuccess('Code copied to clipboard!');
-
-      // Clear success message after 3 seconds
-      setTimeout(() => setCopySuccess(null), 3000);
-    } catch (err) {
-      // Fallback for browsers that don't support clipboard API
-      try {
-        const textArea = document.createElement('textarea');
-        textArea.value = code;
-        textArea.style.position = 'fixed';
-        textArea.style.left = '-999999px';
-        textArea.style.top = '-999999px';
-        document.body.appendChild(textArea);
-        textArea.focus();
-        textArea.select();
-
-        const successful = document.execCommand('copy');
-        document.body.removeChild(textArea);
-
-        if (successful) {
-          setCopySuccess('Code copied to clipboard!');
-          setTimeout(() => setCopySuccess(null), 3000);
-        } else {
-          setCopySuccess('Failed to copy code');
-          setTimeout(() => setCopySuccess(null), 3000);
-        }
-      } catch (fallbackErr) {
-        setCopySuccess('Copy not supported in this browser');
-        setTimeout(() => setCopySuccess(null), 3000);
+  const [currentStep, setCurrentStep] = useState(1);
+  const [config, setConfig] = useState<TransformationConfig>({
+    dataSource: {
+      mode: 'file-to-file',
+      source: {
+        type: 'csv',
+        delimiter: ',',
+        path: ''
+      },
+      target: {
+        type: 'csv',
+        delimiter: ',',
+        path: ''
       }
+    },
+    fieldTransforms: [],
+    rowTransforms: []
+  });
+
+  const [spec, setSpec] = useState<any>(null);
+
+  const updateDataSource = (dataSource: DataSourceConfig) => {
+    setConfig(prev => ({ ...prev, dataSource }));
+  };
+
+  const updateFieldTransforms = (fieldTransforms: FieldTransformation[]) => {
+    console.log('App: updateFieldTransforms called with:', fieldTransforms.map(f => f.fieldName));
+    setConfig(prev => ({ ...prev, fieldTransforms }));
+  };
+
+  const updateRowTransforms = (rowTransforms: RowTransformation[]) => {
+    setConfig(prev => ({ ...prev, rowTransforms }));
+  };
+
+  const steps = [
+    { id: 1, title: 'Data Source Configuration', component: 'datasource' },
+    { id: 2, title: 'Transformation Builder', component: 'transformations' },
+    { id: 3, title: 'Review & Execute Pipeline', component: 'execute' },
+    { id: 4, title: 'AI Code Generation', component: 'codedisplay' }
+  ];
+
+  const renderCurrentStep = () => {
+    switch (currentStep) {
+      case 1:
+        return (
+          <DataSourceConfigComponent
+            config={config.dataSource}
+            onChange={updateDataSource}
+          />
+        );
+      case 2:
+        return (
+          <TransformationBuilder
+            config={config.dataSource}
+            fieldTransforms={config.fieldTransforms}
+            rowTransforms={config.rowTransforms}
+            onFieldTransformsChange={updateFieldTransforms}
+            onRowTransformsChange={updateRowTransforms}
+          />
+        );
+      case 3:
+        return <ExecutePipeline config={config} />;
+      case 4:
+        return (
+          <CodeDisplay
+            config={config}
+            spec={spec}
+            onSpecChange={setSpec}
+          />
+        );
+      default:
+        return <div>Unknown step</div>;
     }
   };
-
-  const downloadCode = () => {
-    try {
-      const blob = new Blob([code], { type: 'text/x-python' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-
-      a.href = url;
-      a.download = generateFilename();
-      a.style.display = 'none';
-
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-
-      // Clean up the URL object
-      URL.revokeObjectURL(url);
-
-      setDownloadSuccess(`Downloaded as ${generateFilename()}`);
-      setTimeout(() => setDownloadSuccess(null), 3000);
-    } catch (err) {
-      setDownloadSuccess('Failed to download file');
-      setTimeout(() => setDownloadSuccess(null), 3000);
-    }
-  };
-
-  const getCodeStats = () => {
-    const lines = code.split('\n').length;
-    const characters = code.length;
-    const words = code.split(/\s+/).filter(word => word.length > 0).length;
-    const size = new Blob([code]).size;
-
-    return { lines, characters, words, size };
-  };
-
-  const stats = getCodeStats();
-
-  if (!code || code.trim() === '') {
-    return (
-      <div className="code-export">
-        <div className="no-code-message">
-          <p>No code available to export. Please generate code first.</p>
-        </div>
-      </div>
-    );
-  }
 
   return (
-    <div className="code-export">
-      <div className="code-export-header">
-        <h3>Export Generated Code</h3>
-        <div className="code-stats">
-          <span>{stats.lines} lines</span>
-          <span>{stats.characters} characters</span>
-          <span>{(stats.size / 1024).toFixed(1)} KB</span>
+    <div className="app">
+      <header className="app-header">
+        <h1>Config-Driven PySpark ETL Engine</h1>
+        <p>Design your data pipeline and execute it with PySpark</p>
+      </header>
+
+      <nav className="step-navigation">
+        <div className="steps">
+          {steps.map((step) => (
+            <button
+              key={step.id}
+              className={`step ${currentStep === step.id ? 'active' : ''} enabled`}
+              onClick={() => setCurrentStep(step.id)}
+            >
+              <span className="step-number">{step.id}</span>
+              <span className="step-title">{step.title}</span>
+            </button>
+          ))}
         </div>
-      </div>
+      </nav>
 
-      <div className="export-actions">
-        <div className="export-buttons">
-          <button
-            onClick={copyToClipboard}
-            className="btn btn-primary export-btn"
-            title="Copy code to clipboard"
-          >
-            <span className="btn-icon">📋</span>
-            Copy to Clipboard
-          </button>
-
-          <button
-            onClick={downloadCode}
-            className="btn btn-secondary export-btn"
-            title="Download code as Python file"
-          >
-            <span className="btn-icon">💾</span>
-            Download .py File
-          </button>
+      <main className="app-content">
+        <div className="step-content">
+          <h2>{steps.find(s => s.id === currentStep)?.title}</h2>
+          {renderCurrentStep()}
         </div>
 
-        <div className="filename-preview">
-          <label>Download filename:</label>
-          <code>{generateFilename()}</code>
+        <div className="step-controls">
+          {currentStep > 1 && (
+            <button
+              className="btn btn-secondary"
+              onClick={() => setCurrentStep(currentStep - 1)}
+            >
+              Previous
+            </button>
+          )}
+
+          {currentStep < steps.length && (
+            <button
+              className="btn btn-primary"
+              onClick={() => setCurrentStep(currentStep + 1)}
+            >
+              Next
+            </button>
+          )}
         </div>
-      </div>
+      </main>
 
-      {/* Success Messages */}
-      {copySuccess && (
-        <div className="success-message copy-success">
-          <span className="success-icon">✅</span>
-          {copySuccess}
-        </div>
-      )}
-
-      {downloadSuccess && (
-        <div className="success-message download-success">
-          <span className="success-icon">✅</span>
-          {downloadSuccess}
-        </div>
-      )}
-
-      {/* Code Preview */}
-      <div className="code-preview">
-        <h4>Code Preview</h4>
-        <div className="code-preview-content">
-          <pre>
-            <code>
-              {code.split('\n').slice(0, 10).join('\n')}
-              {code.split('\n').length > 10 && '\n... (truncated)'}
-            </code>
-          </pre>
-        </div>
-      </div>
-
-      {/* Export Options */}
-      <div className="export-options">
-        <h4>Export Options</h4>
-        <div className="options-grid">
-          <div className="option-item">
-            <h5>Clipboard Copy</h5>
-            <p>Copy the entire code to your system clipboard for pasting into your IDE or text editor.</p>
-            <ul>
-              <li>Preserves formatting and indentation</li>
-              <li>Ready to paste into any text editor</li>
-              <li>Works with most modern browsers</li>
-            </ul>
-          </div>
-
-          <div className="option-item">
-            <h5>File Download</h5>
-            <p>Download the code as a Python (.py) file with a descriptive filename including timestamp.</p>
-            <ul>
-              <li>Automatic filename with timestamp</li>
-              <li>Ready to run with spark-submit</li>
-              <li>Preserves all code formatting</li>
-              <li>Includes UTF-8 encoding</li>
-            </ul>
-          </div>
-        </div>
-      </div>
-
-      {/* Usage Instructions */}
-      <div className="usage-instructions">
-        <h4>Next Steps</h4>
-        <div className="instructions-content">
-          <h5>After Copying/Downloading:</h5>
-          <ol>
-            <li><strong>Review the code:</strong> Check connection strings, file paths, and configuration parameters</li>
-            <li><strong>Update credentials:</strong> Replace placeholder values with your actual database credentials</li>
-            <li><strong>Test with sample data:</strong> Run the code on a small dataset first</li>
-            <li><strong>Deploy to production:</strong> Use spark-submit or your preferred Spark deployment method</li>
-          </ol>
-
-          <h5>Execution Commands:</h5>
-          <div className="command-examples">
-            <div className="command-item">
-              <label>Local Spark:</label>
-              <code>spark-submit {generateFilename()}</code>
-            </div>
-            <div className="command-item">
-              <label>Cluster Mode:</label>
-              <code>spark-submit --master yarn --deploy-mode cluster {generateFilename()}</code>
-            </div>
-            <div className="command-item">
-              <label>With Configuration:</label>
-              <code>spark-submit --conf spark.sql.adaptive.enabled=true {generateFilename()}</code>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* File Information */}
-      <div className="file-info">
-        <h4>File Information</h4>
-        <div className="info-grid">
-          <div className="info-item">
-            <label>File Type:</label>
-            <span>Python Script (.py)</span>
-          </div>
-          <div className="info-item">
-            <label>Encoding:</label>
-            <span>UTF-8</span>
-          </div>
-          <div className="info-item">
-            <label>Framework:</label>
-            <span>Apache Spark / PySpark</span>
-          </div>
-          <div className="info-item">
-            <label>Generated:</label>
-            <span>{new Date().toLocaleString()}</span>
-          </div>
-        </div>
-      </div>
+      <footer className="app-footer">
+        <p>Config-Driven PySpark ETL Engine - "Give me a JSON, I'll run your pipeline."</p>
+      </footer>
     </div>
   );
 };
 
-export default CodeExport;
+export default App;
