@@ -1,314 +1,122 @@
-import axios, { AxiosInstance, AxiosResponse, AxiosError } from 'axios';
-import {
-  TransformationConfig,
-  ValidationResult,
-  TransformationSpec,
-  CodeGenerationTask,
-  CodeGenerationStatus
-} from '../types';
+def build_llm_prompt(config: Dict[str, Any]) -> str:
+    config_json = json.dumps(config, indent=2)
+    return f"""
+You are an expert Data Engineer specializing in Python, Polars, and Oracle databases.
+
+Based on the following JSON ETL pipeline configuration, generate a complete, independent, and runnable Python script using the `polars` library.
+
+The script MUST:
+1. Use `polars` for all data transformations, reading, and writing. Do NOT use PySpark or Pandas.
+2. Read data from the configured source (CSV, Parquet, or Database).
+3. Apply all listed field and row transformations step-by-step.
+4. Write the final DataFrame to the configured target (usually Oracle Database).
+5. Handle parallelism properly. For Polars, this means utilizing LazyFrames (`.lazy()`) and `collect(streaming=True)` if appropriate for large datasets (up to 100 million rows).
+6. For Oracle database reads/writes, use highly optimized concurrent logic utilizing Python multiprocessing or optimized batch configurations if `polars.write_database` is not sufficient natively.
+7. Include robust error handling and logging.
+8. Be well-commented and clean.
+9. ONLY output the Python code, surrounded by ```python ... ``` blocks. Do not include markdown explanations outside the code block.
+
+Pipeline Configuration JSON:
+{config_json}
+"""
+
+@app.route('/api/generate-ollama-code', methods=['POST'])
+def generate_ollama_code():
+    try:
+        config = request.json
+        prompt = build_llm_prompt(config)
+        
+        import requests
+        
+        # Call local Ollama
+        response = requests.post('http://localhost:11434/api/generate', json={
+            "model": "codellama:7b",
+            "prompt": prompt,
+            "stream": False
+        }, timeout=300)
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        # Extract the code from the response
+        code = result.get('response', '')
+        
+        # Clean markdown code blocks if present
+        if code.strip().startswith('```python'):
+            code = code.strip().split('```python', 1)[1]
+            if '```' in code:
+                code = code.rsplit('```', 1)[0]
+        elif code.strip().startswith('```'):
+            code = code.strip().split('```', 1)[1]
+            if '```' in code:
+                code = code.rsplit('```', 1)[0]
+                
+        return jsonify({
+            "success": True,
+            "code": code.strip(),
+            "status": "success"
+        })
+    except requests.exceptions.ConnectionError:
+        return jsonify({
+            "success": False,
+            "error": "Failed to connect to Ollama. Make sure Ollama is running locally on port 11434 (`ollama serve`)."
+        }), 500
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
-// API Client configuration
-interface ApiClientConfig {
-  baseURL: string;
-  timeout: number;
-  retries: number;
-  retryDelay: number;
-}
-
-class ApiClient {
-  private client: AxiosInstance;
-  private config: ApiClientConfig;
-
-  constructor(config: Partial<ApiClientConfig> = {}) {
-    // Determine base URL from Vite `import.meta.env` (if available at runtime) or fallback to process.env for tests.
-    const getViteEnv = () => {
-      try {
-        // Use a dynamic Function so we don't reference `import.meta` at parse time (Jest/CommonJS environments choke on it)
-        // eslint-disable-next-line no-new-func
-        return (new Function('return (typeof import !== "undefined" && typeof import.meta !== "undefined") ? import.meta.env : undefined'))();
-      } catch {
-        return undefined;
-      }
-    };
-
-    const viteEnv = getViteEnv();
-    const envBaseUrl = (viteEnv && viteEnv.VITE_API_BASE_URL) || (typeof process !== 'undefined' && (process as any).env && (process as any).env.REACT_APP_API_BASE_URL);
-
-    this.config = {
-      baseURL: config.baseURL || envBaseUrl || 'http://localhost:9001',
-      timeout: config.timeout || 30000,
-      retries: config.retries || 3,
-      retryDelay: config.retryDelay || 1000,
-    };
-
-    this.client = axios.create({
-      baseURL: this.config.baseURL,
-      timeout: this.config.timeout,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    });
-
-    // Add response interceptor for error handling
-    this.client.interceptors.response.use(
-      (response) => response,
-      (error) => this.handleError(error)
-    );
-  }
-
-  /**
-   * Handle API errors with retry logic
-   */
-  private async handleError(error: AxiosError): Promise<never> {
-    if (error.response) {
-      // Server responded with error status
-      const status = error.response.status;
-      const serverData = error.response.data as any;
-
-      // Prefer our structured ErrorResponse fields when present
-      if (serverData && (serverData.message || serverData.error_code)) {
-        const message = serverData.message || 'Server error occurred';
-        const code = serverData.error_code || `HTTP_${status}`;
-        const details = serverData.details || {}
-        throw new ApiError(message, status, code, details);
-      }
-
-      // Handle FastAPI/Pydantic validation errors (422) which use 'detail'
-      if (serverData && serverData.detail) {
-        // detail is often an array of validation errors; stringify for display
-        const detailStr = typeof serverData.detail === 'string' ? serverData.detail : JSON.stringify(serverData.detail);
-        throw new ApiError(`Validation error: ${detailStr}`, status, 'VALIDATION_ERROR', { detail: serverData.detail });
-      }
-
-      // Fallback: include raw response body
-      const fallbackMsg = typeof serverData === 'string' ? serverData : JSON.stringify(serverData || {});
-      throw new ApiError(fallbackMsg || 'Server error occurred', status, 'SERVER_ERROR', { raw: serverData });
-    } else if (error.request) {
-      // Network error
-      throw new ApiError(
-        'Network error: Unable to connect to server',
-        0,
-        'NETWORK_ERROR'
-      );
-    } else {
-      // Request setup error
-      throw new ApiError(
-        'Request error: ' + error.message,
-        0,
-        'REQUEST_ERROR'
-      );
-    }
-  }
-
-  /**
-   * Retry logic for failed requests
-   */
-  private async retryRequest<T>(
-    requestFn: () => Promise<AxiosResponse<T>>,
-    retries: number = this.config.retries
-  ): Promise<T> {
-    try {
-      const response = await requestFn();
-      return response.data;
-    } catch (error) {
-      if (retries > 0 && this.shouldRetry(error as ApiError)) {
-        await this.delay(this.config.retryDelay);
-        return this.retryRequest(requestFn, retries - 1);
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Determine if request should be retried
-   */
-  private shouldRetry(error: ApiError): boolean {
-    // Retry on network errors or 5xx server errors
-    return error.status === 0 || (error.status >= 500 && error.status < 600);
-  }
-
-  /**
-   * Delay utility for retry logic
-   */
-  private delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Validate transformation configuration
-   */
-  async validateConfig(config: TransformationConfig): Promise<ValidationResult> {
-    return this.retryRequest(() =>
-      this.client.post<ValidationResult>('/api/validate-config', config)
-    );
-  }
-
-  /**
-   * Generate JSON specification from configuration
-   */
-  async generateJson(config: TransformationConfig): Promise<TransformationSpec> {
-    return this.retryRequest(() =>
-      this.client.post<TransformationSpec>('/api/generate-json', config)
-    );
-  }
-
-  /**
-   * Generate PySpark code from specification
-   */
-  async generateCode(spec: TransformationSpec): Promise<CodeGenerationTask> {
-    return this.retryRequest(() =>
-      this.client.post<CodeGenerationTask>('/api/generate-code', spec)
-    );
-  }
-
-  /**
-   * Generate PySpark code using AI directly from configuration
-   */
-  async generateAICode(config: TransformationConfig, provider: 'ollama' | 'gemini'): Promise<{ code: string; status: string }> {
-    const endpoint = provider === 'gemini' ? '/api/generate-gemini-code' : '/api/generate-ollama-code';
-    console.log(`API Client: Calling ${endpoint} with config:`, config);
-    return this.retryRequest(() =>
-      this.client.post<{ code: string; status: string }>(endpoint, config, {
-        timeout: 300000 // 5 minutes timeout for AI generation
-      })
-    );
-  }
-
-  async getFileHeaders(sourceConfig: any): Promise<string[]> {
-    return this.retryRequest(() =>
-      this.client.post<{ headers: string[] }>('/api/preview/file-headers', sourceConfig)
-    ).then(data => data.headers)
-      .catch(error => {
-        console.warn('Failed to fetch file headers', error);
-        throw error; // Re-throw after logging to be caught by retryRequest or higher
-      });
-  }
-
-  async getConnections(): Promise<{ key: string; value: string }[]> {
-    return this.retryRequest(() =>
-      this.client.get<{ success: boolean; connections: { key: string; value: string }[] }>('/api/connections')
-    ).then(data => data.connections);
-  }
-
-  async getDbColumns(targetConfig: any): Promise<string[]> {
-    // Map frontend config format to backend API format
-    const requestBody = {
-      db_type: targetConfig.type,  // Map 'type' to 'db_type'
-      table: targetConfig.table,
-      schema: targetConfig.schema || 'public',
-      connectionString: targetConfig.connectionString,
-      connection: targetConfig.connection
-    };
-
-    return this.retryRequest(() =>
-      this.client.post<{ columns: string[] }>('/api/preview/db-columns', requestBody)
-    ).then(data => data.columns)
-      .catch(error => {
-        console.warn('Failed to fetch db columns', error);
-        throw error; // Re-throw after logging to be caught by retryRequest or higher
-      });
-  }
-
-  async testDbConnection(config: any): Promise<{ success: boolean; error?: string }> {
-    try {
-      const response = await this.client.post('/api/test-connection', config);
-      return response.data;
-    } catch (error) {
-      console.error('Connection test failed request', error);
-      return { success: false, error: 'Network or server error' };
-    }
-  }
-
-  /**
-   * Get code generation status
-   */
-  async getCodeStatus(taskId: string): Promise<CodeGenerationStatus> {
-    return this.retryRequest(() =>
-      this.client.get<CodeGenerationStatus>(`/api/code-status/${taskId}`)
-    );
-  }
-
-  /**
-   * Health check endpoint
-   */
-  async healthCheck(): Promise<{ status: string }> {
-    return this.retryRequest(() =>
-      this.client.get<{ status: string }>(`/api/health`)
-    );
-  }
-
-  /**
-   * List files in directory
-   */
-  async listDirectory(path?: string): Promise<{ current_path: string; parent_path: string | null; items: any[] }> {
-    return this.retryRequest(() =>
-      this.client.get<{ current_path: string; parent_path: string | null; items: any[] }>('/api/fs/list', {
-        params: { path }
-      })
-    );
-  }
-}
-
-/**
- * Custom API Error class
- */
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    public status: number,
-    public errorCode?: string,
-    public details?: Record<string, any>
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
-
-  /**
-   * Check if error is a specific type
-   */
-  isErrorCode(code: string): boolean {
-    return this.errorCode === code;
-  }
-
-  /**
-   * Check if error is a network error
-   */
-  isNetworkError(): boolean {
-    return this.status === 0;
-  }
-
-  /**
-   * Check if error is a server error (5xx)
-   */
-  isServerError(): boolean {
-    return this.status >= 500 && this.status < 600;
-  }
-
-  /**
-   * Check if error is a client error (4xx)
-   */
-  isClientError(): boolean {
-    return this.status >= 400 && this.status < 500;
-  }
-}
-
-// Lazy-initialize default client to avoid creating an Axios instance at module-import time
-// (this prevents issues in test environments where `axios.create` may be mocked before tests set return values)
-let _apiClientInstance: ApiClient | undefined;
-
-const lazyApiClient = new Proxy({}, {
-  get(_: any, prop: string) {
-    if (!_apiClientInstance) {
-      _apiClientInstance = new ApiClient();
-    }
-    const targetProp = (_apiClientInstance as any)[prop];
-    if (typeof targetProp === 'function') {
-      return targetProp.bind(_apiClientInstance);
-    }
-    return targetProp;
-  }
-}) as unknown as ApiClient;
-
-export default lazyApiClient;
-export { ApiClient };
+@app.route('/api/generate-gemini-code', methods=['POST'])
+def generate_gemini_code():
+    try:
+        config = request.json
+        prompt = build_llm_prompt(config)
+        
+        gemini_api_key = os.environ.get('GEMINI_API_KEY')
+        if not gemini_api_key:
+            return jsonify({
+                "success": False,
+                "error": "GEMINI_API_KEY environment variable is not set in the backend .env file."
+            }), 400
+            
+        import requests
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_api_key}"
+        
+        response = requests.post(url, json={
+            "contents": [{"parts": [{"text": prompt}]}]
+        }, timeout=300)
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        try:
+            code = result.get('candidates', [])[0].get('content', {}).get('parts', [])[0].get('text', '')
+        except (IndexError, AttributeError):
+            code = f"# Failed to parse Gemini response:\n# {json.dumps(result, indent=2)}"
+        
+        # Clean markdown code blocks if present
+        if code.strip().startswith('```python'):
+            code = code.strip().split('```python', 1)[1]
+            if '```' in code:
+                code = code.rsplit('```', 1)[0]
+        elif code.strip().startswith('```'):
+            code = code.strip().split('```', 1)[1]
+            if '```' in code:
+                code = code.rsplit('```', 1)[0]
+                
+        return jsonify({
+            "success": True,
+            "code": code.strip(),
+            "status": "success"
+        })
+    except Exception as e:
+        # Sanitize error message to remove any API key
+        error_msg = str(e)
+        if gemini_api_key:
+            error_msg = error_msg.replace(gemini_api_key, '***REDACTED***')
+        return jsonify({
+            "success": False,
+            "error": error_msg
+        }), 500
