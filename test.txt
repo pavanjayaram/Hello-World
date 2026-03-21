@@ -1,186 +1,164 @@
-.file-browser-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-color: rgba(0, 0, 0, 0.5);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 1000;
+import React, { useState, useEffect } from 'react';
+import apiClient from '../services/apiClient';
+import './FileBrowserModal.css';
+
+interface FileEntry {
+    name: string;
+    path: string;
+    is_dir: boolean;
+    size: number;
+    modified: string;
 }
 
-.file-browser-modal {
-    background-color: white;
-    width: 800px;
-    max-width: 90vw;
-    height: 600px;
-    max-height: 90vh;
-    border-radius: 8px;
-    display: flex;
-    flex-direction: column;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+interface FileBrowserModalProps {
+    isOpen: boolean;
+    onClose: () => void;
+    onSelect: (path: string) => void;
+    initialPath?: string;
 }
 
-.file-browser-header {
-    padding: 15px 20px;
-    border-bottom: 1px solid #eee;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
+const FileBrowserModal: React.FC<FileBrowserModalProps> = ({
+    isOpen,
+    onClose,
+    onSelect,
+    initialPath
+}) => {
+    const [currentPath, setCurrentPath] = useState<string>('');
+    const [parentPath, setParentPath] = useState<string | null>(null);
+    const [files, setFiles] = useState<FileEntry[]>([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [selectedFile, setSelectedFile] = useState<string | null>(null);
 
-.file-browser-header h3 {
-    margin: 0;
-    font-size: 1.2rem;
-}
+    // Load files when modal opens or path changes
+    useEffect(() => {
+        if (isOpen) {
+            loadDirectory(currentPath || initialPath);
+        }
+    }, [isOpen]);
 
-.close-btn {
-    background: none;
-    border: none;
-    font-size: 1.5rem;
-    cursor: pointer;
-    color: #666;
-}
+    const loadDirectory = async (path?: string) => {
+        setLoading(true);
+        setError(null);
+        try {
+            const result = await apiClient.listDirectory(path);
+            setCurrentPath(result.current_path);
+            setParentPath(result.parent_path);
+            setFiles(result.items);
+        } catch (err: any) {
+            console.error("Failed to list directory:", err);
+            setError(err.message || "Failed to load directory");
+        } finally {
+            setLoading(false);
+        }
+    };
 
-.file-browser-path {
-    padding: 10px 20px;
-    background-color: #f8f9fa;
-    border-bottom: 1px solid #eee;
-    display: flex;
-    gap: 10px;
-    align-items: center;
-}
+    const handleEntryClick = (entry: FileEntry) => {
+        if (entry.is_dir) {
+            loadDirectory(entry.path);
+        } else {
+            setSelectedFile(entry.path);
+        }
+    };
 
-.nav-btn {
-    padding: 5px 10px;
-    border: 1px solid #ddd;
-    background-color: white;
-    border-radius: 4px;
-    cursor: pointer;
-}
+    const handleSelect = () => {
+        if (selectedFile) {
+            onSelect(selectedFile);
+            onClose();
+        }
+    };
 
-.nav-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
+    const formatSize = (bytes: number) => {
+        if (bytes === 0) return '';
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${sizes[i]}`;
+    };
 
-.path-input {
-    flex: 1;
-    padding: 5px 10px;
-    border: 1px solid #ddd;
-    border-radius: 4px;
-    background-color: #fff;
-    color: #555;
-    font-family: monospace;
-}
+    if (!isOpen) return null;
 
-.file-browser-content {
-    flex: 1;
-    overflow-y: auto;
-    padding: 0;
-}
+    return (
+        <div className="file-browser-overlay">
+            <div className="file-browser-modal">
+                <div className="file-browser-header">
+                    <h3>Browse Server Files</h3>
+                    <button className="close-btn" onClick={onClose}>&times;</button>
+                </div>
 
-.file-list {
-    display: flex;
-    flex-direction: column;
-}
+                <div className="file-browser-path">
+                    <button
+                        className="nav-btn"
+                        onClick={() => parentPath && loadDirectory(parentPath)}
+                        disabled={!parentPath}
+                        title="Go Up"
+                    >
+                        ⬆️ Up
+                    </button>
+                    <input
+                        type="text"
+                        value={currentPath}
+                        readOnly
+                        className="path-input"
+                    />
+                </div>
 
-.file-entry {
-    display: grid;
-    grid-template-columns: 40px 1fr 100px 120px;
-    padding: 8px 20px;
-    cursor: pointer;
-    border-bottom: 1px solid #f0f0f0;
-    align-items: center;
-    transition: background-color 0.1s;
-}
+                <div className="file-browser-content">
+                    {loading ? (
+                        <div className="loading">Loading...</div>
+                    ) : error ? (
+                        <div className="error">{error}</div>
+                    ) : (
+                        <div className="file-list">
+                            {parentPath && (
+                                <div
+                                    className="file-entry directory"
+                                    onClick={() => loadDirectory(parentPath)}
+                                >
+                                    <span className="icon">📁</span>
+                                    <span className="name">..</span>
+                                </div>
+                            )}
+                            {files.map((file) => (
+                                <div
+                                    key={file.path}
+                                    className={`file-entry ${file.is_dir ? 'directory' : 'file'} ${selectedFile === file.path ? 'selected' : ''}`}
+                                    onClick={() => handleEntryClick(file)}
+                                    onDoubleClick={() => {
+                                        if (file.is_dir) loadDirectory(file.path);
+                                        else {
+                                            setSelectedFile(file.path);
+                                            handleSelect();
+                                        }
+                                    }}
+                                >
+                                    <span className="icon">{file.is_dir ? '📁' : '📄'}</span>
+                                    <span className="name">{file.name}</span>
+                                    <span className="size">{formatSize(file.size)}</span>
+                                    <span className="date">{new Date(file.modified).toLocaleDateString()}</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
 
-.file-entry:hover {
-    background-color: #f5f5f5;
-}
+                <div className="file-browser-footer">
+                    <div className="selected-info">
+                        {selectedFile ? `Selected: ${selectedFile.split(/[/\\]/).pop()}` : 'No file selected'}
+                    </div>
+                    <div className="actions">
+                        <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+                        <button
+                            className="btn btn-primary"
+                            onClick={handleSelect}
+                            disabled={!selectedFile}
+                        >
+                            Select File
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
 
-.file-entry.selected {
-    background-color: #e3f2fd;
-    border-color: #90caf9;
-}
-
-.file-entry .icon {
-    font-size: 1.2rem;
-}
-
-.transform-type-btn strong {
-    display: block;
-}
-
-.file-entry .name {
-    font-weight: 500;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.file-entry .size,
-.file-entry .date {
-    color: #666;
-    font-size: 0.9rem;
-    text-align: right;
-}
-
-.loading,
-.error {
-    padding: 40px;
-    text-align: center;
-    color: #666;
-}
-
-.error {
-    color: #d32f2f;
-}
-
-.file-browser-footer {
-    padding: 15px 20px;
-    border-top: 1px solid #eee;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background-color: #f8f9fa;
-}
-
-.selected-info {
-    color: #666;
-    font-style: italic;
-    max-width: 50%;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.actions {
-    display: flex;
-    gap: 10px;
-}
-
-.btn {
-    padding: 8px 16px;
-    border-radius: 4px;
-    cursor: pointer;
-    border: none;
-    font-weight: 500;
-}
-
-.btn-primary {
-    background-color: #007bff;
-    color: white;
-}
-
-.btn-primary:disabled {
-    background-color: #ccc;
-    cursor: not-allowed;
-}
-
-.btn-secondary {
-    background-color: #6c757d;
-    color: white;
-}
+export default FileBrowserModal;
