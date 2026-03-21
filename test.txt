@@ -1,12 +1,7 @@
-import logging
-import os
+def calculate_score(total, mismatches):
+    matched = total - len(mismatches)
+    return (matched / total) * 100 if total else 0
 
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename="logs/execution.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-logger = logging.getLogger()
+def classify_severity(field):
+    critical = ["status", "amount", "customerId"]
+    return "HIGH" if any(c in field for c in critical) else "LOW"
