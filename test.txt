@@ -1,143 +1,18 @@
-// Type definitions for the data transformation system
+cd /Users/pavankumarvarakudujayaram/Desktop/Code/pyspark_app 
+source .venv/bin/activate
+python3 backend/app.py
 
-export interface DataSourceConfig {
-  mode: 'file-to-file' | 'file-to-db' | 'db-to-db' | 'db-to-file';
-  source: FileSource | DatabaseSource;
-  target: FileTarget | DatabaseTarget;
-  errorHandling?: {
-    mode: 'reject_and_continue' | 'reject_and_fail';
-  };
-}
+Kill 
+lsof -i :9001 | awk 'NR!=1 {print $2}' | xargs -r kill -9
 
-export interface FileSource {
-  type: 'csv' | 'dat' | 'txt' | 'excel';
-  delimiter?: string;
-  path: string;
-}
+lsof -i :9001: Lists all open files/processes running on port 9001.
+awk 'NR!=1 {print $2}': Skips the header row (NR!=1) and extracts just the Process ID (PID) which is the second column ($2).
+xargs -r kill -9: Takes those PIDs and force kills them (kill -9).
 
-export interface DatabaseSource {
-  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
-  connectionString: string;
-  schema: string;
-  table: string;
-  partitionColumn?: string;
-  lowerBound?: string;
-  upperBound?: string;
-  numPartitions?: string;
-  fetchsize?: string;
-}
 
-export interface FileTarget {
-  type: 'csv' | 'dat' | 'txt' | 'excel';
-  delimiter?: string;
-  path: string;
-}
 
-export interface DatabaseTarget {
-  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
-  connectionString: string;
-  schema: string;
-  table: string;
-  batchsize?: string;
-  isolationLevel?: string;
-  primaryKey?: string;
-}
 
-export interface FieldTransformation {
-  fieldName: string;
-  targetField?: string;
-  transformations: Transform[];
-}
 
-export interface Transform {
-  type: 'add' | 'upper' | 'lower' | 'trim' | 'ltrim' | 'rtrim' | 'substring' | 'concat' | 'replace' | 'pad' |
-  'cast' | 'to_date' | 'to_timestamp' | 'to_number' | 'format' |
-  'if_then_else' | 'case_when' | 'coalesce' | 'nvl' |
-  'lookup' | 'cdc' |
-  'round' | 'ceil' | 'floor' | 'abs' | 'arithmetic' |
-  'sum' | 'avg' | 'min' | 'max' | 'count' | 'group_by' |
-  'deduplication' | 'validation' | 'masking' | 'data_masking' | 'data_unmasking' |
-  'literal' | 'row_number' | 'sequence' | 'current_date';
-  params: Record<string, any>;
-}
-
-export interface RowTransformation {
-  type: 'distinct' | 'filter' | 'sort' | 'sample' | 'union' | 'intersect' | 'except' | 'pivot' | 'unpivot' | 'lookup' | 'cdc_compare';
-  params: Record<string, any>;
-}
-
-export interface LLMConfig {
-  provider: 'ollama' | 'gemini';
-  model: string;
-  apiKey?: string;
-}
-
-export interface TransformationConfig {
-  dataSource: DataSourceConfig;
-  fieldTransforms: FieldTransformation[];
-  rowTransforms: RowTransformation[];
-  llmConfig?: LLMConfig;
-}
-
-export interface ValidationResult {
-  valid: boolean;
-  errors: string[];
-  warnings: string[];
-}
-
-export interface TransformationSpec {
-  version: string;
-  created_at: string;
-  source: SourceSpec;
-  target: TargetSpec;
-  field_transforms: FieldTransformSpec[];
-  row_transforms: RowTransformSpec[];
-  metadata: Record<string, any>;
-}
-
-export interface SourceSpec {
-  type: 'file' | 'database';
-  file_type?: string;
-  database_type?: string;
-  connection?: Record<string, any>;
-  path?: string;
-  delimiter?: string;
-}
-
-export interface TargetSpec {
-  type: 'file' | 'database';
-  file_type?: string;
-  database_type?: string;
-  connection?: Record<string, any>;
-  path?: string;
-  delimiter?: string;
-}
-
-export interface FieldTransformSpec {
-  field: string;
-  transforms: TransformSpec[];
-}
-
-export interface RowTransformSpec {
-  type: string;
-  params: Record<string, any>;
-}
-
-export interface TransformSpec {
-  type: string;
-  params: Record<string, any>;
-}
-
-export interface CodeGenerationTask {
-  task_id: string;
-  status: string;
-  created_at: string;
-}
-
-export interface CodeGenerationStatus {
-  task_id: string;
-  status: string;
-  progress: number;
-  code?: string;
-  error?: string;
-}
+cd /Users/pavankumarvarakudujayaram/Desktop/Code/pyspark_app/frontend 
+npm run dev
+npx kill-port 3007
