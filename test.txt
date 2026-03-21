@@ -1,9 +1,14 @@
-- Do NOT hardcode credentials (client_id, client_secret)
-- Use environment variables or secure vaults
-- Do NOT include real endpoints or internal URLs
-- Do NOT include production data or sensitive payloads
-- Mask sensitive fields in logs and reports (PII, IDs, tokens)
-- Ensure all API calls use secure protocols (HTTPS)
-- Limit logging of full request/response payloads
-- Ensure compliance with company data security policies
-- If using AI tools, only use anonymized or dummy data
+import requests
+
+def call_api(url, payload, soap_action):
+    headers = {
+        "Content-Type": "text/xml",
+        "SOAPAction": soap_action
+    }
+
+    try:
+        response = requests.post(url, data=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        return f"ERROR: {str(e)}"
