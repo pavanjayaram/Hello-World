@@ -1,13 +1,40 @@
-{
-  "test_cases": [
-    {
-      "test_name": "getCustomer",
-      "dev_url": "https://dev-url",
-      "uat_url": "https://uat-url",
-      "soap_action": "getCustomer",
-      "request_payload": "<Envelope>...</Envelope>",
-      "fields_to_compare": ["customerId", "name", "status", "amount"],
-      "ignore_fields": ["timestamp", "requestId"]
-    }
-  ]
-}
+from flask import Flask, request, Response
+
+app = Flask(__name__)
+
+# ---------------- DEV API ----------------
+@app.route('/dev', methods=['POST'])
+def dev_api():
+    response_xml = """<?xml version="1.0"?>
+    <Envelope>
+      <Body>
+        <customer id="101">
+          <name>Pavan</name>
+          <status>ACTIVE</status>
+          <amount>100</amount>
+        </customer>
+      </Body>
+    </Envelope>"""
+    
+    return Response(response_xml, mimetype='text/xml')
+
+
+# ---------------- UAT API ----------------
+@app.route('/uat', methods=['POST'])
+def uat_api():
+    response_xml = """<?xml version="1.0"?>
+    <Envelope>
+      <Body>
+        <customer id="101">
+          <name>Pavan</name>
+          <status>INACTIVE</status>
+          <amount>100.0</amount>
+        </customer>
+      </Body>
+    </Envelope>"""
+    
+    return Response(response_xml, mimetype='text/xml')
+
+
+if __name__ == '__main__':
+    app.run(port=5000)
