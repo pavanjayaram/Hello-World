@@ -6,7 +6,7 @@ from reject_handler import RejectHandler
 from targets import TargetFactory
 from sources import SourceFactory
 
-class DBToDBETL:
+class DBToFileETL:
     def __init__(self, config_path, config=None):
         self.config_path = config_path
         self.config = config if config else self._load_config()
@@ -20,7 +20,7 @@ class DBToDBETL:
             return json.load(f)
             
     def _create_spark_session(self):
-        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL_DB2DB")
+        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL_DB2F")
         builder = SparkSession.builder.appName(app_name)
         
         jars = self.config.get("pipeline", {}).get("jars", [])
@@ -47,7 +47,7 @@ class DBToDBETL:
         return df
 
     def transform(self, df):
-        print("Starting Transformations via Central Engine (CDC/Lookup enabled)...")
+        print("Starting Transformations via Central Engine (CDC/Lookup automatically skipped due to FILE target)...")
         context = {
             "reject_handler": self.reject
         }
@@ -57,19 +57,19 @@ class DBToDBETL:
 
     def load(self, df):
         target_config = self.config.get("target", {})
-        target_type = target_config.get("type", "DB")
+        target_type = target_config.get("type", "FILE")
         
         row_count = df.count()
         self.audit.record_target_count(row_count)
         
         print(f"Loading data using TargetFactory for type: {target_type}")
         handler = TargetFactory.get_handler(target_type)
-        handler.write(df, self.config)
+        handler.write(df, target_config)
         print("Data load complete!")
 
     def run(self):
         pipeline_id = self.config.get('pipeline', {}).get('pipeline_id', 'Unknown_Pipeline')
-        print(f"=== Starting DB_TO_DB Pipeline: {pipeline_id} ===")
+        print(f"=== Starting DB_TO_FILE Pipeline: {pipeline_id} ===")
         
         try:
             self.audit.start_pipeline(pipeline_id)
@@ -82,7 +82,7 @@ class DBToDBETL:
                 print(f"--- WARNING: {reject_count} invalid rows were sent to Reject path ---")
                 
             self.audit.end_pipeline(self.spark, status='SUCCESS')
-            print("=== DB_TO_DB Pipeline Finished Successfully ===")
+            print("=== DB_TO_FILE Pipeline Finished Successfully ===")
         except Exception as e:
             self.audit.end_pipeline(self.spark, status='FAILED', error_msg=str(e))
             print(f"=== ETL Pipeline FAILED: {str(e)} ===")
