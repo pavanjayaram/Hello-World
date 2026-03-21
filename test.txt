@@ -1,56 +1,20 @@
-def deep_compare(dev, uat, path="", ignore_fields=None, strict=True):
-    if ignore_fields is None:
-        ignore_fields = []
+import os
 
-    result = {
-        "mismatch": [],
-        "match": []
-    }
+def load_test_cases(base_path):
+    test_cases = []
 
-    if is_ignored(path, ignore_fields):
-        return result
+    for folder in os.listdir(base_path):
+        folder_path = os.path.join(base_path, folder)
 
-    if type(dev) != type(uat):
-        result["mismatch"].append({
-            "field": path,
-            "dev": dev,
-            "uat": uat,
-            "type": "TYPE_MISMATCH"
-        })
-        return result
+        if os.path.isdir(folder_path):
+            source_file = os.path.join(folder_path, "source.xml")
+            target_file = os.path.join(folder_path, "target.xml")
 
-    if isinstance(dev, dict):
-        all_keys = set(dev.keys()).union(set(uat.keys()))
-
-        for key in all_keys:
-            new_path = f"{path}.{key}" if path else key
-
-            if key not in dev:
-                result["mismatch"].append({
-                    "field": new_path,
-                    "dev": None,
-                    "uat": uat[key],
-                    "type": "MISSING_IN_DEV"
+            if os.path.exists(source_file) and os.path.exists(target_file):
+                test_cases.append({
+                    "test_name": folder,
+                    "source_request_file": source_file,
+                    "target_request_file": target_file
                 })
-            elif key not in uat:
-                result["mismatch"].append({
-                    "field": new_path,
-                    "dev": dev[key],
-                    "uat": None,
-                    "type": "MISSING_IN_UAT"
-                })
-            else:
-                sub = deep_compare(dev[key], uat[key], new_path, ignore_fields, strict)
-                result["mismatch"].extend(sub["mismatch"])
-                result["match"].extend(sub["match"])
 
-    elif isinstance(dev, list):
-        # keep your existing list logic (extend mismatch)
-        pass
-
-    else:
-        leaf = compare_values(dev, uat, path, strict)
-        result["mismatch"].extend(leaf["mismatch"])
-        result["match"].extend(leaf["match"])
-
-    return result
+    return test_cases
