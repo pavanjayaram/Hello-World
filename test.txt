@@ -1,30 +1,20 @@
-def execute_test(test, config):
-    test_name = test["test_name"]
+def call_api(url, payload, soap_action):
+    headers = {
+        "Content-Type": "text/xml",
+        "SOAPAction": soap_action
+    }
 
-    dev_payload = read_xml_file(test["source_request_file"])
-    uat_payload = read_xml_file(test["target_request_file"])
+    try:
+        response = requests.post(url, data=payload, headers=headers, timeout=30)
 
-    dev_res = call_api(config["dev_url"], dev_payload, config["soap_action"])
-    uat_res = call_api(config["uat_url"], uat_payload, config["soap_action"])
+        # 🔥 Capture SOAP Fault
+        if "Fault" in response.text:
+            print("\n🚨 SOAP FAULT DETECTED")
+            print(response.text)
+            return None
 
-    dev_dict = xml_to_dict(dev_res)
-    uat_dict = xml_to_dict(uat_res)
+        return response.text
 
-    result = deep_compare(
-        dev_dict,
-        uat_dict,
-        ignore_fields=config["ignore_fields"],
-        strict=True
-    )
-
-    mismatches = result["mismatch"]
-    matches = result["match"]
-
-    total = len(matches) + len(mismatches)
-    score = (len(matches) / total) * 100 if total else 0
-
-    status = "Passed" if not mismatches else "Failed"
-
-    csv_file, html_file = generate_reports(test_name, mismatches, matches, score)
-
-    print(f"{test_name} → {status} ({score:.2f}%)")
+    except Exception as e:
+        print(f"API Error: {str(e)}")
+        return None
