@@ -1,148 +1,97 @@
+import sys
 import json
-import os
 import logging
+import os
 from pyspark.sql import SparkSession
-from pyspark.sql.window import Window
-from transformations import apply_all_transformations, apply_field_mappings
-from audit_logger import AuditMetrics
-from reject_handler import RejectHandler
-from sources import SourceFactory
-from targets import TargetFactory
+from dotenv import load_dotenv
 
-class FileToFileETL:
-    def __init__(self, config_path, config=None):
-        """
-        Initializes the ETL Engine.
-        """
-        self.config_path = config_path
-        self.config = config if config else self._load_config()
-        self.spark = self._create_spark_session()
-        self.audit = AuditMetrics(self.config)
-        self.reject = RejectHandler(self.config)
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "Missing config file path"}))
+        sys.exit(1)
         
-    def _load_config(self):
-        logging.info(f"Loading configuration from: {self.config_path}")
-        with open(self.config_path, 'r') as f:
-            return json.load(f)
+    config_path = sys.argv[1]
+    
+    # Load env matching the API
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(backend_dir)
+    load_dotenv(os.path.join(project_root, '.env'))
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
             
-    def _create_spark_session(self):
-        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL")
-        logging.info(f"Initializing SparkSession: {app_name}")
+        db_type = config.get("db_type", "").lower()
+        table = config.get("table")
+        schema = config.get("schema", "public")
+        connection_string = config.get("connectionString")
         
-        # Note: If EXCEL support is needed, you typically need to include the excel jar in config
-        # e.g., .config("spark.jars.packages", "com.crealytics:spark-excel_2.12:3.3.1_0.18.7")
-        builder = SparkSession.builder.appName(app_name)
+        if not table or not connection_string:
+            print(json.dumps({"error": "Missing table or connection string"}))
+            sys.exit(1)
+            
+        # Initialize Spark dynamically with the required drivers
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        jars = [
+            os.path.join(backend_dir, "jars", "ojdbc8.jar"),
+            os.path.join(backend_dir, "jars", "postgresql-42.7.3.jar")
+        ]
         
-        # Look for custom JARs (like excel reader or DB drivers)
-        jars = self.config.get("pipeline", {}).get("jars", [])
-        if jars:
-            # spark.jars is always comma-separated
-            builder = builder.config("spark.jars", ",".join(jars))
-            # spark.driver.extraClassPath requires OS-specific separator
-            builder = builder.config("spark.driver.extraClassPath", os.pathsep.join(jars))
-            
-        spark = builder.getOrCreate()
-            
-        log_level = self.config.get("pipeline", {}).get("log_level", "WARN")
-        spark.sparkContext.setLogLevel(log_level)
-        return spark
-
-    def extract(self):
-        """
-        Reads the source file dynamically based on the JSON configuration via SourceFactory.
-        """
-        source_config = self.config.get("source", {})
-        source_type = source_config.get("type", "FILE")
+        # Suppress logging for faster startup
+        logging.getLogger("py4j").setLevel(logging.ERROR)
         
-        logging.info(f"Extracting data using SourceFactory for type: {source_type}")
-        handler = SourceFactory.get_handler(source_type)
-        df = handler.read(self.spark, source_config)
+        spark = SparkSession.builder \
+            .appName("MetadataFetcher") \
+            .config("spark.jars", ",".join(jars)) \
+            .config("spark.ui.enabled", "false") \
+            .getOrCreate()
+            
+        spark.sparkContext.setLogLevel("ERROR")
         
-        # Capture source count
-        row_count = df.count()
-        logging.info(f"Extracted {row_count} rows.")
-        self.audit.record_source_count(row_count)
+        # Build jdbc read properties
+        properties = {}
         
-        return df
-
-    def transform(self, df):
-        """
-        Applies transformations and field mappings using the central transformation engine.
-        """
-        logging.info("Starting Transformations via Central Engine...")
+        # Extract user/password if available in config.connection
+        conn_details = config.get("connection", {})
+        if conn_details.get("username"):
+            properties["user"] = conn_details.get("username")
+        if conn_details.get("password"):
+            properties["password"] = conn_details.get("password")
+            
+        # Resolve environment variable if connection string is just a key like POSTGRES_URL
+        if connection_string and connection_string in os.environ:
+            connection_string = os.environ[connection_string]
+            
+        # Parse non-JDBC URIs using the shared DBSourceHandler
+        if connection_string and not connection_string.startswith("jdbc:"):
+            from sources import DBSourceHandler
+            handler = DBSourceHandler()
+            connection_string, parsed_props = handler._parse_connection_string(connection_string, db_type)
+            for k, v in parsed_props.items():
+                if k not in properties or not properties[k]:
+                    properties[k] = v
         
-        # 1. Apply rules from "transformations" array
-        # apply_all_transformations handles row_number, if_then_else, filter, sorting, etc.
-        # We pass self.reject in the context dictionary so transformations can log bad rows!
-        context = {
-            "reject_handler": self.reject
-        }
-        df = apply_all_transformations(self, df, self.config, context)
+        target_table = f"{schema}.{table}" if db_type == "postgres" and schema else table
+        if db_type == "oracle" and schema:
+            target_table = f"{schema}.{table}"
+            
+        # We only need the schema layout, we don't need any actual data
+        # To do this incredibly fast, we formulate a pushdown query with 0 results.
+        pushdown_query = f"(SELECT * FROM {target_table} WHERE 1=0) AS tmp"
         
-        # 2. Apply "field_mappings" (Selecting and renaming target columns in specified order)
-        df = apply_field_mappings(df, self.config)
-            
-        return df
-
-    def load(self, df):
-        """
-        Writes the transformed DataFrame to the target destination via TargetFactory.
-        """
-        target_config = self.config.get("target", {})
-        target_type = target_config.get("type", "FILE")
+        df = spark.read.jdbc(
+            url=connection_string,
+            table=pushdown_query,
+            properties=properties
+        )
         
-        # Capture target count BEFORE writing (Action trigger)
-        row_count = df.count()
-        self.audit.record_target_count(row_count)
-            
-        logging.info(f"Loading data using TargetFactory for type: {target_type}")
-        handler = TargetFactory.get_handler(target_type)
-        handler.write(df, target_config)
-        logging.info("Data load complete!")
-
-    def run(self):
-        """
-        Orchestrates the ETL pipeline.
-        """
-        pipeline_id = self.config.get('pipeline', {}).get('pipeline_id', 'Unknown_Pipeline')
-        logging.info(f"=== Starting ETL Pipeline: {pipeline_id} ===")
+        columns = df.columns
+        print(json.dumps({"columns": columns}))
         
-        try:
-            # 1. Start Audit tracking
-            self.audit.start_pipeline(pipeline_id)
-            
-            # 2. Extract
-            source_df = self.extract()
-            
-            # 3. Transform (Rejects are captured automatically in this specific step based on context)
-            transformed_df = self.transform(source_df)
-            
-            # 4. Load (Audit captures row_count and handles writes)
-            self.load(transformed_df)
-            
-            # 5. Check if the pipeline finished, but generated rejections
-            reject_count = self.reject.get_reject_count()
-            if reject_count > 0:
-                logging.warning(f"--- WARNING: {reject_count} invalid rows were sent to Reject path ---")
-            
-            # 6. Successfully terminate Auditing (including rejects in the final audit counts)
-            self.audit.end_pipeline(self.spark, status='SUCCESS')
-            logging.info("=== ETL Pipeline Execution Finished Successfully ===")
-            
-        except Exception as e:
-            # Mark the Audit log as FAILED with the error reason
-            self.audit.end_pipeline(self.spark, status='FAILED', error_msg=str(e))
-            logging.error(f"=== ETL Pipeline FAILED: {str(e)} ===")
-            raise e
+        spark.stop()
+        
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
 
 if __name__ == "__main__":
-    import sys
-    
-    # Allow passing config file via command line argument, otherwise default
-    if len(sys.argv) > 1:
-        config_file = sys.argv[1]
-    else:
-        config_file = "/Users/pavankumarvarakudujayaram/Desktop/Code/pyspark_app/CSV_TO_CSV.json"
-        
-    engine = FileToFileETL(config_file)
-    engine.run()
+    main()
