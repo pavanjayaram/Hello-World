@@ -1,35 +1,58 @@
-import requests
-import os
+import json
+import argparse
+from src.api_client import call_api
+from src.deep_parser import xml_to_dict
+from src.deep_comparator import deep_compare
+from src.executor import run_parallel
+from src.scoring import calculate_score
+from src.report_generator import generate_reports
+from src.octane_client import OctaneClient
+from src.logger import logger
 
-class OctaneClient:
+def execute_test(test, octane):
+    logger.info(f"Running {test['test_name']}")
 
-    def __init__(self):
-        self.base_url = os.getenv("OCTANE_URL")
-        self.client_id = os.getenv("OCTANE_CLIENT_ID")
-        self.client_secret = os.getenv("OCTANE_CLIENT_SECRET")
-        self.space_id = os.getenv("OCTANE_SPACE_ID")
-        self.workspace_id = os.getenv("OCTANE_WORKSPACE_ID")
-        self.cookies = None
+    run_id = octane.create_run(test["test_name"])
 
-    def authenticate(self):
-        res = requests.post(
-            f"{self.base_url}/authentication/sign_in",
-            auth=(self.client_id, self.client_secret)
-        )
-        self.cookies = res.cookies
+    dev_res = call_api(test["dev_url"], test["request_payload"], test["soap_action"])
+    uat_res = call_api(test["uat_url"], test["request_payload"], test["soap_action"])
 
-    def create_run(self, name):
-        url = f"{self.base_url}/api/shared_spaces/{self.space_id}/workspaces/{self.workspace_id}/runs"
-        payload = {"data": [{"name": name, "status": {"phase": "Running"}}]}
-        res = requests.post(url, json=payload, cookies=self.cookies)
-        return res.json()["data"][0]["id"]
+    if not dev_res or not uat_res:
+        octane.update_run(run_id, "Failed")
+        return
 
-    def update_run(self, run_id, status):
-        url = f"{self.base_url}/api/shared_spaces/{self.space_id}/workspaces/{self.workspace_id}/runs/{run_id}"
-        payload = {"data": [{"id": run_id, "status": {"phase": status}}]}
-        requests.put(url, json=payload, cookies=self.cookies)
+    dev_dict = xml_to_dict(dev_res)
+    uat_dict = xml_to_dict(uat_res)
 
-    def attach_report(self, file_path):
-        url = f"{self.base_url}/api/shared_spaces/{self.space_id}/workspaces/{self.workspace_id}/attachments"
-        files = {"file": open(file_path, "rb")}
-        requests.post(url, files=files, cookies=self.cookies)
+    mismatches = deep_compare(dev_dict, uat_dict, ignore_fields=test["ignore_fields"])
+
+    score = calculate_score(len(mismatches) + 1, mismatches)
+
+    status = "Passed" if not mismatches else "Failed"
+
+    csv_file, html_file = generate_reports(test["test_name"], mismatches, score)
+
+    octane.update_run(run_id, status)
+    octane.attach_report(html_file)
+
+    logger.info(f"{test['test_name']} completed → {status}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--parallel", action="store_true")
+    args = parser.parse_args()
+
+    with open("config/config.json") as f:
+        config = json.load(f)
+
+    octane = OctaneClient()
+    octane.authenticate()
+
+    if args.parallel:
+        run_parallel(config["test_cases"], lambda t: execute_test(t, octane))
+    else:
+        for test in config["test_cases"]:
+            execute_test(test, octane)
+
+if __name__ == "__main__":
+    main()
