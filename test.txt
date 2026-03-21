@@ -1,53 +1,56 @@
-import csv
-import os
-from src.scoring import classify_severity
+def deep_compare(dev, uat, path="", ignore_fields=None, strict=True):
+    if ignore_fields is None:
+        ignore_fields = []
 
-def generate_reports(test_name, mismatches, score):
-    os.makedirs("reports", exist_ok=True)
+    result = {
+        "mismatch": [],
+        "match": []
+    }
 
-    csv_file = f"reports/{test_name}.csv"
-    html_file = f"reports/{test_name}.html"
+    if is_ignored(path, ignore_fields):
+        return result
 
-    # CSV
-    with open(csv_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Field", "DEV", "UAT", "Type", "Severity"])
+    if type(dev) != type(uat):
+        result["mismatch"].append({
+            "field": path,
+            "dev": dev,
+            "uat": uat,
+            "type": "TYPE_MISMATCH"
+        })
+        return result
 
-        for m in mismatches:
-            field = m.get("field")
-            dev = m.get("dev")
-            uat = m.get("uat")
-            mtype = m.get("type")
-            severity = classify_severity(field)
+    if isinstance(dev, dict):
+        all_keys = set(dev.keys()).union(set(uat.keys()))
 
-            writer.writerow([field, dev, uat, mtype, severity])
+        for key in all_keys:
+            new_path = f"{path}.{key}" if path else key
 
-    # HTML
-    html = f"<h2>{test_name}</h2><h3>Score: {score:.2f}%</h3><table border=1>"
-    html += "<tr><th>Field</th><th>DEV</th><th>UAT</th><th>Type</th><th>Severity</th></tr>"
+            if key not in dev:
+                result["mismatch"].append({
+                    "field": new_path,
+                    "dev": None,
+                    "uat": uat[key],
+                    "type": "MISSING_IN_DEV"
+                })
+            elif key not in uat:
+                result["mismatch"].append({
+                    "field": new_path,
+                    "dev": dev[key],
+                    "uat": None,
+                    "type": "MISSING_IN_UAT"
+                })
+            else:
+                sub = deep_compare(dev[key], uat[key], new_path, ignore_fields, strict)
+                result["mismatch"].extend(sub["mismatch"])
+                result["match"].extend(sub["match"])
 
-    for m in mismatches:
-        field = m.get("field")
-        dev = m.get("dev")
-        uat = m.get("uat")
-        mtype = m.get("type")
-        severity = classify_severity(field)
+    elif isinstance(dev, list):
+        # keep your existing list logic (extend mismatch)
+        pass
 
-        color = "red" if severity == "HIGH" else "orange"
+    else:
+        leaf = compare_values(dev, uat, path, strict)
+        result["mismatch"].extend(leaf["mismatch"])
+        result["match"].extend(leaf["match"])
 
-        html += f"""
-        <tr style='color:{color}'>
-            <td>{field}</td>
-            <td>{dev}</td>
-            <td>{uat}</td>
-            <td>{mtype}</td>
-            <td>{severity}</td>
-        </tr>
-        """
-
-    html += "</table>"
-
-    with open(html_file, "w") as f:
-        f.write(html)
-
-    return csv_file, html_file
+    return result
