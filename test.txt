@@ -1,67 +1,119 @@
-from pyspark.sql import DataFrame
-from pyspark.sql import functions as F
-import logging
+from pyspark.sql import SparkSession, DataFrame
+from abc import ABC, abstractmethod
 from typing import Dict
+import logging
+import os
 
-class RejectHandler:
-    """
-    Handles capturing, formatting, and storing rows that fail 
-    business validation rules (Filters, Deduplication, Null Constraints).
-    """
+class ConnectionRegistry:
+    _connections = {}
     
-    def __init__(self, config: Dict):
-        # We look specifically for the "reject" block in the JSON
-        self.config = config.get("reject", {})
-        self.enabled = self.config.get("enable", False)
-        self.path = self.config.get("path")
-        self.include_reason = self.config.get("include_reason", True)
+    @classmethod
+    def register(cls, name: str, url: str, properties: Dict):
+        cls._connections[name] = {'url': url, 'properties': properties}
+    
+    @classmethod
+    def get_connection(cls, name: str) -> Dict:
+        if name not in cls._connections:
+            raise ValueError(f"Connection not found: {name}")
+        return cls._connections[name]
+
+class DataFrameRegistry:
+    _dataframes = {}
+    
+    @classmethod
+    def register(cls, name: str, df: DataFrame):
+        cls._dataframes[name] = df
+    
+    @classmethod
+    def get_dataframe(cls, name: str) -> DataFrame:
+        if name not in cls._dataframes:
+            raise ValueError(f"DataFrame not found: {name}")
+        return cls._dataframes[name]
+
+class SourceHandler(ABC):
+    @abstractmethod
+    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
+        pass
+
+class FileSourceHandler(SourceHandler):
+    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
+        format_type = config.get('format', 'csv')
+        path = config.get('path')
+        options = config.get('options', {})
+        if not path:
+            raise ValueError("Source path is required for FILE type")
         
-        # We also look for the "error_handling" block to determine failure behavior
-        # Fallback to errorHandling for raw exports from UI
-        error_config = config.get("error_handling", config.get("errorHandling", {}))
-        self.error_mode = error_config.get("mode", "reject_and_continue")
+        format_mapping = {'txt': 'csv', 'dat': 'csv', 'text': 'csv'}
+        actual_format = format_mapping.get(format_type.lower(), format_type)
+        logging.info(f"Reading {format_type} (as {actual_format}) from {path}")
         
-        self.total_rejects = 0 
+        reader = spark.read.format(actual_format)
+        for k, v in options.items():
+            reader = reader.option(k, str(v).lower() if isinstance(v, bool) else v)
+        return reader.load(path)
+
+class DBSourceHandler(SourceHandler):
+    def read(self, spark: SparkSession, config: Dict) -> DataFrame:
+        db_type = config.get('db_type')
+        table = config.get('table')
+        schema = config.get('schema', 'public')
+        connection = config.get('connection')
+        connection_string = config.get('connectionString')
         
-    def write_rejects(self, df: DataFrame, reason: str = 'VALIDATION_FAILED'):
-        """
-        Takes a DataFrame of "bad" rows, appends the failure reason, 
-        and writes them out to the reject path.
-        """
-        if not self.enabled:
-            return
-            
-        # Count how many bad rows we caught in this specific validation step
-        count = df.count()
-        if count == 0:
-            return
-            
-        self.total_rejects += count
+        if connection_string and connection_string in os.environ:
+             connection_string = os.environ[connection_string]
+             
+        qualified_table = f"{schema}.{table}" if schema and db_type in ['postgres', 'sqlserver', 'oracle'] else table
         
-        # If enabled, append the reason and the timestamp so analysts can debug later
-        if self.include_reason:
-            df = df.withColumn('reject_reason', F.lit(reason))
-            df = df.withColumn('reject_timestamp', F.current_timestamp())
+        if connection:
+            conn_props = ConnectionRegistry.get_connection(connection)
+            jdbc_url = conn_props['url']
+            properties = conn_props['properties']
+        elif connection_string:
+            jdbc_url, properties = self._parse_connection_string(connection_string, db_type)
+        else:
+            raise ValueError("connection or connectionString required for DB source")
             
-        if not self.path:
-            logging.warning("Rejects are enabled, but no 'path' is provided in JSON. Cannot write broken rows.")
-            return
+        fetch_size = config.get('fetchsize')
+        if fetch_size:
+            properties['fetchsize'] = str(fetch_size)
             
-        logging.warning(f"Validation Error: Caught {count} rejected rows. Reason: {reason}.")
-        logging.info(f"Writing rejected rows to {self.path}")
+        partition_col = config.get('partitionColumn')
+        if partition_col:
+            return spark.read.jdbc(
+                url=jdbc_url, table=qualified_table, column=partition_col,
+                lowerBound=int(config.get('lowerBound', 0)),
+                upperBound=int(config.get('upperBound', 100)),
+                numPartitions=int(config.get('numPartitions', 1)),
+                properties=properties
+            )
+        else:
+            return spark.read.jdbc(url=jdbc_url, table=qualified_table, properties=properties)
+
+    def _parse_connection_string(self, conn_str: str, db_type: str) -> tuple:
+        from urllib.parse import urlparse
+        if conn_str.startswith("jdbc:"): conn_str = conn_str[5:]
+        parsed = urlparse(conn_str)
+        username = parsed.username or ''
+        password = parsed.password or ''
+        hostname = parsed.hostname or 'localhost'
+        port = parsed.port
+        database = parsed.path.lstrip('/') if parsed.path else ''
         
-        try:
-            # We typically append Parquet for rejects so we don't accidentally overwrite past failures
-            df.write.mode("append").parquet(self.path)
-            
-            # If the user specifically set reject_and_fail in their JSON, we crash the pipeline immediately!
-            if self.error_mode == "reject_and_fail":
-                error_msg = f"Pipeline aborted. Error Mode is 'reject_and_fail' and {count} rows failed validation: {reason}"
-                logging.error(error_msg)
-                raise RuntimeError(error_msg)
-                
-        except Exception as e:
-            logging.error(f"Failed to write rejected rows to {self.path}: {str(e)}")
-            
-    def get_reject_count(self) -> int:
-        return self.total_rejects
+        driver_map = {
+            'postgres': ('org.postgresql.Driver', f"jdbc:postgresql://{hostname}:{port or 5432}/{database}"),
+            'mysql': ('com.mysql.cj.jdbc.Driver', f"jdbc:mysql://{hostname}:{port or 3306}/{database}"),
+            'oracle': ('oracle.jdbc.driver.OracleDriver', f"jdbc:oracle:thin:@//{hostname}:{port or 1521}/{database}"),
+            'sqlserver': ('com.microsoft.sqlserver.jdbc.SQLServerDriver', f"jdbc:sqlserver://{hostname}:{port or 1433};databaseName={database}")
+        }
+        driver, jdbc_url = driver_map[db_type]
+        properties = {'user': username, 'password': password, 'driver': driver}
+        return jdbc_url, properties
+
+class SourceFactory:
+    _handlers = {'FILE': FileSourceHandler, 'DB': DBSourceHandler}
+    @classmethod
+    def get_handler(cls, source_type: str) -> SourceHandler:
+        if source_type not in cls._handlers:
+             raise ValueError(f"Unsupported source type: {source_type}")
+        return cls._handlers[source_type]()
