@@ -1,40 +1,80 @@
-from flask import Flask, request, Response
+import json
+import argparse
+from src.api_client import call_api
+from src.deep_parser import xml_to_dict
+from src.deep_comparator import deep_compare
+from src.executor import run_parallel
+from src.scoring import calculate_score
+from src.report_generator import generate_reports
+from src.logger import logger
 
-app = Flask(__name__)
-
-# ---------------- DEV API ----------------
-@app.route('/dev', methods=['POST'])
-def dev_api():
-    response_xml = """<?xml version="1.0"?>
-    <Envelope>
-      <Body>
-        <customer id="101">
-          <name>Pavan</name>
-          <status>ACTIVE</status>
-          <amount>100</amount>
-        </customer>
-      </Body>
-    </Envelope>"""
-    
-    return Response(response_xml, mimetype='text/xml')
+# Import only if needed
+from src.octane_client import OctaneClient
 
 
-# ---------------- UAT API ----------------
-@app.route('/uat', methods=['POST'])
-def uat_api():
-    response_xml = """<?xml version="1.0"?>
-    <Envelope>
-      <Body>
-        <customer id="101">
-          <name>Pavan</name>
-          <status>INACTIVE</status>
-          <amount>100.0</amount>
-        </customer>
-      </Body>
-    </Envelope>"""
-    
-    return Response(response_xml, mimetype='text/xml')
+def execute_test(test, octane_enabled, octane):
+    logger.info(f"Running {test['test_name']}")
+
+    run_id = None
+
+    if octane_enabled:
+        run_id = octane.create_run(test["test_name"])
+
+    dev_res = call_api(test["dev_url"], test["request_payload"], test["soap_action"])
+    uat_res = call_api(test["uat_url"], test["request_payload"], test["soap_action"])
+
+    if not dev_res or not uat_res:
+        if octane_enabled:
+            octane.update_run(run_id, "Failed")
+        return
+
+    dev_dict = xml_to_dict(dev_res)
+    uat_dict = xml_to_dict(uat_res)
+
+    mismatches = deep_compare(
+        dev_dict,
+        uat_dict,
+        ignore_fields=test["ignore_fields"]
+    )
+
+    score = calculate_score(len(mismatches) + 1, mismatches)
+    status = "Passed" if not mismatches else "Failed"
+
+    csv_file, html_file = generate_reports(
+        test["test_name"], mismatches, score
+    )
+
+    print(f"{test['test_name']} → {status} ({score:.2f}%)")
+
+    if octane_enabled:
+        octane.update_run(run_id, status)
+        octane.attach_report(html_file)
 
 
-if __name__ == '__main__':
-    app.run(port=5000)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--parallel", action="store_true")
+    args = parser.parse_args()
+
+    with open("config/config.json") as f:
+        config = json.load(f)
+
+    octane_enabled = config.get("enable_octane", False)
+
+    octane = None
+    if octane_enabled:
+        octane = OctaneClient()
+        octane.authenticate()
+
+    if args.parallel:
+        run_parallel(
+            config["test_cases"],
+            lambda t: execute_test(t, octane_enabled, octane)
+        )
+    else:
+        for test in config["test_cases"]:
+            execute_test(test, octane_enabled, octane)
+
+
+if __name__ == "__main__":
+    main()
