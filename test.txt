@@ -1,78 +1,139 @@
-from lxml import etree
-
-
-def remove_namespace(tree):
+def normalize_value(val):
     """
-    Remove XML namespaces for easier parsing
+    Normalize values for fair comparison
+    - Trim strings
+    - Convert numeric strings to numbers
     """
-    for elem in tree.iter():
-        if isinstance(elem.tag, str) and '}' in elem.tag:
-            elem.tag = elem.tag.split('}', 1)[1]
-    return tree
-
-
-def normalize_text(text):
-    """
-    Clean and normalize text values
-    """
-    if text is None:
+    if val is None:
         return None
-    text = text.strip()
-    return text if text else None
+
+    if isinstance(val, str):
+        val = val.strip()
+
+        # Try numeric conversion
+        if val.isdigit():
+            return int(val)
+
+        try:
+            return float(val)
+        except:
+            return val
+
+    return val
 
 
-def parse_element(element):
+def is_ignored(path, ignore_fields):
     """
-    Recursively convert XML element into dictionary
-    Handles:
-    - Nested elements
-    - Repeated tags (lists)
-    - Attributes
+    Check if current path should be ignored
+    Supports partial match
     """
+    return any(ig in path for ig in ignore_fields)
 
-    parsed_data = {}
 
-    # Include attributes if present
-    if element.attrib:
-        for attr_key, attr_val in element.attrib.items():
-            parsed_data[f"@{attr_key}"] = normalize_text(attr_val)
+def compare_values(dev, uat, path):
+    """
+    Compare leaf values
+    """
+    dev_val = normalize_value(dev)
+    uat_val = normalize_value(uat)
 
-    children = list(element)
+    if dev_val != uat_val:
+        return [{
+            "field": path,
+            "dev": dev_val,
+            "uat": uat_val,
+            "type": "VALUE_MISMATCH"
+        }]
+    return []
 
-    # If no children → return text directly
-    if not children:
-        return normalize_text(element.text)
 
-    # Process children
-    child_dict = {}
+def compare_lists(dev_list, uat_list, path, ignore_fields):
+    """
+    Compare lists (order-sensitive)
+    """
+    mismatches = []
 
-    for child in children:
-        child_key = child.tag
-        child_value = parse_element(child)
+    max_len = max(len(dev_list), len(uat_list))
 
-        # Handle repeated tags → convert to list
-        if child_key in child_dict:
-            if not isinstance(child_dict[child_key], list):
-                child_dict[child_key] = [child_dict[child_key]]
-            child_dict[child_key].append(child_value)
+    for i in range(max_len):
+        new_path = f"{path}[{i}]"
+
+        if i >= len(dev_list):
+            mismatches.append({
+                "field": new_path,
+                "dev": None,
+                "uat": uat_list[i],
+                "type": "MISSING_IN_DEV"
+            })
+        elif i >= len(uat_list):
+            mismatches.append({
+                "field": new_path,
+                "dev": dev_list[i],
+                "uat": None,
+                "type": "MISSING_IN_UAT"
+            })
         else:
-            child_dict[child_key] = child_value
+            mismatches.extend(
+                deep_compare(dev_list[i], uat_list[i], new_path, ignore_fields)
+            )
 
-    # Merge attributes + children
-    parsed_data.update(child_dict)
-
-    return parsed_data
+    return mismatches
 
 
-def xml_to_dict(xml_string):
+def deep_compare(dev, uat, path="", ignore_fields=None):
     """
-    Convert full XML string into nested dictionary
+    Main recursive comparison function
     """
-    try:
-        root = etree.fromstring(xml_string.encode())
-        root = remove_namespace(root)
+    if ignore_fields is None:
+        ignore_fields = []
 
-        return {root.tag: parse_element(root)}
+    mismatches = []
 
-    except Exception as e:
-        raise ValueError(f"Invalid XML input: {str(e)}")
+    # Ignore logic
+    if is_ignored(path, ignore_fields):
+        return mismatches
+
+    # Type mismatch
+    if type(dev) != type(uat):
+        return [{
+            "field": path,
+            "dev": dev,
+            "uat": uat,
+            "type": "TYPE_MISMATCH"
+        }]
+
+    # Dict comparison
+    if isinstance(dev, dict):
+        all_keys = set(dev.keys()).union(set(uat.keys()))
+
+        for key in all_keys:
+            new_path = f"{path}.{key}" if path else key
+
+            if key not in dev:
+                mismatches.append({
+                    "field": new_path,
+                    "dev": None,
+                    "uat": uat[key],
+                    "type": "MISSING_IN_DEV"
+                })
+            elif key not in uat:
+                mismatches.append({
+                    "field": new_path,
+                    "dev": dev[key],
+                    "uat": None,
+                    "type": "MISSING_IN_UAT"
+                })
+            else:
+                mismatches.extend(
+                    deep_compare(dev[key], uat[key], new_path, ignore_fields)
+                )
+
+    # List comparison
+    elif isinstance(dev, list):
+        mismatches.extend(compare_lists(dev, uat, path, ignore_fields))
+
+    # Leaf node comparison
+    else:
+        mismatches.extend(compare_values(dev, uat, path))
+
+    return mismatches
