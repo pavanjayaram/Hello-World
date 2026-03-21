@@ -1,58 +1,13 @@
-import json
-import argparse
-from src.api_client import call_api
-from src.deep_parser import xml_to_dict
-from src.deep_comparator import deep_compare
-from src.executor import run_parallel
-from src.scoring import calculate_score
-from src.report_generator import generate_reports
-from src.octane_client import OctaneClient
-from src.logger import logger
-
-def execute_test(test, octane):
-    logger.info(f"Running {test['test_name']}")
-
-    run_id = octane.create_run(test["test_name"])
-
-    dev_res = call_api(test["dev_url"], test["request_payload"], test["soap_action"])
-    uat_res = call_api(test["uat_url"], test["request_payload"], test["soap_action"])
-
-    if not dev_res or not uat_res:
-        octane.update_run(run_id, "Failed")
-        return
-
-    dev_dict = xml_to_dict(dev_res)
-    uat_dict = xml_to_dict(uat_res)
-
-    mismatches = deep_compare(dev_dict, uat_dict, ignore_fields=test["ignore_fields"])
-
-    score = calculate_score(len(mismatches) + 1, mismatches)
-
-    status = "Passed" if not mismatches else "Failed"
-
-    csv_file, html_file = generate_reports(test["test_name"], mismatches, score)
-
-    octane.update_run(run_id, status)
-    octane.attach_report(html_file)
-
-    logger.info(f"{test['test_name']} completed → {status}")
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--parallel", action="store_true")
-    args = parser.parse_args()
-
-    with open("config/config.json") as f:
-        config = json.load(f)
-
-    octane = OctaneClient()
-    octane.authenticate()
-
-    if args.parallel:
-        run_parallel(config["test_cases"], lambda t: execute_test(t, octane))
-    else:
-        for test in config["test_cases"]:
-            execute_test(test, octane)
-
-if __name__ == "__main__":
-    main()
+{
+  "test_cases": [
+    {
+      "test_name": "getCustomer",
+      "dev_url": "https://dev-url",
+      "uat_url": "https://uat-url",
+      "soap_action": "getCustomer",
+      "request_payload": "<Envelope>...</Envelope>",
+      "fields_to_compare": ["customerId", "name", "status", "amount"],
+      "ignore_fields": ["timestamp", "requestId"]
+    }
+  ]
+}
