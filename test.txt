@@ -1,19 +1,22 @@
-import requests
-from src.retry import retry
-from src.logger import logger
+from lxml import etree
 
-def _call(url, payload, soap_action):
-    headers = {
-        "Content-Type": "text/xml",
-        "SOAPAction": soap_action
-    }
-    response = requests.post(url, data=payload, headers=headers, timeout=30)
-    response.raise_for_status()
-    return response.text
+def remove_namespace(tree):
+    for elem in tree.getiterator():
+        if '}' in elem.tag:
+            elem.tag = elem.tag.split('}', 1)[1]
+    return tree
 
-def call_api(url, payload, soap_action):
-    try:
-        return retry(lambda: _call(url, payload, soap_action))
-    except Exception as e:
-        logger.error(f"API call failed: {url} | {str(e)}")
-        return None
+def xml_to_dict(xml_string):
+    root = etree.fromstring(xml_string.encode())
+    root = remove_namespace(root)
+
+    def recurse(node):
+        result = {}
+        for child in node:
+            if len(child):
+                result[child.tag] = recurse(child)
+            else:
+                result[child.tag] = child.text
+        return result
+
+    return {root.tag: recurse(root)}
