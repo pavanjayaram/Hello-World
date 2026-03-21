@@ -1,14 +1,19 @@
-import requests
+from lxml import etree
 
-def call_api(url, payload, soap_action):
-    headers = {
-        "Content-Type": "text/xml",
-        "SOAPAction": soap_action
-    }
+def remove_namespace(xml):
+    for elem in xml.getiterator():
+        if not hasattr(elem.tag, 'find'): continue
+        i = elem.tag.find('}')
+        if i >= 0:
+            elem.tag = elem.tag[i+1:]
+    return xml
 
-    try:
-        response = requests.post(url, data=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        return f"ERROR: {str(e)}"
+def xml_to_dict(xml_string):
+    root = etree.fromstring(xml_string.encode())
+    root = remove_namespace(root)
+
+    data = {}
+    for elem in root.iter():
+        if elem.text and elem.text.strip():
+            data[elem.tag] = elem.text.strip()
+    return data
