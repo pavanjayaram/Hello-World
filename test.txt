@@ -1,7 +1,32 @@
-def calculate_score(total, mismatches):
-    matched = total - len(mismatches)
-    return (matched / total) * 100 if total else 0
+import csv
+import os
+from src.scoring import classify_severity
 
-def classify_severity(field):
-    critical = ["status", "amount", "customerId"]
-    return "HIGH" if any(c in field for c in critical) else "LOW"
+def generate_reports(test_name, mismatches, score):
+    os.makedirs("reports", exist_ok=True)
+
+    csv_file = f"reports/{test_name}.csv"
+    html_file = f"reports/{test_name}.html"
+
+    # CSV
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Field", "DEV", "UAT", "Severity"])
+
+        for field, dev, uat in mismatches:
+            writer.writerow([field, dev, uat, classify_severity(field)])
+
+    # HTML
+    html = f"<h2>{test_name}</h2><h3>Score: {score:.2f}%</h3><table border=1>"
+    html += "<tr><th>Field</th><th>DEV</th><th>UAT</th><th>Severity</th></tr>"
+
+    for field, dev, uat in mismatches:
+        color = "red" if classify_severity(field) == "HIGH" else "orange"
+        html += f"<tr style='color:{color}'><td>{field}</td><td>{dev}</td><td>{uat}</td><td>{classify_severity(field)}</td></tr>"
+
+    html += "</table>"
+
+    with open(html_file, "w") as f:
+        f.write(html)
+
+    return csv_file, html_file
