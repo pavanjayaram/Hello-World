@@ -1,80 +1,53 @@
-import json
-import argparse
-from src.api_client import call_api
-from src.deep_parser import xml_to_dict
-from src.deep_comparator import deep_compare
-from src.executor import run_parallel
-from src.scoring import calculate_score
-from src.report_generator import generate_reports
-from src.logger import logger
+import csv
+import os
+from src.scoring import classify_severity
 
-# Import only if needed
-from src.octane_client import OctaneClient
+def generate_reports(test_name, mismatches, score):
+    os.makedirs("reports", exist_ok=True)
 
+    csv_file = f"reports/{test_name}.csv"
+    html_file = f"reports/{test_name}.html"
 
-def execute_test(test, octane_enabled, octane):
-    logger.info(f"Running {test['test_name']}")
+    # CSV
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Field", "DEV", "UAT", "Type", "Severity"])
 
-    run_id = None
+        for m in mismatches:
+            field = m.get("field")
+            dev = m.get("dev")
+            uat = m.get("uat")
+            mtype = m.get("type")
+            severity = classify_severity(field)
 
-    if octane_enabled:
-        run_id = octane.create_run(test["test_name"])
+            writer.writerow([field, dev, uat, mtype, severity])
 
-    dev_res = call_api(test["dev_url"], test["request_payload"], test["soap_action"])
-    uat_res = call_api(test["uat_url"], test["request_payload"], test["soap_action"])
+    # HTML
+    html = f"<h2>{test_name}</h2><h3>Score: {score:.2f}%</h3><table border=1>"
+    html += "<tr><th>Field</th><th>DEV</th><th>UAT</th><th>Type</th><th>Severity</th></tr>"
 
-    if not dev_res or not uat_res:
-        if octane_enabled:
-            octane.update_run(run_id, "Failed")
-        return
+    for m in mismatches:
+        field = m.get("field")
+        dev = m.get("dev")
+        uat = m.get("uat")
+        mtype = m.get("type")
+        severity = classify_severity(field)
 
-    dev_dict = xml_to_dict(dev_res)
-    uat_dict = xml_to_dict(uat_res)
+        color = "red" if severity == "HIGH" else "orange"
 
-    mismatches = deep_compare(
-        dev_dict,
-        uat_dict,
-        ignore_fields=test["ignore_fields"]
-    )
+        html += f"""
+        <tr style='color:{color}'>
+            <td>{field}</td>
+            <td>{dev}</td>
+            <td>{uat}</td>
+            <td>{mtype}</td>
+            <td>{severity}</td>
+        </tr>
+        """
 
-    score = calculate_score(len(mismatches) + 1, mismatches)
-    status = "Passed" if not mismatches else "Failed"
+    html += "</table>"
 
-    csv_file, html_file = generate_reports(
-        test["test_name"], mismatches, score
-    )
+    with open(html_file, "w") as f:
+        f.write(html)
 
-    print(f"{test['test_name']} → {status} ({score:.2f}%)")
-
-    if octane_enabled:
-        octane.update_run(run_id, status)
-        octane.attach_report(html_file)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--parallel", action="store_true")
-    args = parser.parse_args()
-
-    with open("config/config.json") as f:
-        config = json.load(f)
-
-    octane_enabled = config.get("enable_octane", False)
-
-    octane = None
-    if octane_enabled:
-        octane = OctaneClient()
-        octane.authenticate()
-
-    if args.parallel:
-        run_parallel(
-            config["test_cases"],
-            lambda t: execute_test(t, octane_enabled, octane)
-        )
-    else:
-        for test in config["test_cases"]:
-            execute_test(test, octane_enabled, octane)
-
-
-if __name__ == "__main__":
-    main()
+    return csv_file, html_file
