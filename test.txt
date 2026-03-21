@@ -1,89 +1,194 @@
+import json
+import sys
+import logging
 import os
-from pyspark.sql import SparkSession
-from transformations import apply_all_transformations, apply_field_mappings
-from audit_logger import AuditMetrics
-from reject_handler import RejectHandler
-from targets import TargetFactory
-from sources import SourceFactory
+from file_to_file_etl import FileToFileETL
+from dotenv import load_dotenv
 
-class DBToFileETL:
-    def __init__(self, config_path, config=None):
+# Setup global logging configuration to write to Console so app.py can capture it
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+class PySparkETLEngine:
+    
+    @staticmethod
+    def validate_config(config):
+        """
+        Validates the structure of a JSON configuration dict.
+        Returns a list of error strings. Empty list means valid.
+        """
+        errors = []
+        if not isinstance(config, dict):
+            return ["Configuration must be a JSON object"]
+            
+        if 'pipeline' not in config:
+            errors.append("Missing required 'pipeline' block")
+        elif 'pipeline_type' not in config.get('pipeline', {}):
+            errors.append("Missing 'pipeline_type' in pipeline block")
+            
+        if 'source' not in config:
+            errors.append("Missing required 'source' block")
+            
+        if 'target' not in config:
+            errors.append("Missing required 'target' block")
+            
+        return errors
+    
+    def __init__(self, config_path, param_path=None, env_path=None):
+        """
+        Initializes the ETL Engine by loading the configuration.
+        This serves as the main Factory that routes to the correct pipeline based on config.
+        
+        Args:
+            config_path: Path to the JSON configuration file.
+            param_path:  Optional path to parameterfile.txt for environment-specific overrides.
+            env_path:    Optional explicit path to .env file. If not provided, falls back to
+                         project_root/.env (relative to backend/ directory).
+        """
         self.config_path = config_path
-        self.config = config if config else self._load_config()
-        self.spark = self._create_spark_session()
-        self.audit = AuditMetrics(self.config)
-        self.reject = RejectHandler(self.config)
+        self.param_path = param_path
+        
+        # Ensure env vars are loaded so PySpark can read credentials automatically
+        if env_path and os.path.exists(env_path):
+            load_dotenv(env_path)
+            logging.info(f"[Engine] Loaded environment from: {env_path}")
+        else:
+            backend_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(backend_dir)
+            default_env = os.path.join(project_root, '.env')
+            if os.path.exists(default_env):
+                load_dotenv(default_env)
+                logging.info(f"[Engine] Loaded environment from default: {default_env}")
+        
+        self.config = self._load_config()
+        self._inject_parameters()
+        
+    def _inject_parameters(self):
+        """Reads parameterfile.txt and injects values into the config dict dynamically."""
+        if not self.param_path:
+            return
+            
+        logging.info(f"[Engine] Loading parameters from: {self.param_path}")
+        params = {}
+        try:
+            with open(self.param_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, val = line.split('=', 1)
+                        params[key.strip()] = val.strip()
+            
+            # Inject Audit Path if available in parameters
+            if 'AUDIT_PATH' in params:
+                if 'audit' not in self.config:
+                    self.config['audit'] = {}
+                self.config['audit']['path'] = params['AUDIT_PATH']
+                logging.info(f"[Engine] Injected AUDIT_PATH: {params['AUDIT_PATH']}")
+                
+            # Inject Reject Path if available in parameters
+            if 'REJECT_PATH' in params:
+                if 'reject' not in self.config:
+                    self.config['reject'] = {}
+                self.config['reject']['path'] = params['REJECT_PATH']
+                self.config['reject']['enable'] = True
+                logging.info(f"[Engine] Injected REJECT_PATH: {params['REJECT_PATH']} and enabled Reject Handler")
+                
+            # Inject Global JDBC JARs if available in parameters
+            if 'SPARK_JARS' in params:
+                if 'pipeline' not in self.config:
+                    self.config['pipeline'] = {}
+                # The jars parameter expects an array. We split the string by comma.
+                jar_list = [j.strip() for j in params['SPARK_JARS'].split(',')]
+                self.config['pipeline']['jars'] = jar_list
+                logging.info(f"[Engine] Injected Global SPARK_JARS: {jar_list}")
+        except Exception as e:
+            logging.warning(f"[Engine] WARNING: Failed to read parameter file {self.param_path}: {e}")
         
     def _load_config(self):
-        import json
+        """Loads the JSON configuration file."""
+        logging.info(f"[Engine] Loading configuration from: {self.config_path}")
         with open(self.config_path, 'r') as f:
             return json.load(f)
             
-    def _create_spark_session(self):
-        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL_DB2F")
-        builder = SparkSession.builder.appName(app_name)
+    def run_pipeline(self):
+        """
+        The Factory Method: Reads the pipeline_type from JSON and invokes the respective ETL class.
+        """
+        pipeline_type = self.config.get("pipeline", {}).get("pipeline_type")
+        pipeline_id = self.config.get("pipeline", {}).get("pipeline_id", "Unknown_Pipeline")
         
-        jars = self.config.get("pipeline", {}).get("jars", [])
-        if jars:
-            builder = builder.config("spark.jars", ",".join(jars))
-            builder = builder.config("spark.driver.extraClassPath", os.pathsep.join(jars))
+        logging.info(f"[Engine] Starting Pipeline ID: {pipeline_id}")
+        logging.info(f"[Engine] Identified Pipeline Type: {pipeline_type}")
+        
+        if pipeline_type == "FILE_TO_FILE":
+            from file_to_file_etl import FileToFileETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
             
-        spark = builder.getOrCreate()
-        log_level = self.config.get("pipeline", {}).get("log_level", "WARN")
-        spark.sparkContext.setLogLevel(log_level)
-        return spark
-
-    def extract(self):
-        source_config = self.config.get("source", {})
-        source_type = source_config.get("type", "DB")
-        
-        print(f"Extracting data using SourceFactory for type: {source_type}")
-        handler = SourceFactory.get_handler(source_type)
-        df = handler.read(self.spark, source_config)
-        
-        row_count = df.count()
-        print(f"Extracted {row_count} rows.")
-        self.audit.record_source_count(row_count)
-        return df
-
-    def transform(self, df):
-        print("Starting Transformations via Central Engine (CDC/Lookup automatically skipped due to FILE target)...")
-        context = {
-            "reject_handler": self.reject
-        }
-        df = apply_all_transformations(self, df, self.config, context)
-        df = apply_field_mappings(df, self.config)
-        return df
-
-    def load(self, df):
-        target_config = self.config.get("target", {})
-        target_type = target_config.get("type", "FILE")
-        
-        row_count = df.count()
-        self.audit.record_target_count(row_count)
-        
-        print(f"Loading data using TargetFactory for type: {target_type}")
-        handler = TargetFactory.get_handler(target_type)
-        handler.write(df, target_config)
-        print("Data load complete!")
-
-    def run(self):
-        pipeline_id = self.config.get('pipeline', {}).get('pipeline_id', 'Unknown_Pipeline')
-        print(f"=== Starting DB_TO_FILE Pipeline: {pipeline_id} ===")
-        
-        try:
-            self.audit.start_pipeline(pipeline_id)
-            source_df = self.extract()
-            transformed_df = self.transform(source_df)
-            self.load(transformed_df)
+            logging.info("[Engine] Routing to FILE_TO_FILE ETL process...")
+            etl_process = FileToFileETL(self.config_path, config=self.config)
             
-            reject_count = self.reject.get_reject_count()
-            if reject_count > 0:
-                print(f"--- WARNING: {reject_count} invalid rows were sent to Reject path ---")
-                
-            self.audit.end_pipeline(self.spark, status='SUCCESS')
-            print("=== DB_TO_FILE Pipeline Finished Successfully ===")
-        except Exception as e:
-            self.audit.end_pipeline(self.spark, status='FAILED', error_msg=str(e))
-            print(f"=== ETL Pipeline FAILED: {str(e)} ===")
-            raise e
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "FILE_TO_DB":
+            from file_to_db_etl import FileToDBETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to FILE_TO_DB ETL process...")
+            etl_process = FileToDBETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "DB_TO_FILE":
+            from db_to_file_etl import DBToFileETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to DB_TO_FILE ETL process...")
+            etl_process = DBToFileETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "DB_TO_DB":
+            from db_to_db_etl import DBToDBETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to DB_TO_DB ETL process...")
+            etl_process = DBToDBETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        else:
+            raise ValueError(f"Unsupported pipeline_type: {pipeline_type}")
+            
+if __name__ == "__main__":
+    # Usage: python etl_engine.py <config.json> [parameterfile.txt]
+    if len(sys.argv) > 1:
+        config_file = sys.argv[1]
+    else:
+        config_file = "/Users/pavankumarvarakudujayaram/Desktop/Code/pyspark_app/CSV_TO_CSV.json"
+        
+    param_file = None
+    if len(sys.argv) > 2:
+        param_file = sys.argv[2]
+    else:
+        # Default parameter file if one isn't passed for testing
+        param_file = "/Users/pavankumarvarakudujayaram/Desktop/Code/pyspark_app/parameterfile.txt"
+        
+    engine = PySparkETLEngine(config_file, param_file)
+    engine.run_pipeline()
