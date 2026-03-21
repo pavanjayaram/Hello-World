@@ -1,185 +1,217 @@
-# PySpark ETL Standalone Runner
+#!/usr/bin/env python3
+"""
+Standalone PySpark ETL Pipeline Runner
+======================================
+Production-grade CLI entry point for running ETL pipelines without the Flask/React stack.
+Designed for Autosys job scheduling and batch execution.
 
-This package allows running ETL pipelines **without the Flask/React stack**, directly from the command line or via **Autosys job scheduling**.
+Usage:
+    python run_pipeline.py --config <config.json> [--params <parameterfile.txt>] [--env-file <.env>] [--log-dir <path>]
 
-## Quick Start
+Exit Codes:
+    0 = Pipeline completed successfully
+    1 = Pipeline execution failed (runtime error)
+    2 = Bad arguments, missing files, or invalid configuration
+"""
 
-```bash
-# From the project root directory:
-python standalone/run_pipeline.py \
-    --config  backend/config/CSV_TO_CSV.json \
-    --params  backend/parameterfile.txt \
-    --env-file .env
-```
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime
 
-## Directory Layout
 
-```
-pyspark_app/
-├── standalone/              ← YOU ARE HERE (deploy this + backend/)
-│   ├── run_pipeline.py      # CLI entry point
-│   ├── run_pipeline.sh      # Shell wrapper for Autosys
-│   ├── requirements.txt     # Minimal Python dependencies
-│   └── README.md            # This file
-│
-├── backend/                 ← Required (ETL engine + modules)
-│   ├── etl_engine.py        # Core engine (Factory pattern)
-│   ├── file_to_file_etl.py  # FILE → FILE pipeline
-│   ├── file_to_db_etl.py    # FILE → DB pipeline
-│   ├── db_to_file_etl.py    # DB → FILE pipeline
-│   ├── db_to_db_etl.py      # DB → DB pipeline
-│   ├── transformations.py   # Transformation engine
-│   ├── sources.py           # Source readers (File, DB)
-│   ├── targets.py           # Target writers (File, DB)
-│   ├── audit_logger.py      # Audit metrics
-│   ├── reject_handler.py    # Reject row handling
-│   └── jars/                # JDBC driver JARs
-│
-└── .env                     ← Database credentials (optional)
-```
+# ---------------------------------------------------------------------------
+# Resolve the backend directory so we can import etl_engine and siblings
+# ---------------------------------------------------------------------------
+STANDALONE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(STANDALONE_DIR)
+BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
 
-## CLI Arguments
+# Add backend to sys.path so etl_engine.py and its siblings can be imported
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
 
-| Argument | Short | Required | Description |
-|----------|-------|----------|-------------|
-| `--config` | `-c` | **Yes** | Path to JSON pipeline configuration file |
-| `--params` | `-p` | No | Path to `parameterfile.txt` for environment overrides |
-| `--env-file` | `-e` | No | Path to `.env` file with DB credentials |
-| `--log-dir` | `-l` | No | Directory for execution log files |
 
-## Exit Codes
+# ---------------------------------------------------------------------------
+# Exit Code Constants
+# ---------------------------------------------------------------------------
+EXIT_SUCCESS = 0
+EXIT_PIPELINE_FAILURE = 1
+EXIT_BAD_ARGS = 2
 
-| Code | Meaning | Autosys Status |
-|------|---------|----------------|
-| `0` | Pipeline completed successfully | SUCCESS |
-| `1` | Pipeline execution failed (runtime error) | FAILURE |
-| `2` | Bad arguments, missing files, or invalid config | FAILURE |
 
-## Autosys Integration
+def setup_logging(log_dir=None, pipeline_id="pipeline"):
+    """
+    Configure logging to both console (stdout) and an optional log file.
+    Autosys captures stdout/stderr, so console logging is always enabled.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_format = "%(asctime)s - %(levelname)s - %(message)s"
 
-### JIL Definition Example
+    handlers = [logging.StreamHandler(sys.stdout)]
 
-```jil
-/* ============================================ */
-/*  Daily ETL Load Job                          */
-/* ============================================ */
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"pipeline_{pipeline_id}_{timestamp}.log")
+        handlers.append(logging.FileHandler(log_file, mode="w"))
+        print(f"[Standalone] Log file: {log_file}")
 
-insert_job: ETL_DAILY_LOAD
-job_type: CMD
-command: /opt/etl/standalone/run_pipeline.sh \
-    --config /opt/etl/configs/daily_load.json \
-    --params /opt/etl/parameterfile.txt \
-    --env-file /opt/etl/.env \
-    --log-dir /opt/etl/logs
-machine: etl-server-01
-owner: etl_user
-permission: gx,ge
-date_conditions: 1
-days_of_week: mo,tu,we,th,fr
-start_times: "06:00"
-std_out_file: /opt/etl/logs/autosys_stdout.log
-std_err_file: /opt/etl/logs/autosys_stderr.log
-alarm_if_fail: 1
-max_run_alarm: 120   /* Alert if job runs > 2 hours */
-```
+    # Reset root logger
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    for h in handlers:
+        h.setFormatter(logging.Formatter(log_format))
+        root.addHandler(h)
 
-### Chained Jobs Example
 
-```jil
-/* Job 1: Extract stage */
-insert_job: ETL_EXTRACT_STAGE
-job_type: CMD
-command: /opt/etl/standalone/run_pipeline.sh --config /opt/etl/configs/extract.json
-machine: etl-server-01
-owner: etl_user
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="PySpark ETL Pipeline Runner — Standalone mode for Autosys jobs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic run with config only
+  python run_pipeline.py --config /path/to/pipeline.json
 
-/* Job 2: Transform & Load (depends on extract) */
-insert_job: ETL_TRANSFORM_LOAD
-job_type: CMD
-command: /opt/etl/standalone/run_pipeline.sh --config /opt/etl/configs/transform_load.json
-machine: etl-server-01
-owner: etl_user
-condition: success(ETL_EXTRACT_STAGE)
-```
+  # Full run with all options
+  python run_pipeline.py \\
+      --config  /path/to/pipeline.json \\
+      --params  /path/to/parameterfile.txt \\
+      --env-file /path/to/.env \\
+      --log-dir /path/to/logs
 
-## Parameter File Format
+Autosys JIL Example:
+  insert_job: ETL_DAILY_LOAD
+  job_type: CMD
+  command: /opt/etl/standalone/run_pipeline.sh --config /opt/etl/configs/daily_load.json --params /opt/etl/parameterfile.txt
+  machine: etl-server-01
+  owner: etl_user
+  date_conditions: 1
+  days_of_week: mo,tu,we,th,fr
+  start_times: "06:00"
+        """
+    )
+    parser.add_argument(
+        "--config", "-c",
+        required=True,
+        help="Path to the JSON pipeline configuration file (required)"
+    )
+    parser.add_argument(
+        "--params", "-p",
+        default=None,
+        help="Path to parameterfile.txt for environment-specific overrides (optional)"
+    )
+    parser.add_argument(
+        "--env-file", "-e",
+        default=None,
+        help="Path to .env file containing database credentials (optional, defaults to project_root/.env)"
+    )
+    parser.add_argument(
+        "--log-dir", "-l",
+        default=None,
+        help="Directory to write execution log files (optional, defaults to stdout only)"
+    )
+    return parser.parse_args()
 
-The `parameterfile.txt` injects environment-specific values into the JSON config at runtime:
 
-```
-# Lines starting with # are ignored
-AUDIT_PATH=/opt/etl/logs/audit
-REJECT_PATH=/opt/etl/logs/reject
-SPARK_JARS=/opt/etl/jars/ojdbc8.jar,/opt/etl/jars/postgresql-42.7.3.jar
-```
+def validate_inputs(args):
+    """
+    Validate that input files exist and the JSON config is structurally valid.
+    Returns (config_dict, errors_list).
+    """
+    errors = []
 
-These override the corresponding values in the JSON config, allowing the **same JSON config** to run in different environments (dev, staging, prod) just by swapping the parameter file.
+    # Check config file exists
+    if not os.path.isfile(args.config):
+        errors.append(f"Config file not found: {args.config}")
+        return None, errors
 
-## JSON Configuration Structure
+    # Check params file exists (if provided)
+    if args.params and not os.path.isfile(args.params):
+        errors.append(f"Parameter file not found: {args.params}")
 
-```json
-{
-  "pipeline": {
-    "pipeline_id": "MY_PIPELINE",
-    "pipeline_type": "FILE_TO_FILE",   // FILE_TO_FILE | FILE_TO_DB | DB_TO_FILE | DB_TO_DB
-    "execution_mode": "BATCH",
-    "log_level": "INFO"
-  },
-  "source": {
-    "type": "FILE",                    // FILE or DB
-    "format": "csv",
-    "path": "/data/input/file.csv",
-    "options": { "header": true, "delimiter": "," }
-  },
-  "target": {
-    "type": "FILE",
-    "format": "csv",
-    "path": "/data/output/result.csv",
-    "mode": "overwrite",
-    "options": { "header": true }
-  },
-  "transformations": [...],
-  "field_mappings": [...],
-  "audit": { "enable": true, "path": "/logs/audit" },
-  "reject": { "enable": true, "path": "/logs/reject" }
-}
-```
+    # Check env file exists (if provided)
+    if args.env_file and not os.path.isfile(args.env_file):
+        errors.append(f"Env file not found: {args.env_file}")
 
-## Deployment Steps
+    # Try to parse and validate JSON
+    try:
+        with open(args.config, "r") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        errors.append(f"Invalid JSON in config file: {e}")
+        return None, errors
+    except Exception as e:
+        errors.append(f"Failed to read config file: {e}")
+        return None, errors
 
-1. **Copy files** to the production server:
-   ```bash
-   rsync -av standalone/ backend/ .env etl-server:/opt/etl/
-   ```
+    # Structural validation via etl_engine
+    from etl_engine import PySparkETLEngine
+    struct_errors = PySparkETLEngine.validate_config(config)
+    errors.extend(struct_errors)
 
-2. **Install Python dependencies** (Python 3.8+ required):
-   ```bash
-   pip install -r /opt/etl/standalone/requirements.txt
-   ```
+    return config, errors
 
-3. **Make the shell script executable**:
-   ```bash
-   chmod +x /opt/etl/standalone/run_pipeline.sh
-   ```
 
-4. **Test manually** before scheduling:
-   ```bash
-   /opt/etl/standalone/run_pipeline.sh \
-       --config /opt/etl/configs/my_pipeline.json \
-       --params /opt/etl/parameterfile.txt
-   echo "Exit code: $?"
-   ```
+def main():
+    """Main entry point."""
+    args = parse_args()
 
-5. **Submit Autosys JIL** once manual test passes:
-   ```bash
-   jil < /opt/etl/autosys/my_pipeline.jil
-   ```
+    # --- Pre-flight Validation ---
+    config, errors = validate_inputs(args)
+    if errors:
+        # Print errors to stderr so Autosys captures them
+        for err in errors:
+            print(f"[VALIDATION ERROR] {err}", file=sys.stderr)
+        sys.exit(EXIT_BAD_ARGS)
 
-## Troubleshooting
+    # Extract pipeline ID for logging
+    pipeline_id = config.get("pipeline", {}).get("pipeline_id", "unknown")
 
-| Issue | Solution |
-|-------|----------|
-| `ModuleNotFoundError: No module named 'etl_engine'` | Ensure `PYTHONPATH` includes the `backend/` directory. The shell wrapper handles this automatically. |
-| Exit code `2` with validation errors | Check that your JSON has `pipeline`, `source`, and `target` blocks |
-| `ClassNotFoundException: oracle.jdbc.OracleDriver` | Ensure JDBC JARs are in `parameterfile.txt` under `SPARK_JARS` |
-| Audit files not generated | Verify `audit.enable: true` in JSON and `AUDIT_PATH` in parameterfile.txt |
+    # --- Setup Logging ---
+    setup_logging(log_dir=args.log_dir, pipeline_id=pipeline_id)
+
+    logger = logging.getLogger(__name__)
+    logger.info("=" * 70)
+    logger.info(f"  STANDALONE PIPELINE EXECUTION")
+    logger.info(f"  Pipeline ID : {pipeline_id}")
+    logger.info(f"  Config File : {args.config}")
+    logger.info(f"  Params File : {args.params or '(none)'}")
+    logger.info(f"  Env File    : {args.env_file or '(auto-detect)'}")
+    logger.info(f"  Log Dir     : {args.log_dir or '(stdout only)'}")
+    logger.info(f"  Timestamp   : {datetime.now().isoformat()}")
+    logger.info("=" * 70)
+
+    # --- Execute Pipeline ---
+    try:
+        from etl_engine import PySparkETLEngine
+
+        engine = PySparkETLEngine(
+            config_path=args.config,
+            param_path=args.params,
+            env_path=args.env_file
+        )
+        engine.run_pipeline()
+
+        logger.info("=" * 70)
+        logger.info("  PIPELINE COMPLETED SUCCESSFULLY")
+        logger.info("=" * 70)
+        sys.exit(EXIT_SUCCESS)
+
+    except Exception as e:
+        logger.error("=" * 70)
+        logger.error(f"  PIPELINE FAILED: {str(e)}")
+        logger.error("=" * 70)
+        # Log full traceback for debugging
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(EXIT_PIPELINE_FAILURE)
+
+
+if __name__ == "__main__":
+    main()
