@@ -4,17 +4,13 @@ def call_api(url, payload, soap_action):
         "SOAPAction": soap_action
     }
 
-    try:
-        response = requests.post(url, data=payload, headers=headers, timeout=30)
+    response = requests.post(url, data=payload, headers=headers, timeout=30, verify=get_ssl_config())
 
-        # 🔥 Capture SOAP Fault
-        if "Fault" in response.text:
-            print("\n🚨 SOAP FAULT DETECTED")
-            print(response.text)
-            return None
+    fault = extract_soap_fault(response.text)
 
-        return response.text
-
-    except Exception as e:
-        print(f"API Error: {str(e)}")
+    if fault:
+        print("\n🚨 SOAP FAULT:")
+        print(fault)
         return None
+
+    return response.text
