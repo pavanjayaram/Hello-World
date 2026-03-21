@@ -1,11 +1,19 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from src.retry import retry
+from src.logger import logger
 
-def run_parallel(test_cases, execute_func):
-    results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(execute_func, tc) for tc in test_cases]
+def _call(url, payload, soap_action):
+    headers = {
+        "Content-Type": "text/xml",
+        "SOAPAction": soap_action
+    }
+    response = requests.post(url, data=payload, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.text
 
-        for future in as_completed(futures):
-            results.append(future.result())
-
-    return results
+def call_api(url, payload, soap_action):
+    try:
+        return retry(lambda: _call(url, payload, soap_action))
+    except Exception as e:
+        logger.error(f"API call failed: {url} | {str(e)}")
+        return None
