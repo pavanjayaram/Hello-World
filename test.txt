@@ -1,700 +1,186 @@
-import React, { useState, useEffect } from 'react';
-import { TransformationConfig } from '../types';
-import './ExecutePipeline.css';
-
-interface ExecutePipelineProps {
-  config: TransformationConfig;
+.file-browser-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
 }
 
-interface PipelineExecution {
-  id: string;
-  status: 'pending' | 'running' | 'success' | 'failed';
-  startTime?: string;
-  endTime?: string;
-  duration?: number;
-  sourceRowCount?: number;
-  targetRowCount?: number;
-  rejectRowCount?: number;
-  error?: string;
-  logs?: string[];
+.file-browser-modal {
+    background-color: white;
+    width: 800px;
+    max-width: 90vw;
+    height: 600px;
+    max-height: 90vh;
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 }
 
-const ExecutePipeline: React.FC<ExecutePipelineProps> = ({ config }) => {
-  const [pipelineJson, setPipelineJson] = useState<any>(null);
-  const [execution, setExecution] = useState<PipelineExecution | null>(null);
-  const [savedConfigs, setSavedConfigs] = useState<any[]>([]);
-  const [selectedConfig, setSelectedConfig] = useState<string>('');
-  const [pipelineName, setPipelineName] = useState<string>('');
+.file-browser-header {
+    padding: 15px 20px;
+    border-bottom: 1px solid #eee;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
 
-  // Get API URL from environment variable
-  const API_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:9001';
+.file-browser-header h3 {
+    margin: 0;
+    font-size: 1.2rem;
+}
 
-  useEffect(() => {
-    loadSavedConfigs();
-  }, []);
+.close-btn {
+    background: none;
+    border: none;
+    font-size: 1.5rem;
+    cursor: pointer;
+    color: #666;
+}
 
-  const loadSavedConfigs = async () => {
-    try {
-      const response = await fetch(`${API_URL}/api/list-configs`);
-      const data = await response.json();
-      if (data.success) {
-        setSavedConfigs(data.configs);
-      }
-    } catch (error) {
-      console.error('Error loading configs:', error);
-    }
-  };
+.file-browser-path {
+    padding: 10px 20px;
+    background-color: #f8f9fa;
+    border-bottom: 1px solid #eee;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
 
-  const generatePipelineJson = () => {
-    const isSourceDb = config.dataSource.mode === 'db-to-file' || config.dataSource.mode === 'db-to-db';
-    const isTargetDb = config.dataSource.mode === 'file-to-db' || config.dataSource.mode === 'db-to-db';
+.nav-btn {
+    padding: 5px 10px;
+    border: 1px solid #ddd;
+    background-color: white;
+    border-radius: 4px;
+    cursor: pointer;
+}
 
-    // Build field mappings (column selection and renaming)
-    const fieldMappings: any[] = [];
+.nav-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
 
-    console.log('=== Generating Field Mappings ===');
-    console.log('Field Transforms:', config.fieldTransforms);
+.path-input {
+    flex: 1;
+    padding: 5px 10px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background-color: #fff;
+    color: #555;
+    font-family: monospace;
+}
 
-    config.fieldTransforms.forEach((ft, index) => {
-      console.log(`Field ${index}:`, {
-        fieldName: ft.fieldName,
-        targetField: ft.targetField,
-        hasTransformations: ft.transformations.length
-      });
+.file-browser-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0;
+}
 
-      fieldMappings.push({
-        source_column: ft.fieldName,
-        target_column: ft.targetField || ft.fieldName,
-        order: index  // Maintain order
-      });
-    });
+.file-list {
+    display: flex;
+    flex-direction: column;
+}
 
-    console.log('Generated Field Mappings:', fieldMappings);
+.file-entry {
+    display: grid;
+    grid-template-columns: 40px 1fr 100px 120px;
+    padding: 8px 20px;
+    cursor: pointer;
+    border-bottom: 1px solid #f0f0f0;
+    align-items: center;
+    transition: background-color 0.1s;
+}
 
-    // Map transformations to backend format
-    const transformations: any[] = [];
+.file-entry:hover {
+    background-color: #f5f5f5;
+}
 
-    // Add field transformations
-    config.fieldTransforms.forEach(ft => {
-      ft.transformations.forEach(t => {
-        if (t.type === 'upper') {
-          transformations.push({
-            type: 'column',
-            action: 'upper',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'lower') {
-          transformations.push({
-            type: 'column',
-            action: 'lower',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'trim') {
-          transformations.push({
-            type: 'column',
-            action: 'trim',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'cast') {
-          transformations.push({
-            type: 'column',
-            action: 'cast',
-            column: ft.fieldName,
-            target_type: t.params?.targetType || 'string'
-          });
-        } else if (t.type === 'literal') {
-          transformations.push({
-            type: 'column',
-            action: 'literal',
-            column: ft.fieldName,
-            value: t.params?.value || '',
-            data_type: t.params?.data_type || 'string'
-          });
-        } else if (t.type === 'sequence') {
-          transformations.push({
-            type: 'column',
-            action: 'sequence',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'current_date') {
-          transformations.push({
-            type: 'column',
-            action: 'current_date',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'if_then_else') {
-          transformations.push({
-            type: 'column',
-            action: 'if_then_else',
-            column: ft.fieldName,
-            condition: t.params?.condition || '',
-            trueValue: t.params?.trueValue || '',
-            falseValue: t.params?.falseValue || ''
-          });
-        } else if (t.type === 'data_masking') {
-          transformations.push({
-            type: 'column',
-            action: 'data_masking',
-            column: ft.fieldName, // using column field mapping
-            masking_type: t.params?.masking_type || 'full',
-            key: t.params?.key || '',
-            show_first: t.params?.show_first ?? 2,
-            show_last: t.params?.show_last ?? 2
-          });
-        } else if (t.type === 'data_unmasking') {
-          transformations.push({
-            type: 'column',
-            action: 'data_unmasking',
-            column: ft.fieldName,
-            unmasking_type: t.params?.unmasking_type || 'base64',
-            key: t.params?.key || ''
-          });
-        }
-      });
-    });
+.file-entry.selected {
+    background-color: #e3f2fd;
+    border-color: #90caf9;
+}
 
-    // Add row transformations
-    config.rowTransforms.forEach(rt => {
-      if (rt.type === 'filter') {
-        transformations.push({
-          type: 'row',
-          action: 'filter',
-          condition: rt.params?.condition || 'true'
-        });
-      } else if (rt.type === 'distinct') {
-        // fields may be a pre-split array or a comma-separated string (e.g. "EMP_ID, DEPT_ID")
-        const rawFields = rt.params?.fields;
-        const parsedFields: string[] = Array.isArray(rawFields)
-          ? rawFields
-          : typeof rawFields === 'string'
-            ? rawFields.split(/[;,\s]+/).map((s: string) => s.trim()).filter((s: string) => s)
-            : [];
-        transformations.push({
-          type: 'row',
-          action: 'distinct',
-          columns: parsedFields,
-          duplicate_handling: rt.params?.duplicate_handling || 'drop'
-        });
-      } else if (rt.type === 'sort') {
-        transformations.push({
-          type: 'row',
-          action: 'sort',
-          columns: rt.params?.columns || [],
-          ascending: rt.params?.ascending !== false
-        });
-      } else if (rt.type === 'cdc_compare') {
-        transformations.push({
-          type: 'cdc_compare',
-          target_type: rt.params?.target_type || 'FILE',
-          target_path: rt.params?.target_path || '',
-          db_type: rt.params?.db_type,
-          schema: rt.params?.schema || 'public',
-          connection_string: rt.params?.connection_string,
-          format: rt.params?.format,
-          key_columns: typeof rt.params?.key_columns === 'string'
-            ? rt.params.key_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.key_columns || []),
-          compare_columns: typeof rt.params?.compare_columns === 'string'
-            ? rt.params.compare_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.compare_columns || []),
-          exclude_columns: typeof rt.params?.exclude_columns === 'string'
-            ? rt.params.exclude_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.exclude_columns || []),
-          op_column: rt.params?.op_column || 'op_type',
-          // New mapping support
-          source_key_columns: typeof rt.params?.source_key_columns === 'string'
-            ? rt.params.source_key_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.source_key_columns || []),
-          target_key_columns: typeof rt.params?.target_key_columns === 'string'
-            ? rt.params.target_key_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.target_key_columns || []),
-          source_compare_columns: typeof rt.params?.source_compare_columns === 'string'
-            ? rt.params.source_compare_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.source_compare_columns || []),
-          target_compare_columns: typeof rt.params?.target_compare_columns === 'string'
-            ? rt.params.target_compare_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.target_compare_columns || [])
-        });
-      } else if (rt.type === 'lookup') {
-        const lookupParams: any = {
-          type: 'lookup',
-          lookup_table: rt.params?.lookup_table,
-          operation: rt.params?.operation || 'join',
-          schema: rt.params?.schema,
-          table: rt.params?.table,
-        };
+.file-entry .icon {
+    font-size: 1.2rem;
+}
 
-        if (lookupParams.operation === 'surrogate_key') {
-          lookupParams.source_column = rt.params?.source_column;
-          lookupParams.target_column = rt.params?.target_column;
+.transform-type-btn strong {
+    display: block;
+}
 
-          // Auto-inject Target Config if available and source not valid
-          if (!rt.params?.source_type && !rt.params?.path) {
-            const targetConfig = config.dataSource.target as any;
+.file-entry .name {
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 
-            if (isTargetDb) {
-              let schema = targetConfig.schema;
-              let table = targetConfig.table;
+.file-entry .size,
+.file-entry .date {
+    color: #666;
+    font-size: 0.9rem;
+    text-align: right;
+}
 
-              // Handle case where user entered "schema.table" in the Table field
-              if (table && table.includes('.')) {
-                const parts = table.split('.');
-                if (parts.length === 2) {
-                  schema = parts[0];
-                  table = parts[1];
-                }
-              }
+.loading,
+.error {
+    padding: 40px;
+    text-align: center;
+    color: #666;
+}
 
-              lookupParams.source_type = targetConfig.db_type;
-              lookupParams.table = table;
-              lookupParams.schema = schema;
-              lookupParams.connection_string = targetConfig.connectionString;
-              lookupParams.db_type = targetConfig.db_type;
-              lookupParams.path = table; // Fallback matches table name
-            } else {
-              // File Target
-              lookupParams.source_type = targetConfig.type;
-              lookupParams.path = targetConfig.path;
-              lookupParams.file_format = targetConfig.type;
-            }
-          }
-        } else {
-          lookupParams.join_keys = rt.params?.join_keys;
-          lookupParams.join_type = rt.params?.join_type;
-          lookupParams.broadcast = rt.params?.broadcast;
-          lookupParams.column_mapping = rt.params?.column_mapping;
-          lookupParams.aggregation = rt.params?.aggregation;
-          // Include lookup_filter only if user provided a value
-          if (rt.params?.lookup_filter) {
-            lookupParams.lookup_filter = rt.params.lookup_filter;
-          }
-        }
+.error {
+    color: #d32f2f;
+}
 
-        // Common optional params
-        if (rt.params?.source_type && rt.params?.path) {
-          lookupParams.source_type = rt.params.source_type;
-          lookupParams.path = rt.params.path;
-          lookupParams.file_format = rt.params.file_format;
-          lookupParams.options = rt.params.options || {};
+.file-browser-footer {
+    padding: 15px 20px;
+    border-top: 1px solid #eee;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background-color: #f8f9fa;
+}
 
-          // Inject DB params if missing (assume same DB as target if not specified)
-          if (rt.params.source_type === 'DB') {
-            lookupParams.db_type = rt.params.db_type || (isTargetDb ? (config.dataSource.target as any).type : undefined);
-            lookupParams.connection_string = rt.params.connection_string || (isTargetDb ? (config.dataSource.target as any).connectionString : undefined);
-            // Also inject table if path is provided but table is missing
-            if (!lookupParams.table && lookupParams.path && !lookupParams.path.includes('/')) {
-              if (lookupParams.path.includes('.')) {
-                const parts = lookupParams.path.split('.');
-                if (parts.length === 2) {
-                  lookupParams.schema = parts[0];
-                  lookupParams.table = parts[1];
-                } else {
-                  lookupParams.table = lookupParams.path;
-                }
-              } else {
-                lookupParams.table = lookupParams.path;
-              }
-            }
-          }
-        }
+.selected-info {
+    color: #666;
+    font-style: italic;
+    max-width: 50%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 
-        transformations.push(lookupParams);
-      }
-    });
+.actions {
+    display: flex;
+    gap: 10px;
+}
 
-    // Debug: Log target configuration before building JSON
-    console.log('=== Target Configuration Debug ===');
-    console.log('Target Config:', config.dataSource.target);
-    console.log('Batchsize:', (config.dataSource.target as any).batchsize);
-    console.log('IsolationLevel:', (config.dataSource.target as any).isolationLevel);
+.btn {
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: none;
+    font-weight: 500;
+}
 
-    // Sanitize Source and Target Table Names (Handle schema.table input)
-    const sourceConfig = config.dataSource.source as any;
-    let sourceSchema = sourceConfig.schema || 'public';
-    let sourceTable = sourceConfig.table || '';
-    if (sourceTable && sourceTable.includes('.')) {
-      const parts = sourceTable.split('.');
-      if (parts.length === 2) {
-        sourceSchema = parts[0];
-        sourceTable = parts[1];
-      }
-    }
+.btn-primary {
+    background-color: #007bff;
+    color: white;
+}
 
-    const targetConfig = config.dataSource.target as any;
-    let targetSchema = targetConfig.schema || 'public';
-    let targetTable = targetConfig.table || '';
-    if (targetTable && targetTable.includes('.')) {
-      const parts = targetTable.split('.');
-      if (parts.length === 2) {
-        targetSchema = parts[0];
-        targetTable = parts[1];
-      }
-    }
+.btn-primary:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+}
 
-    const pipelineConfig = {
-      pipeline: {
-        pipeline_id: pipelineName || `PIPELINE_${Date.now()}`,
-        pipeline_type: config.dataSource.mode.toUpperCase().replace(/-/g, '_'),
-        execution_mode: 'BATCH',
-        run_date: new Date().toISOString().split('T')[0],
-        version: '1.0',
-        log_level: 'INFO'
-      },
-      field_mappings: fieldMappings,  // NEW: Column selection and ordering
-      source: isSourceDb ? {
-        type: 'DB',
-        db_type: config.dataSource.source.type,
-        table: sourceTable,
-        connectionString: (config.dataSource.source as any).connectionString || '',
-        schema: sourceSchema,
-        partitionColumn: (config.dataSource.source as any).partitionColumn,
-        lowerBound: (config.dataSource.source as any).lowerBound,
-        upperBound: (config.dataSource.source as any).upperBound,
-        numPartitions: (config.dataSource.source as any).numPartitions,
-        fetchsize: (config.dataSource.source as any).fetchsize
-      } : {
-        type: 'FILE',
-        format: config.dataSource.source.type || 'csv',
-        path: (config.dataSource.source as any).path || '',
-        options: {
-          header: true,
-          delimiter: (config.dataSource.source as any).delimiter || ','
-        }
-      },
-      transformations: transformations,
-      target: isTargetDb ? {
-        type: 'DB',
-        db_type: config.dataSource.target.type,
-        table: targetTable,
-        connectionString: (config.dataSource.target as any).connectionString || '',
-        schema: targetSchema,
-        mode: 'append',
-        batchsize: (config.dataSource.target as any).batchsize,
-        isolationLevel: (config.dataSource.target as any).isolationLevel,
-        primary_key: (config.dataSource.target as any).primaryKey
-      } : {
-        type: 'FILE',
-        format: config.dataSource.target.type || 'parquet',
-        path: (config.dataSource.target as any).path || '',
-        mode: 'overwrite',
-        options: ['csv', 'txt', 'dat'].includes(config.dataSource.target.type) ? {
-          header: true,
-          delimiter: (config.dataSource.target as any).delimiter || ','
-        } : {
-          compression: 'snappy'
-        }
-      },
-      audit: {
-        enable: true,
-        capture_row_count: true,
-        capture_duration: true,
-        path: (config.dataSource.target as any).path
-          ? `${(config.dataSource.target as any).path.substring(0, (config.dataSource.target as any).path.lastIndexOf('/'))}/audit`
-          : './audit'
-      },
-      reject: {
-        enable: true,
-        path: (config.dataSource.target as any).path
-          ? `${(config.dataSource.target as any).path.substring(0, (config.dataSource.target as any).path.lastIndexOf('/'))}/reject`
-          : './reject',
-        include_reason: true
-      },
-      error_handling: {
-        mode: config.dataSource.errorHandling?.mode || 'reject_and_continue'
-      }
-    };
-
-    setPipelineJson(pipelineConfig);
-    return pipelineConfig;
-  };
-
-  const saveConfiguration = async () => {
-    if (!pipelineName) {
-      alert('Please enter a pipeline name');
-      return;
-    }
-
-    const jsonConfig = pipelineJson || generatePipelineJson();
-
-    try {
-      const response = await fetch(`${API_URL}/api/save-config`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          config: jsonConfig,
-          filename: `${pipelineName}.json`
-        })
-      });
-
-      const data = await response.json();
-      if (data.success) {
-        alert('Configuration saved successfully!');
-        loadSavedConfigs();
-      } else {
-        alert('Failed to save configuration: ' + data.error);
-      }
-    } catch (error) {
-      console.error('Error saving config:', error);
-      alert('Error saving configuration');
-    }
-  };
-
-  const executePipeline = async () => {
-    const jsonConfig = pipelineJson || generatePipelineJson();
-
-    setExecution({
-      id: jsonConfig.pipeline.pipeline_id,
-      status: 'running',
-      startTime: new Date().toISOString(),
-      logs: ['Pipeline execution started...', 'Validating configuration...']
-    });
-
-    try {
-      // First, validate the configuration
-      const validateResponse = await fetch(`${API_URL}/api/validate-config`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(jsonConfig)
-      });
-
-      const validateData = await validateResponse.json();
-
-      if (!validateData.valid) {
-        throw new Error('Configuration validation failed: ' + JSON.stringify(validateData.errors));
-      }
-
-      setExecution(prev => ({
-        ...prev!,
-        logs: [...(prev?.logs || []), '✓ Configuration validated', 'Executing pipeline...']
-      }));
-
-      // Execute the pipeline
-      // Note: This would call your backend ETL engine
-      // For now, we'll simulate the execution
-      const executeResponse = await fetch(`${API_URL}/api/execute-pipeline`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(jsonConfig)
-      });
-
-      const executeData = await executeResponse.json();
-
-      if (executeData.success) {
-        const m = executeData.metrics || {};
-        const isCdc = m.cdc_insert_row_count !== undefined;
-        setExecution(prev => ({
-          ...prev!,
-          status: 'success',
-          endTime: new Date().toISOString(),
-          duration: executeData.duration || 0,
-          sourceRowCount: m.source_row_count || 0,
-          targetRowCount: m.target_row_count || 0,
-          rejectRowCount: m.reject_row_count || 0,
-          cdcInsertCount: isCdc ? (m.cdc_insert_row_count || 0) : undefined,
-          cdcUpdateCount: isCdc ? (m.cdc_update_row_count || 0) : undefined,
-          cdcDeleteCount: isCdc ? (m.cdc_delete_row_count || 0) : undefined,
-          logs: [
-            ...(prev?.logs || []),
-            '✓ Pipeline executed successfully',
-            `Source rows: ${m.source_row_count || 0}`,
-            isCdc
-              ? `CDC — Inserts: ${m.cdc_insert_row_count || 0}, Updates: ${m.cdc_update_row_count || 0}, Deletes: ${m.cdc_delete_row_count || 0}`
-              : `Target rows: ${m.target_row_count || 0}`,
-            `Rejected rows: ${m.reject_row_count || 0}`,
-            `Duration: ${executeData.duration || 0}s`
-          ]
-        }));
-      } else {
-        throw new Error(executeData.error || 'Pipeline execution failed');
-      }
-    } catch (error: any) {
-      console.error('Error executing pipeline:', error);
-      setExecution(prev => ({
-        ...prev!,
-        status: 'failed',
-        endTime: new Date().toISOString(),
-        error: error.message,
-        logs: [...(prev?.logs || []), `✗ Error: ${error.message}`]
-      }));
-    }
-  };
-
-  const loadConfiguration = async (filename: string) => {
-    try {
-      const response = await fetch(`${API_URL}/api/get-config/${filename}`);
-      const data = await response.json();
-
-      if (data.success) {
-        setPipelineJson(data.config);
-        setPipelineName(filename.replace('.json', ''));
-      }
-    } catch (error) {
-      console.error('Error loading config:', error);
-      alert('Error loading configuration');
-    }
-  };
-
-  return (
-    <div className="execute-pipeline">
-      <div className="section">
-        <h3>Pipeline Configuration</h3>
-
-        <div className="config-actions">
-          <div className="input-group">
-            <label>Pipeline Name:</label>
-            <input
-              type="text"
-              value={pipelineName}
-              onChange={(e) => setPipelineName(e.target.value)}
-              placeholder="Enter pipeline name"
-              className="form-control"
-            />
-          </div>
-
-          <div className="button-group">
-            <button
-              className="btn btn-primary"
-              onClick={() => generatePipelineJson()}
-            >
-              Generate JSON Config
-            </button>
-            <button
-              className="btn btn-success"
-              onClick={saveConfiguration}
-              disabled={!pipelineName}
-            >
-              Save Configuration
-            </button>
-          </div>
-        </div>
-
-        {savedConfigs.length > 0 && (
-          <div className="saved-configs">
-            <h4>Saved Configurations</h4>
-            <select
-              className="form-control"
-              value={selectedConfig}
-              onChange={(e) => {
-                setSelectedConfig(e.target.value);
-                if (e.target.value) {
-                  loadConfiguration(e.target.value);
-                }
-              }}
-            >
-              <option value="">Select a saved configuration...</option>
-              {savedConfigs.map((cfg) => (
-                <option key={cfg.filename} value={cfg.filename}>
-                  {cfg.pipeline_id} ({cfg.pipeline_type})
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-      </div>
-
-      {pipelineJson && (
-        <div className="section">
-          <h3>Generated Configuration</h3>
-          <div className="json-display">
-            <pre>{JSON.stringify(pipelineJson, null, 2)}</pre>
-          </div>
-        </div>
-      )}
-
-      {pipelineJson && (
-        <div className="section">
-          <h3>Execute Pipeline</h3>
-          <button
-            className="btn btn-primary btn-large"
-            onClick={executePipeline}
-            disabled={execution?.status === 'running'}
-          >
-            {execution?.status === 'running' ? '⏳ Executing...' : '▶️ Execute Pipeline'}
-          </button>
-        </div>
-      )}
-
-      {execution && (
-        <div className="section">
-          <h3>Execution Status</h3>
-          <div className={`execution-status status-${execution.status}`}>
-            <div className="status-header">
-              <span className="status-badge">{execution.status.toUpperCase()}</span>
-              <span className="pipeline-id">{execution.id}</span>
-            </div>
-
-            {execution.status === 'success' && (
-              <div className="metrics">
-                <div className="metric">
-                  <span className="metric-label">Source Rows:</span>
-                  <span className="metric-value">{execution.sourceRowCount}</span>
-                </div>
-
-                {(execution as any).cdcInsertCount !== undefined ? (
-                  // CDC pipeline — show Insert / Update / Delete breakdown
-                  <>
-                    <div className="metric" style={{ borderLeft: '3px solid #28a745' }}>
-                      <span className="metric-label">Target Insert Rows:</span>
-                      <span className="metric-value" style={{ color: '#28a745', fontWeight: 700 }}>
-                        {(execution as any).cdcInsertCount}
-                      </span>
-                    </div>
-                    <div className="metric" style={{ borderLeft: '3px solid #fd7e14' }}>
-                      <span className="metric-label">Target Update Rows:</span>
-                      <span className="metric-value" style={{ color: '#fd7e14', fontWeight: 700 }}>
-                        {(execution as any).cdcUpdateCount}
-                      </span>
-                    </div>
-                    <div className="metric" style={{ borderLeft: '3px solid #dc3545' }}>
-                      <span className="metric-label">Target Delete Rows:</span>
-                      <span className="metric-value" style={{ color: '#dc3545', fontWeight: 700 }}>
-                        {(execution as any).cdcDeleteCount}
-                      </span>
-                    </div>
-                  </>
-                ) : (
-                  <div className="metric">
-                    <span className="metric-label">Target Rows:</span>
-                    <span className="metric-value">{execution.targetRowCount}</span>
-                  </div>
-                )}
-
-                <div className="metric">
-                  <span className="metric-label">Rejected Rows:</span>
-                  <span className="metric-value">{execution.rejectRowCount}</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">Duration:</span>
-                  <span className="metric-value">{execution.duration}s</span>
-                </div>
-              </div>
-            )}
-
-            {execution.error && (
-              <div className="error-message">
-                <strong>Error:</strong> {execution.error}
-              </div>
-            )}
-
-            <div className="logs">
-              <h4>Execution Logs</h4>
-              <div className="log-content">
-                {execution.logs?.map((log, index) => (
-                  <div key={index} className="log-line">{log}</div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-export default ExecutePipeline;
+.btn-secondary {
+    background-color: #6c757d;
+    color: white;
+}
