@@ -1,20 +1,30 @@
-import os
+def execute_test(test, config):
+    test_name = test["test_name"]
 
-def load_test_cases(base_path):
-    test_cases = []
+    dev_payload = read_xml_file(test["source_request_file"])
+    uat_payload = read_xml_file(test["target_request_file"])
 
-    for folder in os.listdir(base_path):
-        folder_path = os.path.join(base_path, folder)
+    dev_res = call_api(config["dev_url"], dev_payload, config["soap_action"])
+    uat_res = call_api(config["uat_url"], uat_payload, config["soap_action"])
 
-        if os.path.isdir(folder_path):
-            source_file = os.path.join(folder_path, "source.xml")
-            target_file = os.path.join(folder_path, "target.xml")
+    dev_dict = xml_to_dict(dev_res)
+    uat_dict = xml_to_dict(uat_res)
 
-            if os.path.exists(source_file) and os.path.exists(target_file):
-                test_cases.append({
-                    "test_name": folder,
-                    "source_request_file": source_file,
-                    "target_request_file": target_file
-                })
+    result = deep_compare(
+        dev_dict,
+        uat_dict,
+        ignore_fields=config["ignore_fields"],
+        strict=True
+    )
 
-    return test_cases
+    mismatches = result["mismatch"]
+    matches = result["match"]
+
+    total = len(matches) + len(mismatches)
+    score = (len(matches) / total) * 100 if total else 0
+
+    status = "Passed" if not mismatches else "Failed"
+
+    csv_file, html_file = generate_reports(test_name, mismatches, matches, score)
+
+    print(f"{test_name} → {status} ({score:.2f}%)")
