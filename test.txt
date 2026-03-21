@@ -1,22 +1,78 @@
 from lxml import etree
 
+
 def remove_namespace(tree):
-    for elem in tree.getiterator():
-        if '}' in elem.tag:
+    """
+    Remove XML namespaces for easier parsing
+    """
+    for elem in tree.iter():
+        if isinstance(elem.tag, str) and '}' in elem.tag:
             elem.tag = elem.tag.split('}', 1)[1]
     return tree
 
+
+def normalize_text(text):
+    """
+    Clean and normalize text values
+    """
+    if text is None:
+        return None
+    text = text.strip()
+    return text if text else None
+
+
+def parse_element(element):
+    """
+    Recursively convert XML element into dictionary
+    Handles:
+    - Nested elements
+    - Repeated tags (lists)
+    - Attributes
+    """
+
+    parsed_data = {}
+
+    # Include attributes if present
+    if element.attrib:
+        for attr_key, attr_val in element.attrib.items():
+            parsed_data[f"@{attr_key}"] = normalize_text(attr_val)
+
+    children = list(element)
+
+    # If no children → return text directly
+    if not children:
+        return normalize_text(element.text)
+
+    # Process children
+    child_dict = {}
+
+    for child in children:
+        child_key = child.tag
+        child_value = parse_element(child)
+
+        # Handle repeated tags → convert to list
+        if child_key in child_dict:
+            if not isinstance(child_dict[child_key], list):
+                child_dict[child_key] = [child_dict[child_key]]
+            child_dict[child_key].append(child_value)
+        else:
+            child_dict[child_key] = child_value
+
+    # Merge attributes + children
+    parsed_data.update(child_dict)
+
+    return parsed_data
+
+
 def xml_to_dict(xml_string):
-    root = etree.fromstring(xml_string.encode())
-    root = remove_namespace(root)
+    """
+    Convert full XML string into nested dictionary
+    """
+    try:
+        root = etree.fromstring(xml_string.encode())
+        root = remove_namespace(root)
 
-    def recurse(node):
-        result = {}
-        for child in node:
-            if len(child):
-                result[child.tag] = recurse(child)
-            else:
-                result[child.tag] = child.text
-        return result
+        return {root.tag: parse_element(root)}
 
-    return {root.tag: recurse(root)}
+    except Exception as e:
+        raise ValueError(f"Invalid XML input: {str(e)}")
