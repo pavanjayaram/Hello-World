@@ -1,108 +1,89 @@
+import os
 from pyspark.sql import SparkSession
-from datetime import datetime
-import logging
-from typing import Dict
+from transformations import apply_all_transformations, apply_field_mappings
+from audit_logger import AuditMetrics
+from reject_handler import RejectHandler
+from targets import TargetFactory
+from sources import SourceFactory
 
-class AuditMetrics:
-    """Captures and tracks audit metrics for a PySpark ETL run."""
-    
-    def __init__(self, config: Dict):
-        self.config = config.get("audit", {})
-        self.enabled = self.config.get("enable", False)
-        self.capture_row_count = self.config.get("capture_row_count", True)
-        self.capture_duration = self.config.get("capture_duration", True)
-        self.audit_path = self.config.get("path")
+class DBToDBETL:
+    def __init__(self, config_path, config=None):
+        self.config_path = config_path
+        self.config = config if config else self._load_config()
+        self.spark = self._create_spark_session()
+        self.audit = AuditMetrics(self.config)
+        self.reject = RejectHandler(self.config)
         
-        self.metrics = {
-            'pipeline_id': None,
-            'start_time': None,
-            'end_time': None,
-            'duration_seconds': None,
-            'source_row_count': 0,
-            'target_row_count': 0,
-            'status': 'INITIALIZED'
+    def _load_config(self):
+        import json
+        with open(self.config_path, 'r') as f:
+            return json.load(f)
+            
+    def _create_spark_session(self):
+        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL_DB2DB")
+        builder = SparkSession.builder.appName(app_name)
+        
+        jars = self.config.get("pipeline", {}).get("jars", [])
+        if jars:
+            builder = builder.config("spark.jars", ",".join(jars))
+            builder = builder.config("spark.driver.extraClassPath", os.pathsep.join(jars))
+            
+        spark = builder.getOrCreate()
+        log_level = self.config.get("pipeline", {}).get("log_level", "WARN")
+        spark.sparkContext.setLogLevel(log_level)
+        return spark
+
+    def extract(self):
+        source_config = self.config.get("source", {})
+        source_type = source_config.get("type", "DB")
+        
+        print(f"Extracting data using SourceFactory for type: {source_type}")
+        handler = SourceFactory.get_handler(source_type)
+        df = handler.read(self.spark, source_config)
+        
+        row_count = df.count()
+        print(f"Extracted {row_count} rows.")
+        self.audit.record_source_count(row_count)
+        return df
+
+    def transform(self, df):
+        print("Starting Transformations via Central Engine (CDC/Lookup enabled)...")
+        context = {
+            "reject_handler": self.reject
         }
+        df = apply_all_transformations(self, df, self.config, context)
+        df = apply_field_mappings(df, self.config)
+        return df
+
+    def load(self, df):
+        target_config = self.config.get("target", {})
+        target_type = target_config.get("type", "DB")
         
-    def start_pipeline(self, pipeline_id: str):
-        """Marks the beginning of the pipeline run."""
-        if not self.enabled:
-            return
-            
-        self.metrics['pipeline_id'] = pipeline_id
-        if self.capture_duration:
-            self.metrics['start_time'] = datetime.now()
-        self.metrics['status'] = 'RUNNING'
-        logging.info(f"Audit: Started pipeline {pipeline_id} at {self.metrics['start_time']}")
-
-    def record_source_count(self, count: int):
-        """Records the number of rows read from the source."""
-        if self.enabled and self.capture_row_count:
-            self.metrics['source_row_count'] = count
-            logging.info(f"Audit: Recorded Source Count: {count}")
-
-    def record_target_count(self, count: int):
-        """Records the number of rows written to the target."""
-        if self.enabled and self.capture_row_count:
-            self.metrics['target_row_count'] = count
-            logging.info(f"Audit: Recorded Target Count: {count}")
-
-    def end_pipeline(self, spark: SparkSession, status: str = 'SUCCESS', error_msg: str = None):
-        """
-        Marks the end of the pipeline run, calculates duration, 
-        and writes the audit record to the configured path.
-        """
-        if not self.enabled:
-            return
-
-        self.metrics['status'] = status
+        row_count = df.count()
+        self.audit.record_target_count(row_count)
         
-        if self.capture_duration and self.metrics['start_time']:
-            self.metrics['end_time'] = datetime.now()
-            duration = self.metrics['end_time'] - self.metrics['start_time']
-            self.metrics['duration_seconds'] = duration.total_seconds()
-            
-        if error_msg:
-            self.metrics['error_message'] = str(error_msg)
+        print(f"Loading data using TargetFactory for type: {target_type}")
+        handler = TargetFactory.get_handler(target_type)
+        handler.write(df, self.config)
+        print("Data load complete!")
 
-        logging.info(f"Audit: Pipeline Completed with Status: {status}. Total Time: {self.metrics.get('duration_seconds')}s")
-
-        # Write audit log to destination
-        self._write_audit_log(spark)
-
-    def _write_audit_log(self, spark: SparkSession):
-        """Internal method to write the metrics as a JSON file using native Python I/O.
+    def run(self):
+        pipeline_id = self.config.get('pipeline', {}).get('pipeline_id', 'Unknown_Pipeline')
+        print(f"=== Starting DB_TO_DB Pipeline: {pipeline_id} ===")
         
-        Previously used PySpark DataFrame writer (audit_df.write.json) which suffered
-        from a race condition: Spark's lazy/async write produced empty part-*.json files
-        that were moved before content was flushed to disk. Now uses json.dump for
-        reliable, atomic single-file writes.
-        """
-        if not self.audit_path:
-            logging.warning("Audit is enabled, but no 'path' was provided in the JSON configuration. Skipping write.")
-            return
-            
         try:
-            import os
-            import json
+            self.audit.start_pipeline(pipeline_id)
+            source_df = self.extract()
+            transformed_df = self.transform(source_df)
+            self.load(transformed_df)
             
-            # Convert datetime objects to strings for JSON serialization
-            metrics_out = dict(self.metrics)
-            if metrics_out.get('start_time') and hasattr(metrics_out['start_time'], 'strftime'):
-                metrics_out['start_time'] = metrics_out['start_time'].strftime("%Y-%m-%d %H:%M:%S")
-            if metrics_out.get('end_time') and hasattr(metrics_out['end_time'], 'strftime'):
-                metrics_out['end_time'] = metrics_out['end_time'].strftime("%Y-%m-%d %H:%M:%S")
-
-            # Build destination path
-            pipeline_name = self.metrics.get('pipeline_id', 'unknown')
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            os.makedirs(self.audit_path, exist_ok=True)
-            final_audit_file = os.path.join(self.audit_path, f"audit_{pipeline_name}_{timestamp}.json")
-            
-            logging.info(f"Writing single-file Audit Log to: {final_audit_file}")
-            
-            # Write using native Python — reliable and atomic for a single metrics dict
-            with open(final_audit_file, 'w') as f:
-                json.dump(metrics_out, f, indent=2)
-            
+            reject_count = self.reject.get_reject_count()
+            if reject_count > 0:
+                print(f"--- WARNING: {reject_count} invalid rows were sent to Reject path ---")
+                
+            self.audit.end_pipeline(self.spark, status='SUCCESS')
+            print("=== DB_TO_DB Pipeline Finished Successfully ===")
         except Exception as e:
-            logging.error(f"Failed to write Audit Log to {self.audit_path}: {str(e)}")
+            self.audit.end_pipeline(self.spark, status='FAILED', error_msg=str(e))
+            print(f"=== ETL Pipeline FAILED: {str(e)} ===")
+            raise e
