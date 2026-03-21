@@ -1,26 +1,39 @@
-def compare(dev_data, uat_data, fields, ignore_fields):
-    mismatches = []
-    total = 0
-    matched = 0
+import csv
+from datetime import datetime
+import os
 
-    for field in fields:
-        if field in ignore_fields:
-            continue
+def generate_csv_report(test_name, mismatches):
+    filename = f"reports/{test_name}_report.csv"
+    os.makedirs("reports", exist_ok=True)
 
-        dev_val = dev_data.get(field)
-        uat_val = uat_data.get(field)
+    with open(filename, "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Field", "DEV", "UAT"])
 
-        total += 1
+        for m in mismatches:
+            writer.writerow([m["field"], m["dev"], m["uat"]])
 
-        if dev_val == uat_val:
-            matched += 1
-        else:
-            mismatches.append({
-                "field": field,
-                "dev": dev_val,
-                "uat": uat_val
-            })
+    return filename
 
-    match_percent = (matched / total * 100) if total > 0 else 0
 
-    return mismatches, match_percent
+def generate_html_report(test_name, mismatches, match_percent):
+    filename = f"reports/{test_name}_report.html"
+
+    html = f"""
+    <html>
+    <body>
+    <h2>Test: {test_name}</h2>
+    <h3>Match %: {match_percent:.2f}%</h3>
+    <table border="1">
+    <tr><th>Field</th><th>DEV</th><th>UAT</th></tr>
+    """
+
+    for m in mismatches:
+        html += f"<tr><td>{m['field']}</td><td>{m['dev']}</td><td>{m['uat']}</td></tr>"
+
+    html += "</table></body></html>"
+
+    with open(filename, "w") as f:
+        f.write(html)
+
+    return filename
