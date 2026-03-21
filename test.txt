@@ -1,39 +1,49 @@
-import csv
-from datetime import datetime
+import requests
 import os
 
-def generate_csv_report(test_name, mismatches):
-    filename = f"reports/{test_name}_report.csv"
-    os.makedirs("reports", exist_ok=True)
+class OctaneClient:
+    def __init__(self):
+        self.base_url = os.getenv("OCTANE_URL")
+        self.client_id = os.getenv("OCTANE_CLIENT_ID")
+        self.client_secret = os.getenv("OCTANE_CLIENT_SECRET")
+        self.space_id = os.getenv("OCTANE_SPACE_ID")
+        self.workspace_id = os.getenv("OCTANE_WORKSPACE_ID")
+        self.cookies = None
 
-    with open(filename, "w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["Field", "DEV", "UAT"])
+    def authenticate(self):
+        response = requests.post(
+            f"{self.base_url}/authentication/sign_in",
+            auth=(self.client_id, self.client_secret)
+        )
+        self.cookies = response.cookies
 
-        for m in mismatches:
-            writer.writerow([m["field"], m["dev"], m["uat"]])
+    def create_run(self, test_name):
+        url = f"{self.base_url}/api/shared_spaces/{self.space_id}/workspaces/{self.workspace_id}/runs"
 
-    return filename
+        payload = {
+            "data": [{
+                "name": test_name,
+                "status": {"phase": "Running"}
+            }]
+        }
 
+        res = requests.post(url, json=payload, cookies=self.cookies)
+        return res.json()["data"][0]["id"]
 
-def generate_html_report(test_name, mismatches, match_percent):
-    filename = f"reports/{test_name}_report.html"
+    def update_run(self, run_id, status):
+        url = f"{self.base_url}/api/shared_spaces/{self.space_id}/workspaces/{self.workspace_id}/runs/{run_id}"
 
-    html = f"""
-    <html>
-    <body>
-    <h2>Test: {test_name}</h2>
-    <h3>Match %: {match_percent:.2f}%</h3>
-    <table border="1">
-    <tr><th>Field</th><th>DEV</th><th>UAT</th></tr>
-    """
+        payload = {
+            "data": [{
+                "id": run_id,
+                "status": {"phase": status}
+            }]
+        }
 
-    for m in mismatches:
-        html += f"<tr><td>{m['field']}</td><td>{m['dev']}</td><td>{m['uat']}</td></tr>"
+        requests.put(url, json=payload, cookies=self.cookies)
 
-    html += "</table></body></html>"
+    def attach_report(self, run_id, file_path):
+        url = f"{self.base_url}/api/shared_spaces/{self.space_id}/workspaces/{self.workspace_id}/attachments"
 
-    with open(filename, "w") as f:
-        f.write(html)
-
-    return filename
+        files = {'file': open(file_path, 'rb')}
+        requests.post(url, files=files, cookies=self.cookies)
