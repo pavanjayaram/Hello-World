@@ -1,122 +1,180 @@
-def build_llm_prompt(config: Dict[str, Any]) -> str:
-    config_json = json.dumps(config, indent=2)
-    return f"""
-You are an expert Data Engineer specializing in Python, Polars, and Oracle databases.
+import os
+import json
+import requests
 
-Based on the following JSON ETL pipeline configuration, generate a complete, independent, and runnable Python script using the `polars` library.
+# === System Prompt ===
+SYSTEM_PROMPT = """
+You are an expert Python and Polars developer.
+Generate a complete, production-ready Python script using the Polars library to perform an ETL pipeline based on the provided configuration.
 
-The script MUST:
-1. Use `polars` for all data transformations, reading, and writing. Do NOT use PySpark or Pandas.
-2. Read data from the configured source (CSV, Parquet, or Database).
-3. Apply all listed field and row transformations step-by-step.
-4. Write the final DataFrame to the configured target (usually Oracle Database).
-5. Handle parallelism properly. For Polars, this means utilizing LazyFrames (`.lazy()`) and `collect(streaming=True)` if appropriate for large datasets (up to 100 million rows).
-6. For Oracle database reads/writes, use highly optimized concurrent logic utilizing Python multiprocessing or optimized batch configurations if `polars.write_database` is not sufficient natively.
-7. Include robust error handling and logging.
-8. Be well-commented and clean.
-9. ONLY output the Python code, surrounded by ```python ... ``` blocks. Do not include markdown explanations outside the code block.
+### Requirements:
+1.  **Imports**: Include `import polars as pl` and any other necessary modules (e.g., `os`, `sys`).
+2.  **Data Source**: 
+    *   Load data from the specified source.
+    *   Handle delimiters, headers, paths correctly for Polars (`pl.read_csv`, `pl.read_parquet`, etc.).
+3.  **Transformations**:
+    *   Apply all **field level transformations** (upper, lower, trim, cast, mask etc.).
+    *   Apply all **row level transformations** (filter, distinct, sort etc.).
+4.  **Data Target**:
+    *   Write the processed DataFrame to the target location.
+    *   Handle formats (`write_csv`, `write_parquet`).
+5.  **Structure**:
+    *   Wrap logic in a `main()` function or `run_pipeline()` function.
+    *   Include basic error handling (`try-except`) and structured logging/printing.
+    *   Code must be strictly runnable and optimized.
 
-Pipeline Configuration JSON:
-{config_json}
+### 🛡️ Guardrails & Safety:
+1.  **Security**: Do NOT generate code that introduces security risks (e.g., `eval()`, `exec()`, `os.system()`). Use only Polars operations for data manipulation.
+2.  **No Hallucinations**: Use only the columns and paths explicitly defined in the configuration.
+3.  **Reliability**: Ensure that file paths and database connection placeholders are highlighted with comments if they need replacement by the user.
+4.  **Format Strictness**: Return **ONLY** the valid Python code. Do not include markdown code block backticks (like ```python) or explanatory text outside the code. The output must be pure Python.
 """
 
-@app.route('/api/generate-ollama-code', methods=['POST'])
-def generate_ollama_code():
+def clean_generated_code(code):
+    """Post-processing cleaning guardrail to remove any markdown styling."""
+    if not code:
+        return ""
+    code = code.strip()
+    if code.startswith("```python"):
+        code = code[9:]
+    elif code.startswith("```"):
+        code = code[3:]
+    if code.endswith("```"):
+        code = code[:-3]
+    return code.strip()
+
+def read_parameter_file(param_file_path):
+    """Reads the parameter file and returns a dictionary of key-values."""
+    params = {}
+    if not os.path.exists(param_file_path):
+        return params
+        
+    with open(param_file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and '=' in line and not line.startswith('#'):
+                key, val = line.split('=', 1)
+                params[key.strip()] = val.strip()
+    return params
+
+def generate_polars_prompt(config):
+    """Generates the main User Prompt containing the payload."""
+    prompt = f"""
+### Configuration:
+{json.dumps(config, indent=2)}
+
+Please generate the Python-Polars ETL code for this configuration.
+"""
+    return prompt
+
+def get_installed_ollama_model(preferred_name="codellama"):
+    """Queries /api/tags to find the exact model name/tag installed."""
     try:
-        config = request.json
-        prompt = build_llm_prompt(config)
-        
-        import requests
-        
-        # Call local Ollama
-        response = requests.post('http://localhost:11434/api/generate', json={
-            "model": "codellama:7b",
-            "prompt": prompt,
-            "stream": False
-        }, timeout=300)
-        
+        response = requests.get("http://localhost:11434/api/tags", timeout=5)
         response.raise_for_status()
-        result = response.json()
+        data = response.json()
+        models = [m.get("name") for m in data.get("models", [])]
         
-        # Extract the code from the response
-        code = result.get('response', '')
-        
-        # Clean markdown code blocks if present
-        if code.strip().startswith('```python'):
-            code = code.strip().split('```python', 1)[1]
-            if '```' in code:
-                code = code.rsplit('```', 1)[0]
-        elif code.strip().startswith('```'):
-            code = code.strip().split('```', 1)[1]
-            if '```' in code:
-                code = code.rsplit('```', 1)[0]
-                
-        return jsonify({
-            "success": True,
-            "code": code.strip(),
-            "status": "success"
-        })
-    except requests.exceptions.ConnectionError:
-        return jsonify({
-            "success": False,
-            "error": "Failed to connect to Ollama. Make sure Ollama is running locally on port 11434 (`ollama serve`)."
-        }), 500
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route('/api/generate-gemini-code', methods=['POST'])
-def generate_gemini_code():
-    try:
-        config = request.json
-        prompt = build_llm_prompt(config)
-        
-        gemini_api_key = os.environ.get('GEMINI_API_KEY')
-        if not gemini_api_key:
-            return jsonify({
-                "success": False,
-                "error": "GEMINI_API_KEY environment variable is not set in the backend .env file."
-            }), 400
+        # 1. Look for exact match
+        if preferred_name in models:
+            return preferred_name
             
-        import requests
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_api_key}"
-        
-        response = requests.post(url, json={
-            "contents": [{"parts": [{"text": prompt}]}]
-        }, timeout=300)
-        
-        response.raise_for_status()
-        result = response.json()
-        
-        try:
-            code = result.get('candidates', [])[0].get('content', {}).get('parts', [])[0].get('text', '')
-        except (IndexError, AttributeError):
-            code = f"# Failed to parse Gemini response:\n# {json.dumps(result, indent=2)}"
-        
-        # Clean markdown code blocks if present
-        if code.strip().startswith('```python'):
-            code = code.strip().split('```python', 1)[1]
-            if '```' in code:
-                code = code.rsplit('```', 1)[0]
-        elif code.strip().startswith('```'):
-            code = code.strip().split('```', 1)[1]
-            if '```' in code:
-                code = code.rsplit('```', 1)[0]
+        # 2. Look for name:tag variation (e.g., codellama:7b)
+        for m in models:
+            if m == preferred_name or m.startswith(f"{preferred_name}:"):
+                return m
                 
-        return jsonify({
-            "success": True,
-            "code": code.strip(),
-            "status": "success"
-        })
+        # 3. Fallback to any model if nothing is found
+        if models:
+            return models[0]
+            
+        return preferred_name
+    except Exception:
+        return preferred_name # Fallback on error
+
+def generate_code_ollama(user_prompt, model="codellama"):
+    """Calls local Ollama API to generate code (using combined string format)."""
+    url = "http://localhost:11434/api/generate"
+    
+    # Resolve exact model tag/name before sending request
+    resolved_model = get_installed_ollama_model(model)
+    print(f"Ollama: Resolved model '{model}' to '{resolved_model}'")
+    
+    # Combine system and user prompt manually into absolute full string for compatibility
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+    
+    payload = {
+        "model": resolved_model,
+        "prompt": full_prompt,
+        "stream": False
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=300)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("response", "")
     except Exception as e:
-        # Sanitize error message to remove any API key
-        error_msg = str(e)
-        if gemini_api_key:
-            error_msg = error_msg.replace(gemini_api_key, '***REDACTED***')
-        return jsonify({
-            "success": False,
-            "error": error_msg
-        }), 500
+        raise Exception(f"Ollama generation failed: {str(e)}")
+
+def generate_code_gemini(user_prompt, api_key):
+    """Calls Gemini REST API using systemInstruction."""
+    if not api_key:
+        raise ValueError("Gemini API Key is missing.")
+        
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        },
+        "contents": [{
+            "parts": [{"text": user_prompt}]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+        }
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+        
+        candidates = data.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            if parts:
+                return parts[0].get("text", "")
+                
+        raise Exception("Invalid response format from Gemini API")
+    except Exception as e:
+        raise Exception(f"Gemini generation failed: {str(e)}")
+
+def generate_code(config_payload, param_file_path):
+    """Main entry point to generate code based on payload and params."""
+    config = config_payload.get("config", config_payload)
+    llm_config = config_payload.get("llmConfig", {}) or config.get("llmConfig", {})
+    
+    provider = llm_config.get("provider", "ollama")
+    model = llm_config.get("model", "codellama" if provider == 'ollama' else 'gemini-1.5-flash')
+    
+    params = read_parameter_file(param_file_path)
+    gemini_key = params.get("GEMINI_API_KEY", "")
+    
+    # Generate User Prompt
+    user_prompt = generate_polars_prompt(config)
+    
+    if provider == 'gemini' or gemini_key:
+        if not gemini_key:
+            gemini_key = llm_config.get("apiKey", "")
+            if not gemini_key:
+                raise ValueError("GEMINI_API_KEY not found in parameterfile.txt and not provided in config.")
+        
+        print(f"Using Gemini Provider with model: {model}")
+        code = generate_code_gemini(user_prompt, gemini_key)
+    else:
+        print(f"Using Ollama Provider with model: {model}")
+        code = generate_code_ollama(user_prompt, model)
+        
+    return clean_generated_code(code)
