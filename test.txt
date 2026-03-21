@@ -1,146 +1,67 @@
-# PySpark Dynamic ETL Engine
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+import logging
+from typing import Dict
 
-Welcome to your custom, configuration-driven PySpark ETL Engine! This application is designed to be highly modular, scalable, and completely driven by JSON configurations. You can build complex data pipelines (Extract, Transform, Load) without writing new PySpark code for every job.
-
----
-
-## 🏗️ Core Architecture Overview
-
-The engine is built using the **Factory Design Pattern** and is divided into specific modules that handle discrete parts of the ETL lifecycle. 
-
-### 1. `etl_engine.py` (The Orchestrator)
-This is the main entry point of the application. It reads your JSON configuration file and an optional `parameterfile.txt`, dynamically overrides variables, and spins up the correct ETL pipeline (`FILE_TO_FILE`, `FILE_TO_DB`, etc.).
-
-### 2. Pipeline Handlers
-Depending on the `pipeline_type` declared in your JSON, the engine routes the data through one of four specialized scripts:
-*   `file_to_file_etl.py`
-*   `file_to_db_etl.py`
-*   `db_to_file_etl.py`
-*   `db_to_db_etl.py`
-
-### 3. Factory Providers 
-Rather than hardcoding how to read a CSV or write to a PostgreSQL database inside the pipelines, the pipelines utilize Factory modules:
-*   **`sources.py`**: Resolves how to connect to JDBC databases, parse connection strings, or read complex file formats intelligently.
-*   **`targets.py`**: Resolves how to write data. It natively checks if data has Change Data Capture (CDC) flags and automatically stages data for database UPSERTs (Merge) operations.
-
-### 4. `transformations.py` (The Core Engine)
-This module houses all the logic for manipulating the Spark DataFrame. 
-*   **Column Transformations**: Upper, lower, trim, cast string->date, renaming, string masking/unmasking (AES/Base64), and distributed parallel `row_number` generation.
-*   **Row Transformations**: Data filtering, deduplication (dropping or rejecting), and sorting.
-*   **Lookups & CDC**: Surrogate key generation, broadcasting joins, and SCD Type 2 logic parsing. *(Note: The engine aggressively protects file-based targets and automatically disables CDC/Lookups if the target system is a File).*
-*   **Field Mappings**: Dynamically re-orders and aliases final columns before loading.
-
-### 5. `audit_logger.py` & `reject_handler.py` (Observability & Validation)
-*   **Audit Logging**: The engine wraps every pipeline in an observable timer. It captures extraction row counts, load row counts, calculate execution duration, and writes the metadata to a central JSON directory for analytical monitoring.
-*   **Row Rejection**: If data fails a transformation rule (e.g., a filter condition or a duplicate trap), the engine quarantines the bad rows, appends a failure reason/timestamp, and writes them to a designated "Reject" folder. It supports both `reject_and_continue` (save bad data, process the rest) and `reject_and_fail` (save bad data, immediately crash the Spark job).
-
----
-
-## 🚀 How to Run the Engine
-
-The engine takes two arguments:
-1. The **JSON Configuration File** *(Required)*
-2. The **Parameter File** containing global variables *(Optional)*
-
-```bash
-# Example Run Command
-python etl_engine.py /path/to/my_config.json /path/to/parameterfile.txt
-```
-
----
-
-## ⚙️ How the JSON Configuration Works
-
-The engine's logic is derived entirely from standard JSON blocks. Here is the structure of a pipeline config:
-
-### 1. Pipeline Definition
-Defines the high-level intent.
-```json
-"pipeline": {
-  "pipeline_id": "DAILY_SALES_ETL",
-  "pipeline_type": "FILE_TO_DB",
-  "execution_mode": "BATCH",
-  "log_level": "WARN",
-  "jars": ["/opt/spark/jars/postgresql-42.2.18.jar", "/opt/spark/jars/ojdbc8.jar"]
-}
-```
-
-### 2. Global Settings (Audit & Rejects)
-These can be parameterized via `parameterfile.txt` (e.g., `AUDIT_PATH=/my/secure/folder`).
-```json
-"audit": {
-  "enable": true,
-  "capture_row_count": true,
-  "capture_duration": true,
-  "path": "/Logs/audit"
-},
-"reject": {
-  "enable": true,
-  "path": "/Logs/reject",
-  "include_reason": true
-},
-"error_handling": {
-  "mode": "reject_and_continue"
-}
-```
-
-### 3. Source Extraction
-Tell the engine what to read and how to connect.
-```json
-"source": {
-  "type": "FILE",
-  "format": "csv",
-  "path": "/incoming_data/sales.csv",
-  "options": {"header": true, "delimiter": ","}
-}
-```
-
-### 4. Transformations
-An array of actions executed sequentially top-to-bottom.
-```json
-"transformations": [
-  {
-    "type": "row",
-    "action": "filter",
-    "condition": "Price > 0",
-    "capture_rejects": true,
-    "reject_reason": "Negative Price Invalid"
-  },
-  {
-    "type": "column",
-    "action": "upper",
-    "column": "CustomerName"
-  },
-  {
-    "type": "column",
-    "action": "data_masking",
-    "column": "CreditCard",
-    "masking_type": "partial",
-    "show_last": 4
-  }
-]
-```
-
-### 5. Final Mapping & Target Load
-Map to the final schema and define the output system.
-```json
-"field_mappings": [
-  {"source_column": "CustomerName", "target_column": "customer_account_name", "order": 1},
-  {"source_column": "Price", "target_column": "transaction_amount", "order": 2}
-],
-"target": {
-  "type": "FILE",
-  "format": "parquet",
-  "path": "/processed_data/sales",
-  "mode": "overwrite",
-  "coalesce": 10
-}
-```
-
----
-
-## 🎓 PySpark Distributed Best Practices Captured in this Engine
-
-1. **Distributed Lineage IDs over Global Sorts:** Using `monotonically_increasing_id()` instead of `row_number().over(Window.orderBy())` for sequential ID generation ensures Spark does not drag the entire DataFrame onto a single machine to sort it. 
-2. **Coalesced Target Writes:** Writing to disk across 200 distributed worker nodes will yield 200 tiny files. Using `.coalesce(N)` brings the data together safely before writing to disk, avoiding thousands of tiny 5kb files hitting cloud storage.
-3. **Atomic Upserts (CDC):** Row-by-row `.update()` statements over JDBC in a distributed cluster will bottleneck databases. The engine stages Upserts via `.append()` into a STAGING table, empowering the DB Engine to run a fast, massive `MERGE` query.
+class RejectHandler:
+    """
+    Handles capturing, formatting, and storing rows that fail 
+    business validation rules (Filters, Deduplication, Null Constraints).
+    """
+    
+    def __init__(self, config: Dict):
+        # We look specifically for the "reject" block in the JSON
+        self.config = config.get("reject", {})
+        self.enabled = self.config.get("enable", False)
+        self.path = self.config.get("path")
+        self.include_reason = self.config.get("include_reason", True)
+        
+        # We also look for the "error_handling" block to determine failure behavior
+        # Fallback to errorHandling for raw exports from UI
+        error_config = config.get("error_handling", config.get("errorHandling", {}))
+        self.error_mode = error_config.get("mode", "reject_and_continue")
+        
+        self.total_rejects = 0 
+        
+    def write_rejects(self, df: DataFrame, reason: str = 'VALIDATION_FAILED'):
+        """
+        Takes a DataFrame of "bad" rows, appends the failure reason, 
+        and writes them out to the reject path.
+        """
+        if not self.enabled:
+            return
+            
+        # Count how many bad rows we caught in this specific validation step
+        count = df.count()
+        if count == 0:
+            return
+            
+        self.total_rejects += count
+        
+        # If enabled, append the reason and the timestamp so analysts can debug later
+        if self.include_reason:
+            df = df.withColumn('reject_reason', F.lit(reason))
+            df = df.withColumn('reject_timestamp', F.current_timestamp())
+            
+        if not self.path:
+            logging.warning("Rejects are enabled, but no 'path' is provided in JSON. Cannot write broken rows.")
+            return
+            
+        logging.warning(f"Validation Error: Caught {count} rejected rows. Reason: {reason}.")
+        logging.info(f"Writing rejected rows to {self.path}")
+        
+        try:
+            # We typically append Parquet for rejects so we don't accidentally overwrite past failures
+            df.write.mode("append").parquet(self.path)
+            
+            # If the user specifically set reject_and_fail in their JSON, we crash the pipeline immediately!
+            if self.error_mode == "reject_and_fail":
+                error_msg = f"Pipeline aborted. Error Mode is 'reject_and_fail' and {count} rows failed validation: {reason}"
+                logging.error(error_msg)
+                raise RuntimeError(error_msg)
+                
+        except Exception as e:
+            logging.error(f"Failed to write rejected rows to {self.path}: {str(e)}")
+            
+    def get_reject_count(self) -> int:
+        return self.total_rejects
