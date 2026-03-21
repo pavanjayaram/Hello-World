@@ -1,19 +1,26 @@
-from lxml import etree
+def compare(dev_data, uat_data, fields, ignore_fields):
+    mismatches = []
+    total = 0
+    matched = 0
 
-def remove_namespace(xml):
-    for elem in xml.getiterator():
-        if not hasattr(elem.tag, 'find'): continue
-        i = elem.tag.find('}')
-        if i >= 0:
-            elem.tag = elem.tag[i+1:]
-    return xml
+    for field in fields:
+        if field in ignore_fields:
+            continue
 
-def xml_to_dict(xml_string):
-    root = etree.fromstring(xml_string.encode())
-    root = remove_namespace(root)
+        dev_val = dev_data.get(field)
+        uat_val = uat_data.get(field)
 
-    data = {}
-    for elem in root.iter():
-        if elem.text and elem.text.strip():
-            data[elem.tag] = elem.text.strip()
-    return data
+        total += 1
+
+        if dev_val == uat_val:
+            matched += 1
+        else:
+            mismatches.append({
+                "field": field,
+                "dev": dev_val,
+                "uat": uat_val
+            })
+
+    match_percent = (matched / total * 100) if total > 0 else 0
+
+    return mismatches, match_percent
