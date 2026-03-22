@@ -1,16 +1,39 @@
-def call_api(url, payload, soap_action):
-    headers = {
-        "Content-Type": "text/xml",
-        "SOAPAction": soap_action
-    }
+import os
+import json
 
-    response = requests.post(url, data=payload, headers=headers, timeout=30, verify=get_ssl_config())
+def load_all_test_cases(base_path):
+    all_tests = []
 
-    fault = extract_soap_fault(response.text)
+    for wsdl_folder in os.listdir(base_path):
+        wsdl_path = os.path.join(base_path, wsdl_folder)
 
-    if fault:
-        print("\n🚨 SOAP FAULT:")
-        print(fault)
-        return None
+        if not os.path.isdir(wsdl_path):
+            continue
 
-    return response.text
+        config_file = os.path.join(wsdl_path, "config.json")
+
+        if not os.path.exists(config_file):
+            continue
+
+        with open(config_file) as f:
+            wsdl_config = json.load(f)
+
+        # Loop test folders
+        for test_folder in os.listdir(wsdl_path):
+            test_path = os.path.join(wsdl_path, test_folder)
+
+            if not os.path.isdir(test_path):
+                continue
+
+            source = os.path.join(test_path, "source.xml")
+            target = os.path.join(test_path, "target.xml")
+
+            if os.path.exists(source) and os.path.exists(target):
+                all_tests.append({
+                    "test_name": f"{wsdl_folder}_{test_folder}",
+                    "source_request_file": source,
+                    "target_request_file": target,
+                    **wsdl_config   # merge config
+                })
+
+    return all_tests
