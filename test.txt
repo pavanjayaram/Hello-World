@@ -1,39 +1,12 @@
-import os
-import json
+import subprocess
 
-def load_all_test_cases(base_path):
-    all_tests = []
+def send_alert_via_shell(subject, body):
+    try:
+        subprocess.run(
+            ["./send_alert.sh", subject, body],
+            check=True
+        )
+        log("📧 Alert triggered via shell script")
 
-    for wsdl_folder in os.listdir(base_path):
-        wsdl_path = os.path.join(base_path, wsdl_folder)
-
-        if not os.path.isdir(wsdl_path):
-            continue
-
-        config_file = os.path.join(wsdl_path, "config.json")
-
-        if not os.path.exists(config_file):
-            continue
-
-        with open(config_file) as f:
-            wsdl_config = json.load(f)
-
-        # Loop test folders
-        for test_folder in os.listdir(wsdl_path):
-            test_path = os.path.join(wsdl_path, test_folder)
-
-            if not os.path.isdir(test_path):
-                continue
-
-            source = os.path.join(test_path, "source.xml")
-            target = os.path.join(test_path, "target.xml")
-
-            if os.path.exists(source) and os.path.exists(target):
-                all_tests.append({
-                    "test_name": f"{wsdl_folder}_{test_folder}",
-                    "source_request_file": source,
-                    "target_request_file": target,
-                    **wsdl_config   # merge config
-                })
-
-    return all_tests
+    except subprocess.CalledProcessError as e:
+        log(f"❌ Shell alert failed: {e}")
