@@ -1,12 +1,111 @@
-import subprocess
+import requests
+import smtplib
+import time
+from email.mime.text import MIMEText
+from datetime import datetime
 
-def send_alert_via_shell(subject, body):
+# =========================
+# CONFIGURATION
+# =========================
+WSDL_URL = "http://host:port/DataService?wsdl"
+TIMEOUT = 10  # seconds
+RETRY_COUNT = 2
+SLEEP_BETWEEN_RETRIES = 5
+
+EMAIL_ENABLED = True
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_USER = "your_email@gmail.com"
+EMAIL_PASS = "your_password"
+TO_EMAIL = ["team@example.com"]
+
+LOG_FILE = "wsdl_monitor.log"
+
+
+# =========================
+# LOG FUNCTION
+# =========================
+def log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_msg = f"[{timestamp}] {message}"
+    print(log_msg)
+    
+    with open(LOG_FILE, "a") as f:
+        f.write(log_msg + "\n")
+
+
+# =========================
+# EMAIL ALERT FUNCTION
+# =========================
+def send_email(subject, body):
+    if not EMAIL_ENABLED:
+        return
+    
     try:
-        subprocess.run(
-            ["./send_alert.sh", subject, body],
-            check=True
-        )
-        log("📧 Alert triggered via shell script")
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_USER
+        msg["To"] = ", ".join(TO_EMAIL)
 
-    except subprocess.CalledProcessError as e:
-        log(f"❌ Shell alert failed: {e}")
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(EMAIL_USER, TO_EMAIL, msg.as_string())
+        server.quit()
+
+        log("📧 Alert email sent successfully")
+
+    except Exception as e:
+        log(f"❌ Failed to send email: {e}")
+
+
+# =========================
+# HEARTBEAT CHECK
+# =========================
+def check_wsdl():
+    for attempt in range(1, RETRY_COUNT + 1):
+        try:
+            log(f"Checking WSDL (Attempt {attempt})...")
+            response = requests.get(WSDL_URL, timeout=TIMEOUT)
+
+            if response.status_code == 200:
+                log("✅ WSDL is healthy (HTTP 200)")
+                return True
+            else:
+                log(f"⚠️ Unexpected status: {response.status_code}")
+
+        except requests.exceptions.Timeout:
+            log("⏱️ Timeout occurred")
+
+        except requests.exceptions.ConnectionError:
+            log("🔌 Connection error")
+
+        except Exception as e:
+            log(f"❌ Unexpected error: {e}")
+
+        time.sleep(SLEEP_BETWEEN_RETRIES)
+
+    return False
+
+
+# =========================
+# MAIN EXECUTION
+# =========================
+if __name__ == "__main__":
+    is_healthy = check_wsdl()
+
+    if not is_healthy:
+        alert_msg = f"""
+🚨 WSDL/API DOWN ALERT 🚨
+
+URL: {WSDL_URL}
+Time: {datetime.now()}
+
+Issue: Service unreachable or returning non-200 response.
+
+Immediate action required!
+"""
+        log("🚨 Service is DOWN - sending alert")
+        send_email("WSDL/API DOWN ALERT", alert_msg)
+    else:
+        log("✔️ Service check passed")
