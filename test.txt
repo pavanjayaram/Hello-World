@@ -1,8 +1,137 @@
-#!/bin/bash
+import requests
+import json
+import os
+import subprocess
+from datetime import datetime
 
-SUBJECT="$1"
-BODY="$2"
+# =========================
+# CONFIG
+# =========================
+CONFIG_FILES = [
+    "wsdl_avs_config.json",
+    "wsdl_avs_lang_config.json",
+    "wsdl_avs_certi_config.json",
+    "wsdl_avs_fc_config.json",
+    "wsdl_avs_fc_certi_config.json"
+]
 
-TO="team@example.com"
+TIMEOUT = 15
+LOG_FILE = "wsdl_monitor.log"
 
-echo "$BODY" | mailx -s "$SUBJECT" $TO
+
+# =========================
+# LOG FUNCTION
+# =========================
+def log(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    full_msg = f"[{timestamp}] {msg}"
+    print(full_msg)
+
+    with open(LOG_FILE, "a") as f:
+        f.write(full_msg + "\n")
+
+
+# =========================
+# LOAD CONFIG
+# =========================
+def load_config(file):
+    with open(file, "r") as f:
+        return json.load(f)
+
+
+# =========================
+# API CALL
+# =========================
+def check_api(cfg):
+    try:
+        name = cfg.get("name", "UNKNOWN")
+        url = cfg["url"]
+        method = cfg.get("method", "GET").upper()
+        headers = cfg.get("headers", {})
+        body = cfg.get("body", None)
+
+        log(f"Checking {name}...")
+
+        if method == "GET":
+            response = requests.get(url, timeout=TIMEOUT)
+
+        elif method == "POST":
+            response = requests.post(url, data=body, headers=headers, timeout=TIMEOUT)
+
+        else:
+            return False, f"{name} -> Unsupported method {method}"
+
+        if response.status_code == 200:
+            return True, f"{name} -> OK (200)"
+        else:
+            return False, f"{name} -> FAILED ({response.status_code})"
+
+    except Exception as e:
+        return False, f"{name} -> ERROR ({str(e)})"
+
+
+# =========================
+# SHELL ALERT
+# =========================
+def send_alert(summary):
+    try:
+        with open("alert.txt", "w") as f:
+            f.write(summary)
+
+        subprocess.run(
+            ["./send_alert.sh", "WSDL/API FAILURE ALERT", "alert.txt"],
+            check=True
+        )
+
+        log("📧 Alert sent via shell script")
+
+    except Exception as e:
+        log(f"❌ Failed to trigger alert: {e}")
+
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+    failures = []
+    success_count = 0
+
+    for file in CONFIG_FILES:
+        if not os.path.exists(file):
+            log(f"❌ Config missing: {file}")
+            failures.append(f"{file} -> NOT FOUND")
+            continue
+
+        cfg = load_config(file)
+        status, message = check_api(cfg)
+
+        log(message)
+
+        if status:
+            success_count += 1
+        else:
+            failures.append(message)
+
+    # =========================
+    # FINAL DECISION
+    # =========================
+    if failures:
+        log("🚨 Some APIs failed")
+
+        summary = f"""
+WSDL/API FAILURE ALERT
+
+Time: {datetime.now()}
+
+Failed Services:
+----------------
+{chr(10).join(failures)}
+
+Successful Count: {success_count}
+Failed Count: {len(failures)}
+"""
+
+        send_alert(summary)
+
+    else:
+        log("✅ All APIs are healthy - No alert needed")
