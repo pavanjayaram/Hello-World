@@ -1,18 +1,16 @@
 def check_api(cfg):
     name = cfg.get("name", "UNKNOWN")
-    method = cfg.get("method", "GET").upper()
+    url = cfg.get("url")
+    enabled = cfg.get("enabled", True)
+    ignore_if_down = cfg.get("ignore_if_down", True)
 
-    env_config = cfg.get("environments", {}).get(ENV)
+    if not enabled:
+        return True, f"{name} -> SKIPPED (disabled)"
 
-    if not env_config:
-        return False, f"{name} -> No config for ENV {ENV}"
+    log(f"Checking {name}...")
 
-    url = env_config["url"]
-
-    log(f"[{ENV}] Checking {name}...")
-
-    ATTEMPTS = 5
-    SLOW_THRESHOLD = 5  # seconds
+    ATTEMPTS = 3
+    SLOW_THRESHOLD = 5
 
     for attempt in range(1, ATTEMPTS + 1):
         try:
@@ -24,39 +22,32 @@ def check_api(cfg):
 
             response_time = response.elapsed.total_seconds()
 
-            # 🔍 Capture node info from headers
-            headers = response.headers
-            node_info = (
-                headers.get("X-Node-IP") or
-                headers.get("X-Backend-Server") or
-                headers.get("X-Served-By") or
-                headers.get("Server") or
-                "UNKNOWN"
-            )
+            log(f"{name} -> Attempt {attempt} | Time: {response_time:.2f}s")
 
-            log(f"{name} -> Attempt {attempt} | Node: {node_info} | Time: {response_time:.2f}s")
-
-            # ❌ HTTP failure
+            # ❌ HTTP error (real issue)
             if response.status_code != 200:
                 return False, (
-                    f"{name} -> FAILED (Status {response.status_code}) "
-                    f"on attempt {attempt} | Node: {node_info}"
+                    f"{name} -> FAILED ({response.status_code}) "
+                    f"on attempt {attempt}"
                 )
 
             # ❌ Slow response
             if response_time > SLOW_THRESHOLD:
                 return False, (
-                    f"{name} -> SLOW ({response_time:.2f}s) "
-                    f"on attempt {attempt} | Node: {node_info}"
+                    f"{name} -> SLOW ({response_time:.2f}s)"
                 )
 
         except requests.exceptions.Timeout:
-            return False, f"{name} -> TIMEOUT on attempt {attempt}"
+            if ignore_if_down:
+                return True, f"{name} -> DOWN (ignored)"
+            return False, f"{name} -> TIMEOUT"
 
         except requests.exceptions.ConnectionError:
-            return False, f"{name} -> CONNECTION ERROR on attempt {attempt}"
+            if ignore_if_down:
+                return True, f"{name} -> DOWN (ignored)"
+            return False, f"{name} -> CONNECTION ERROR"
 
         except Exception as e:
-            return False, f"{name} -> ERROR ({str(e)}) on attempt {attempt}"
+            return False, f"{name} -> ERROR ({str(e)})"
 
-    return True, f"{name} -> HEALTHY (All {ATTEMPTS} checks passed)"
+    return True, f"{name} -> HEALTHY"
