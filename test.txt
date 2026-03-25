@@ -24,20 +24,30 @@ def check_api(cfg):
 
             response_time = response.elapsed.total_seconds()
 
+            # 🔍 Capture node info from headers
+            headers = response.headers
+            node_info = (
+                headers.get("X-Node-IP") or
+                headers.get("X-Backend-Server") or
+                headers.get("X-Served-By") or
+                headers.get("Server") or
+                "UNKNOWN"
+            )
+
+            log(f"{name} -> Attempt {attempt} | Node: {node_info} | Time: {response_time:.2f}s")
+
             # ❌ HTTP failure
             if response.status_code != 200:
                 return False, (
-                    f"{name} -> FAILED "
-                    f"(Status {response.status_code}) "
-                    f"on attempt {attempt}"
+                    f"{name} -> FAILED (Status {response.status_code}) "
+                    f"on attempt {attempt} | Node: {node_info}"
                 )
 
-            # ❌ Slow response (early warning)
+            # ❌ Slow response
             if response_time > SLOW_THRESHOLD:
                 return False, (
-                    f"{name} -> SLOW RESPONSE "
-                    f"({response_time:.2f}s > {SLOW_THRESHOLD}s) "
-                    f"on attempt {attempt}"
+                    f"{name} -> SLOW ({response_time:.2f}s) "
+                    f"on attempt {attempt} | Node: {node_info}"
                 )
 
         except requests.exceptions.Timeout:
@@ -49,5 +59,4 @@ def check_api(cfg):
         except Exception as e:
             return False, f"{name} -> ERROR ({str(e)}) on attempt {attempt}"
 
-    # ✅ All attempts passed
     return True, f"{name} -> HEALTHY (All {ATTEMPTS} checks passed)"
