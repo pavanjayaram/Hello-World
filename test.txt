@@ -1,27 +1,53 @@
 def check_api(cfg):
-    try:
-        name = cfg.get("name", "UNKNOWN")
-        method = cfg.get("method", "GET").upper()
+    name = cfg.get("name", "UNKNOWN")
+    method = cfg.get("method", "GET").upper()
 
-        env_config = cfg.get("environments", {}).get(ENV)
+    env_config = cfg.get("environments", {}).get(ENV)
 
-        if not env_config:
-            return False, f"{name} -> No config for ENV {ENV}"
+    if not env_config:
+        return False, f"{name} -> No config for ENV {ENV}"
 
-        url = env_config["url"]
+    url = env_config["url"]
 
-        log(f"[{ENV}] Checking {name}...")
+    log(f"[{ENV}] Checking {name}...")
 
-        response = requests.get(
-            url,
-            timeout=TIMEOUT,
-            verify=False
-        )
+    ATTEMPTS = 5
+    SLOW_THRESHOLD = 5  # seconds
 
-        if response.status_code == 200:
-            return True, f"{name} -> OK (200)"
-        else:
-            return False, f"{name} -> FAILED ({response.status_code})"
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                url,
+                timeout=TIMEOUT,
+                verify=False
+            )
 
-    except Exception as e:
-        return False, f"{name} -> ERROR ({str(e)})"
+            response_time = response.elapsed.total_seconds()
+
+            # ❌ HTTP failure
+            if response.status_code != 200:
+                return False, (
+                    f"{name} -> FAILED "
+                    f"(Status {response.status_code}) "
+                    f"on attempt {attempt}"
+                )
+
+            # ❌ Slow response (early warning)
+            if response_time > SLOW_THRESHOLD:
+                return False, (
+                    f"{name} -> SLOW RESPONSE "
+                    f"({response_time:.2f}s > {SLOW_THRESHOLD}s) "
+                    f"on attempt {attempt}"
+                )
+
+        except requests.exceptions.Timeout:
+            return False, f"{name} -> TIMEOUT on attempt {attempt}"
+
+        except requests.exceptions.ConnectionError:
+            return False, f"{name} -> CONNECTION ERROR on attempt {attempt}"
+
+        except Exception as e:
+            return False, f"{name} -> ERROR ({str(e)}) on attempt {attempt}"
+
+    # ✅ All attempts passed
+    return True, f"{name} -> HEALTHY (All {ATTEMPTS} checks passed)"
