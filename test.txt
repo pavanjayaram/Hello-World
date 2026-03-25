@@ -1,53 +1,56 @@
-def check_api(cfg):
+def check_service(cfg):
     name = cfg.get("name", "UNKNOWN")
-    url = cfg.get("url")
-    enabled = cfg.get("enabled", True)
     ignore_if_down = cfg.get("ignore_if_down", True)
 
-    if not enabled:
-        return True, f"{name} -> SKIPPED (disabled)"
+    env_config = cfg.get("environments", {}).get(ENV)
 
-    log(f"Checking {name}...")
+    if not env_config:
+        return False, f"{name} -> No config for ENV {ENV}"
 
-    ATTEMPTS = 3
-    SLOW_THRESHOLD = 5
+    lb_url = env_config.get("lb_url")
+    nodes = env_config.get("nodes", [])
 
-    for attempt in range(1, ATTEMPTS + 1):
-        try:
-            response = requests.get(
-                url,
-                timeout=TIMEOUT,
-                verify=False
-            )
+    failures = []
+    success_msgs = []
 
-            response_time = response.elapsed.total_seconds()
+    # =========================
+    # 1. CHECK LOAD BALANCER
+    # =========================
+    if lb_url:
+        status, msg = check_api({
+            "name": f"{name}_LB",
+            "url": lb_url,
+            "ignore_if_down": False
+        })
 
-            log(f"{name} -> Attempt {attempt} | Time: {response_time:.2f}s")
+        log(msg)
 
-            # ❌ HTTP error (real issue)
-            if response.status_code != 200:
-                return False, (
-                    f"{name} -> FAILED ({response.status_code}) "
-                    f"on attempt {attempt}"
-                )
+        if not status:
+            failures.append(msg)
+        else:
+            success_msgs.append(msg)
 
-            # ❌ Slow response
-            if response_time > SLOW_THRESHOLD:
-                return False, (
-                    f"{name} -> SLOW ({response_time:.2f}s)"
-                )
+    # =========================
+    # 2. CHECK NODES
+    # =========================
+    for i, node_url in enumerate(nodes, start=1):
+        status, msg = check_api({
+            "name": f"{name}_NODE{i}",
+            "url": node_url,
+            "ignore_if_down": ignore_if_down
+        })
 
-        except requests.exceptions.Timeout:
-            if ignore_if_down:
-                return True, f"{name} -> DOWN (ignored)"
-            return False, f"{name} -> TIMEOUT"
+        log(msg)
 
-        except requests.exceptions.ConnectionError:
-            if ignore_if_down:
-                return True, f"{name} -> DOWN (ignored)"
-            return False, f"{name} -> CONNECTION ERROR"
+        if not status:
+            failures.append(msg)
+        else:
+            success_msgs.append(msg)
 
-        except Exception as e:
-            return False, f"{name} -> ERROR ({str(e)})"
+    # =========================
+    # FINAL RESULT
+    # =========================
+    if failures:
+        return False, "\n".join(failures)
 
-    return True, f"{name} -> HEALTHY"
+    return True, f"{name} -> ALL HEALTHY"
