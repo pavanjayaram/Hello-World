@@ -1,445 +1,161 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import os
-import sys
 import json
-import subprocess
-import glob
-from datetime import datetime
-from werkzeug.utils import secure_filename
+import os
+import logging
+from pyspark.sql import SparkSession
+from transformations import apply_all_transformations, apply_field_mappings
+from audit_logger import AuditMetrics
+from reject_handler import RejectHandler
+from sources import SourceFactory
+from targets import TargetFactory
 
-app = Flask(__name__)
-# Allow CORS for local development (React runs on 5173 by default)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+class FileToDBETL:
+    def __init__(self, config_path, config=None):
+        """
+        Initializes the ETL Engine for File/DB to DB.
+        """
+        self.config_path = config_path
+        self.config = config if config else self._load_config()
+        self.spark = self._create_spark_session()
+        self.audit = AuditMetrics(self.config)
+        self.reject = RejectHandler(self.config)
+        
+    def _load_config(self):
+        logging.info(f"Loading configuration from: {self.config_path}")
+        with open(self.config_path, 'r') as f:
+            return json.load(f)
+            
+    def _create_spark_session(self):
+        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL_F2DB")
+        logging.info(f"Initializing SparkSession: {app_name}")
+        builder = SparkSession.builder.appName(app_name)
+        
+        # Look for custom JARs (like excel reader or DB drivers)
+        jars = self.config.get("pipeline", {}).get("jars", [])
+        if jars:
+            maven_jars = [j for j in jars if ":" in j]
+            local_jars = [j for j in jars if ":" not in j]
+            
+            if maven_jars:
+                builder = builder.config("spark.jars.packages", ",".join(maven_jars))
+            if local_jars:
+                jar_str = ",".join(local_jars)
+                # spark.jars is always comma-separated
+                builder = builder.config("spark.jars", jar_str)
+                # spark.driver.extraClassPath requires OS-specific separator (colon on Mac, semicolon on Windows)
+                builder = builder.config("spark.driver.extraClassPath", os.pathsep.join(local_jars))
+            
+        spark = builder.getOrCreate()
+        log_level = self.config.get("pipeline", {}).get("log_level", "WARN")
+        spark.sparkContext.setLogLevel(log_level)
+        return spark
 
-# Constants
-BACKEND_DIR = os.path.dirname(os.path.abspath(__name__))
-if not BACKEND_DIR.endswith("backend"):
-    BACKEND_DIR = os.path.join(BACKEND_DIR, "backend")
+    def extract(self):
+        """
+        Reads the source data dynamically based on the JSON configuration via SourceFactory.
+        """
+        source_config = self.config.get("source", {})
+        source_type = source_config.get("type", "FILE")
+        
+        logging.info(f"Extracting data using SourceFactory for type: {source_type}")
+        handler = SourceFactory.get_handler(source_type)
+        df = handler.read(self.spark, source_config)
+        
+        row_count = df.count()
+        logging.info(f"Extracted {row_count} rows.")
+        self.audit.record_source_count(row_count)
+        
+        return df
+
+    def transform(self, df):
+        """
+        Applies transformations and field mappings using the central transformation engine.
+        """
+        logging.info("Starting Transformations via Central Engine (CDC/Lookup enabled due to DB target)...")
+        
+        context = {
+            "reject_handler": self.reject
+        }
+        df = apply_all_transformations(self, df, self.config, context)
+        df = apply_field_mappings(df, self.config)
+        return df
+
+    def load(self, df):
+        target_config = self.config.get("target", {})
+        target_type = target_config.get("type", "DB")
+        mode = target_config.get("mode", "append")
+        
+        row_count = df.count()
+        self.audit.record_target_count(row_count)
+        
+        # Check if chunked load is enabled (APPEND mode only)
+        chunked_config = self.config.get("chunked_load", {})
+        if chunked_config.get("enabled", False) and mode == "append":
+            logging.info(f"[FileToDBETL] Chunked load enabled — delegating to ChunkProcessor")
+            from chunk_processor import ChunkProcessor
+            processor = ChunkProcessor(self.config, self.spark)
+            summary = processor.process_all_chunks(df)
+            
+            if summary.get("failed", 0) > 0:
+                raise RuntimeError(
+                    f"Chunked load completed with {summary['failed']} failed chunks. "
+                    f"Use run_mode=RETRY_FAILED to retry. job_run_id={summary.get('job_run_id')}"
+                )
+            return
+        
+        logging.info(f"Loading data using TargetFactory for type: {target_type}")
+        handler = TargetFactory.get_handler(target_type)
+        # We pass the full self.config rather than just target_config so targets.py can scan for CDC
+        handler.write(df, self.config)
+        logging.info("Data load complete!")
+
+    def run(self):
+        pipeline_id = self.config.get('pipeline', {}).get('pipeline_id', 'Unknown_Pipeline')
+        run_mode = self.config.get('pipeline', {}).get('run_mode', 'FULL').upper()
+        logging.info(f"=== Starting FILE_TO_DB Pipeline: {pipeline_id} (run_mode: {run_mode}) ===")
+        
+        try:
+            self.audit.start_pipeline(pipeline_id)
+            
+            if run_mode == 'RETRY_FAILED':
+                # Retry mode: re-extract and re-transform, but only write failed chunks
+                logging.info("[FileToDBETL] RETRY_FAILED mode — will reprocess only failed chunks")
+                source_df = self.extract()
+                transformed_df = self.transform(source_df)
+                
+                from chunk_processor import ChunkProcessor
+                processor = ChunkProcessor(self.config, self.spark)
+                job_run_id = self.config.get('chunked_load', {}).get('retry_job_run_id', None)
+                summary = processor.retry_failed_chunks(transformed_df, job_run_id)
+                
+                if summary.get("failed", 0) > 0:
+                    raise RuntimeError(
+                        f"Retry completed with {summary['failed']} chunks still failing."
+                    )
+            else:
+                # Normal FULL run
+                source_df = self.extract()
+                transformed_df = self.transform(source_df)
+                self.load(transformed_df)
+            
+            reject_count = self.reject.get_reject_count()
+            if reject_count > 0:
+                logging.warning(f"--- WARNING: {reject_count} invalid rows were sent to Reject path ---")
+                
+            self.audit.end_pipeline(self.spark, status='SUCCESS')
+            logging.info("=== FILE_TO_DB Pipeline Finished Successfully ===")
+        except Exception as e:
+            self.audit.end_pipeline(self.spark, status='FAILED', error_msg=str(e))
+            logging.error(f"=== ETL Pipeline FAILED: {str(e)} ===")
+            raise e
+
+if __name__ == "__main__":
+    import sys
     
-CONFIG_DIR = os.path.join(BACKEND_DIR, "config")
-os.makedirs(CONFIG_DIR, exist_ok=True)
-
-ENGINE_SCRIPT = os.path.join(BACKEND_DIR, "etl_engine.py")
-PARAM_FILE = os.path.join(BACKEND_DIR, "parameterfile.txt")
-
-@app.route('/', methods=['GET'])
-def index():
-    return """
-    <h1>PySpark ETL Backend is Running! 🚀</h1>
-    <p>This is the API server. Please open the React Frontend UI to use the application.</p>
-    <p>👉 <b><a href="http://localhost:3007">Go to Frontend (http://localhost:3007)</a></b></p>
-    """
-
-@app.route('/api/connections', methods=['GET'])
-def get_connections():
-    """Returns a list of saved database connections from the local .env file."""
-    connections = []
+    if len(sys.argv) < 2:
+        print("ERROR: Config file path is required.", file=sys.stderr)
+        print("Usage: python file_to_db_etl.py <config.json>", file=sys.stderr)
+        sys.exit(2)
     
-    # In earlier versions, we checked inside BACKEND_DIR.
-    # The true .env file is actually in the root PROJECT directory.
-    project_root = os.path.dirname(BACKEND_DIR)
-    env_file = os.path.join(project_root, '.env')
-    
-    if os.path.exists(env_file):
-        with open(env_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, val = line.split('=', 1)
-                    key = key.strip()
-                    val = val.strip()
-                    
-                    # Optional: Add jdbc: prefix if not present but looks like a DB URL
-                    # so that PySpark handles it cleanly, just in case.
-                    if val.startswith('postgresql://'):
-                        val = 'jdbc:' + val
-                    elif val.startswith('mysql://'):
-                        val = 'jdbc:' + val
-                    elif val.startswith('oracle:'):
-                        pass # Typically jdbc:oracle:... but we leave it to user
-                        
-                    connections.append({"key": key, "value": val})
-    else:
-        # Fallback if .env doesn't exist at all
-        connections = [
-            {"key": "Local PostgreSQL", "value": "jdbc:postgresql://localhost:5432/postgres"}
-        ]
-        
-    return jsonify({
-        "success": True,
-        "connections": connections
-    })
-
-@app.route('/api/fs/list', methods=['GET'])
-def fs_list():
-    """Returns directory contents for the frontend file browser."""
-    try:
-        req_path = request.args.get('path', '')
-        # Default to the Project Root if no path is provided
-        current_path = req_path if req_path else os.path.dirname(BACKEND_DIR)
-        
-        if not os.path.exists(current_path):
-            current_path = os.path.dirname(BACKEND_DIR)
-            
-        items = []
-        # Sort directories first, then files
-        for item in sorted(os.listdir(current_path)):
-            if item.startswith('.'):
-                continue # Skip hidden files
-                
-            item_path = os.path.join(current_path, item)
-            is_dir = os.path.isdir(item_path)
-            
-            items.append({
-                "name": item,
-                "path": item_path,
-                "is_dir": is_dir,
-                "size": os.path.getsize(item_path) if not is_dir else 0
-            })
-            
-        parent_path = os.path.dirname(current_path) if current_path != '/' else None
-        
-        return jsonify({
-            "current_path": current_path,
-            "parent_path": parent_path,
-            "items": sorted(items, key=lambda x: (not x["is_dir"], x["name"].lower()))
-        })
-    except Exception as e:
-        return jsonify({"current_path": "", "parent_path": None, "items": [], "error": str(e)}), 500
-
-@app.route('/api/preview/file-headers', methods=['POST'])
-def get_file_headers():
-    """Reads headers from a file to support the UI Transformation Builder dropdowns."""
-    try:
-        data = request.json
-        path = data.get('path')
-        if not path or not os.path.exists(path):
-            return jsonify({"headers": []})
-            
-        import csv
-        with open(path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter=data.get('delimiter', ','))
-            headers = next(reader, [])
-            # Strip BOM or whitespace just in case
-            headers = [h.strip() for h in headers]
-            return jsonify({"headers": headers})
-    except Exception as e:
-        print(f"Error reading file headers: {e}")
-        return jsonify({"headers": []})
-
-@app.route('/api/preview/db-columns', methods=['POST'])
-def get_db_columns():
-    """Fetches real DB columns by spawning a quick PySpark JDBC job."""
-    try:
-        data = request.json
-        import time
-        temp_file = os.path.join(CONFIG_DIR, f"temp_db_query_{int(time.time())}.json")
-        
-        with open(temp_file, 'w') as f:
-            json.dump(data, f)
-            
-        fetcher_script = os.path.join(BACKEND_DIR, "get_db_columns.py")
-        cmd = [sys.executable, fetcher_script, temp_file]
-        
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=BACKEND_DIR
-        )
-        stdout, stderr = process.communicate()
-        
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-            
-        if process.returncode != 0:
-            print(f"Error fetching DB columns: {stderr}")
-            return jsonify({"columns": [], "error": stderr})
-            
-        # Try to find the JSON output in the stdout
-        for line in reversed(stdout.split('\n')):
-            if line.strip().startswith('{'):
-                try:
-                    result = json.loads(line)
-                    if "columns" in result:
-                        return jsonify(result)
-                    elif "error" in result:
-                        return jsonify({"columns": [], "error": result["error"]})
-                except json.JSONDecodeError:
-                    pass
-                    
-        return jsonify({"columns": []})
-        
-    except Exception as e:
-        print(f"Server error fetching DB columns: {e}")
-        return jsonify({"columns": [], "error": str(e)})
-
-@app.route('/api/test-connection', methods=['POST'])
-def test_connection():
-    """Mock implementation for DB connection test."""
-    return jsonify({"success": True})
-
-@app.route('/api/list-configs', methods=['GET'])
-def list_configs():
-    """Returns a list of all saved JSON pipeline configurations."""
-    try:
-        # Search for all JSON files in the config directory
-        search_pattern = os.path.join(CONFIG_DIR, "*.json")
-        json_files = glob.glob(search_pattern)
-        
-        configs = []
-        for file_path in json_files:
-            filename = os.path.basename(file_path)
-            # Skip temporary execution files
-            if filename.startswith("temp_"):
-                continue
-                
-            with open(file_path, 'r') as f:
-                try:
-                    data = json.load(f)
-                    pipeline = data.get("pipeline", {})
-                    configs.append({
-                        "filename": filename,
-                        "pipeline_id": pipeline.get("pipeline_id", "Unknown"),
-                        "pipeline_type": pipeline.get("pipeline_type", "Unknown")
-                    })
-                except json.JSONDecodeError:
-                    continue
-                    
-        return jsonify({"success": True, "configs": configs})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/get-config/<filename>', methods=['GET'])
-def get_config(filename):
-    """Fetches a specific configuration file."""
-    try:
-        secure_name = secure_filename(filename)
-        file_path = os.path.join(CONFIG_DIR, secure_name)
-        
-        if not os.path.exists(file_path):
-            return jsonify({"success": False, "error": "File not found"}), 404
-            
-        with open(file_path, 'r') as f:
-            config = json.load(f)
-            
-        return jsonify({"success": True, "config": config})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/save-config', methods=['POST'])
-def save_config():
-    """Saves a JSON configuration payload to disk."""
-    try:
-        data = request.json
-        config = data.get('config')
-        filename = secure_filename(data.get('filename', 'pipeline.json'))
-        
-        if not config:
-            return jsonify({"success": False, "error": "No config provided"}), 400
-            
-        if not filename.endswith('.json'):
-            filename += '.json'
-            
-        file_path = os.path.join(CONFIG_DIR, filename)
-        
-        with open(file_path, 'w') as f:
-            json.dump(config, f, indent=4)
-            
-        return jsonify({"success": True, "message": f"Saved {filename} successfully"})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/export-config/<filename>', methods=['GET'])
-def export_config(filename):
-    """Returns a JSON configuration file as a downloadable attachment for standalone/Autosys use."""
-    try:
-        from flask import send_from_directory
-        secure_name = secure_filename(filename)
-        file_path = os.path.join(CONFIG_DIR, secure_name)
-        
-        if not os.path.exists(file_path):
-            return jsonify({"success": False, "error": "File not found"}), 404
-            
-        return send_from_directory(
-            CONFIG_DIR, 
-            secure_name, 
-            as_attachment=True,
-            mimetype='application/json'
-        )
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/validate-config', methods=['POST'])
-def validate_config():
-    """Validates the structure of the JSON payload before execution."""
-    try:
-        config = request.json
-        errors = []
-        
-        if 'pipeline' not in config:
-            errors.append("Missing 'pipeline' metadata block")
-        elif 'pipeline_type' not in config['pipeline']:
-            errors.append("Missing 'pipeline_type' in pipeline block")
-            
-        if 'source' not in config:
-            errors.append("Missing 'source' block")
-            
-        if 'target' not in config:
-            errors.append("Missing 'target' block")
-            
-        if errors:
-            return jsonify({"valid": False, "errors": errors})
-            
-        return jsonify({"valid": True})
-    except Exception as e:
-        return jsonify({"valid": False, "errors": [str(e)]})
-
-@app.route('/api/execute-pipeline', methods=['POST'])
-def execute_pipeline():
-    """Writes the payload to a temp file and executes etl_engine.py."""
-    try:
-        config = request.json
-        pipeline_id = config.get("pipeline", {}).get("pipeline_id", "dynamic_run")
-        
-        # 1. Save temp config inside config folder
-        temp_filename = f"temp_execution_{pipeline_id}.json"
-        temp_path = os.path.join(CONFIG_DIR, temp_filename)
-        
-        with open(temp_path, 'w') as f:
-            json.dump(config, f, indent=4)
-            
-        # 2. Run PySpark Engine Subprocess
-        # Uses sys.executable to ensure we use the same Python binary (and virtual environment) running this Flask app.
-        cmd = [sys.executable, ENGINE_SCRIPT, temp_path, PARAM_FILE]
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=os.path.dirname(BACKEND_DIR)  # Run from root so relative paths work
-        )
-        stdout, stderr = process.communicate()
-        
-        # Cleanup temp file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            
-        # 3. Read the Audit Log generated to send back metrics
-        metrics = {}
-        duration = 0
-        # Default status based on exit code: if subprocess exited cleanly, assume success
-        # unless the audit log explicitly says otherwise.
-        status = "success" if process.returncode == 0 else "failed"
-        
-        # Determine the true Audit Path (Check parameterfile.txt first, then fallback to JSON)
-        audit_path = ""
-        if os.path.exists(PARAM_FILE):
-            with open(PARAM_FILE, 'r') as f:
-                for line in f:
-                    if line.startswith('AUDIT_PATH='):
-                        audit_path = line.split('=', 1)[1].strip()
-                        break
-                        
-        if not audit_path:
-            audit_path = config.get("audit", {}).get("path", "")
-            
-        if audit_path and os.path.exists(audit_path):
-            # Look for recent JSONs in the audit folder, sort by modified time
-            search_pattern = os.path.join(audit_path, "*.json")
-            audit_files = glob.glob(search_pattern)
-            
-            if audit_files:
-                latest_log = max(audit_files, key=os.path.getmtime)
-                
-                # Wait up to 2 seconds for OS to flush the file to disk
-                import time
-                wait_time = 0
-                while os.path.getsize(latest_log) == 0 and wait_time < 2.0:
-                    time.sleep(0.1)
-                    wait_time += 0.1
-                    
-                try:
-                    with open(latest_log, 'r') as f:
-                        log_data = json.load(f)
-                        
-                        # Ensure it belongs to our execution
-                        if log_data.get("pipeline_id") == pipeline_id:
-                            metrics = log_data
-                            duration = log_data.get("duration_seconds", 0)
-                            status = log_data.get("status", status).lower()
-                except Exception as e:
-                    print(f"Warning: Could not parse Audit JSON ({e}). Using exit-code based status.")
-                        
-        # 4. Write execution output to dedicated files per run
-        log_dir = os.path.join(BACKEND_DIR, "Logs")
-        os.makedirs(log_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        step_log_file = os.path.join(log_dir, f"step_by_step_{pipeline_id}_{timestamp}.log")
-        error_log_file = os.path.join(log_dir, f"error_{pipeline_id}_{timestamp}.log")
-        
-        # Always write step-by-step logs (Standard Output)
-        with open(step_log_file, 'w') as f:
-            f.write(f"=== PIPELINE EXECUTION: {pipeline_id} ===\n")
-            f.write(f"TIMESTAMP: {timestamp}\n")
-            f.write(f"EXIT CODE: {process.returncode}\n\n")
-            if stdout: 
-                f.write(stdout)
-                
-        # Only write error logs if there actually was an error stream or a crash
-        if stderr or process.returncode != 0:
-            with open(error_log_file, 'w') as f:
-                f.write(f"=== PIPELINE ERROR LOG: {pipeline_id} ===\n")
-                f.write(f"TIMESTAMP: {timestamp}\n")
-                f.write(f"EXIT CODE: {process.returncode}\n\n")
-                if stderr:
-                    f.write(stderr)
-            
-        # 5. Determine final result based on exit code or captured exceptions
-        if process.returncode != 0:
-            return jsonify({
-                "success": False, 
-                "error": stderr or stdout or "Engine crashed unexpectedly",
-                "logs": stdout.split("\n")
-            })
-            
-        return jsonify({
-            "success": status == "success",
-            "duration": duration,
-            "metrics": metrics,
-            "logs": stdout.split("\n"),
-            "error": "Engine reported failure in audit log" if status == "failed" else None
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/generate-ollama-code', methods=['POST'])
-def generate_ollama_code_endpoint():
-    """Generates Python-Polars code using AI (Ollama or Gemini)."""
-    try:
-        # Import inside handler to avoid circular imports or early failures
-        sys.path.append(BACKEND_DIR)
-        from ai_generator import generate_code
-        
-        config = request.json
-        # Pass PARAM_FILE to read the key
-        code = generate_code(config, PARAM_FILE)
-        
-        return jsonify({
-            "status": "success",
-            "code": code
-        })
-    except Exception as e:
-        print(f"Error generating code: {e}")
-        return jsonify({
-            "status": "error",
-            "error": str(e)
-        }), 500
-
-if __name__ == '__main__':
-    # Start the Flask API on port 9001 (Must match React ExecutePipeline.tsx API_URL)
-    app.run(host='0.0.0.0', port=9001, debug=True)
+    config_file = sys.argv[1]
+    engine = FileToDBETL(config_file)
+    engine.run()
