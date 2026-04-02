@@ -1,14 +1,18 @@
+import json
 import os
 import logging
 from pyspark.sql import SparkSession
 from transformations import apply_all_transformations, apply_field_mappings
 from audit_logger import AuditMetrics
 from reject_handler import RejectHandler
-from targets import TargetFactory
 from sources import SourceFactory
+from targets import TargetFactory
 
-class DBToDBETL:
+class FileToDBETL:
     def __init__(self, config_path, config=None):
+        """
+        Initializes the ETL Engine for File/DB to DB.
+        """
         self.config_path = config_path
         self.config = config if config else self._load_config()
         self.spark = self._create_spark_session()
@@ -16,18 +20,29 @@ class DBToDBETL:
         self.reject = RejectHandler(self.config)
         
     def _load_config(self):
-        import json
+        logging.info(f"Loading configuration from: {self.config_path}")
         with open(self.config_path, 'r') as f:
             return json.load(f)
             
     def _create_spark_session(self):
-        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL_DB2DB")
+        app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL_F2DB")
+        logging.info(f"Initializing SparkSession: {app_name}")
         builder = SparkSession.builder.appName(app_name)
         
+        # Look for custom JARs (like excel reader or DB drivers)
         jars = self.config.get("pipeline", {}).get("jars", [])
         if jars:
-            builder = builder.config("spark.jars", ",".join(jars))
-            builder = builder.config("spark.driver.extraClassPath", os.pathsep.join(jars))
+            maven_jars = [j for j in jars if ":" in j]
+            local_jars = [j for j in jars if ":" not in j]
+            
+            if maven_jars:
+                builder = builder.config("spark.jars.packages", ",".join(maven_jars))
+            if local_jars:
+                jar_str = ",".join(local_jars)
+                # spark.jars is always comma-separated
+                builder = builder.config("spark.jars", jar_str)
+                # spark.driver.extraClassPath requires OS-specific separator (colon on Mac, semicolon on Windows)
+                builder = builder.config("spark.driver.extraClassPath", os.pathsep.join(local_jars))
             
         spark = builder.getOrCreate()
         log_level = self.config.get("pipeline", {}).get("log_level", "WARN")
@@ -35,20 +50,28 @@ class DBToDBETL:
         return spark
 
     def extract(self):
+        """
+        Reads the source data dynamically based on the JSON configuration via SourceFactory.
+        """
         source_config = self.config.get("source", {})
-        source_type = source_config.get("type", "DB")
+        source_type = source_config.get("type", "FILE")
         
-        print(f"Extracting data using SourceFactory for type: {source_type}")
+        logging.info(f"Extracting data using SourceFactory for type: {source_type}")
         handler = SourceFactory.get_handler(source_type)
         df = handler.read(self.spark, source_config)
         
         row_count = df.count()
-        print(f"Extracted {row_count} rows.")
+        logging.info(f"Extracted {row_count} rows.")
         self.audit.record_source_count(row_count)
+        
         return df
 
     def transform(self, df):
-        print("Starting Transformations via Central Engine (CDC/Lookup enabled)...")
+        """
+        Applies transformations and field mappings using the central transformation engine.
+        """
+        logging.info("Starting Transformations via Central Engine (CDC/Lookup enabled due to DB target)...")
+        
         context = {
             "reject_handler": self.reject
         }
@@ -67,7 +90,7 @@ class DBToDBETL:
         # Check if chunked load is enabled (APPEND mode only)
         chunked_config = self.config.get("chunked_load", {})
         if chunked_config.get("enabled", False) and mode == "append":
-            logging.info(f"[DBToDBETL] Chunked load enabled — delegating to ChunkProcessor")
+            logging.info(f"[FileToDBETL] Chunked load enabled — delegating to ChunkProcessor")
             from chunk_processor import ChunkProcessor
             processor = ChunkProcessor(self.config, self.spark)
             summary = processor.process_all_chunks(df)
@@ -81,19 +104,21 @@ class DBToDBETL:
         
         logging.info(f"Loading data using TargetFactory for type: {target_type}")
         handler = TargetFactory.get_handler(target_type)
+        # We pass the full self.config rather than just target_config so targets.py can scan for CDC
         handler.write(df, self.config)
         logging.info("Data load complete!")
 
     def run(self):
         pipeline_id = self.config.get('pipeline', {}).get('pipeline_id', 'Unknown_Pipeline')
         run_mode = self.config.get('pipeline', {}).get('run_mode', 'FULL').upper()
-        logging.info(f"=== Starting DB_TO_DB Pipeline: {pipeline_id} (run_mode: {run_mode}) ===")
+        logging.info(f"=== Starting FILE_TO_DB Pipeline: {pipeline_id} (run_mode: {run_mode}) ===")
         
         try:
             self.audit.start_pipeline(pipeline_id)
             
             if run_mode == 'RETRY_FAILED':
-                logging.info("[DBToDBETL] RETRY_FAILED mode — will reprocess only failed chunks")
+                # Retry mode: re-extract and re-transform, but only write failed chunks
+                logging.info("[FileToDBETL] RETRY_FAILED mode — will reprocess only failed chunks")
                 source_df = self.extract()
                 transformed_df = self.transform(source_df)
                 
@@ -107,6 +132,7 @@ class DBToDBETL:
                         f"Retry completed with {summary['failed']} chunks still failing."
                     )
             else:
+                # Normal FULL run
                 source_df = self.extract()
                 transformed_df = self.transform(source_df)
                 self.load(transformed_df)
@@ -116,8 +142,18 @@ class DBToDBETL:
                 logging.warning(f"--- WARNING: {reject_count} invalid rows were sent to Reject path ---")
                 
             self.audit.end_pipeline(self.spark, status='SUCCESS')
-            logging.info("=== DB_TO_DB Pipeline Finished Successfully ===")
+            logging.info("=== FILE_TO_DB Pipeline Finished Successfully ===")
         except Exception as e:
             self.audit.end_pipeline(self.spark, status='FAILED', error_msg=str(e))
             logging.error(f"=== ETL Pipeline FAILED: {str(e)} ===")
             raise e
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        config_file = sys.argv[1]
+    else:
+        config_file = "/Users/pavankumarvarakudujayaram/Desktop/Code/pyspark_app/CSV_TO_DB.json"
+        
+    engine = FileToDBETL(config_file)
+    engine.run()
