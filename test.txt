@@ -1,743 +1,147 @@
-import React, { useState, useEffect } from 'react';
-import { TransformationConfig } from '../types';
-import './ExecutePipeline.css';
+// Type definitions for the data transformation system
 
-interface ExecutePipelineProps {
-  config: TransformationConfig;
+export interface DataSourceConfig {
+  mode: 'file-to-file' | 'file-to-db' | 'db-to-db' | 'db-to-file';
+  source: FileSource | DatabaseSource;
+  target: FileTarget | DatabaseTarget;
+  errorHandling?: {
+    mode: 'reject_and_continue' | 'reject_and_fail';
+  };
 }
 
-interface PipelineExecution {
-  id: string;
-  status: 'pending' | 'running' | 'success' | 'failed';
-  startTime?: string;
-  endTime?: string;
-  duration?: number;
-  sourceRowCount?: number;
-  targetRowCount?: number;
-  rejectRowCount?: number;
+export interface FileSource {
+  type: 'csv' | 'dat' | 'txt' | 'excel';
+  delimiter?: string;
+  path: string;
+}
+
+export interface DatabaseSource {
+  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
+  connectionString: string;
+  schema: string;
+  table: string;
+  partitionColumn?: string;
+  lowerBound?: string;
+  upperBound?: string;
+  numPartitions?: string;
+  fetchsize?: string;
+}
+
+export interface FileTarget {
+  type: 'csv' | 'dat' | 'txt' | 'excel';
+  delimiter?: string;
+  path: string;
+}
+
+export interface DatabaseTarget {
+  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
+  connectionString: string;
+  schema: string;
+  table: string;
+  batchsize?: string;
+  isolationLevel?: string;
+  primaryKey?: string;
+  writeMode?: 'append' | 'truncate_and_load';
+  chunkedLoad?: boolean;
+  numChunks?: number;
+  businessKeys?: string;
+}
+
+export interface FieldTransformation {
+  fieldName: string;
+  targetField?: string;
+  transformations: Transform[];
+}
+
+export interface Transform {
+  type: 'add' | 'upper' | 'lower' | 'trim' | 'ltrim' | 'rtrim' | 'substring' | 'concat' | 'replace' | 'pad' |
+  'cast' | 'to_date' | 'to_timestamp' | 'to_number' | 'format' |
+  'if_then_else' | 'case_when' | 'coalesce' | 'nvl' |
+  'lookup' | 'cdc' |
+  'round' | 'ceil' | 'floor' | 'abs' | 'arithmetic' |
+  'sum' | 'avg' | 'min' | 'max' | 'count' | 'group_by' |
+  'deduplication' | 'validation' | 'masking' | 'data_masking' | 'data_unmasking' |
+  'literal' | 'row_number' | 'sequence' | 'current_date';
+  params: Record<string, any>;
+}
+
+export interface RowTransformation {
+  type: 'distinct' | 'filter' | 'sort' | 'sample' | 'union' | 'intersect' | 'except' | 'pivot' | 'unpivot' | 'lookup' | 'cdc_compare';
+  params: Record<string, any>;
+}
+
+export interface LLMConfig {
+  provider: 'ollama' | 'gemini';
+  model: string;
+  apiKey?: string;
+}
+
+export interface TransformationConfig {
+  dataSource: DataSourceConfig;
+  fieldTransforms: FieldTransformation[];
+  rowTransforms: RowTransformation[];
+  llmConfig?: LLMConfig;
+}
+
+export interface ValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface TransformationSpec {
+  version: string;
+  created_at: string;
+  source: SourceSpec;
+  target: TargetSpec;
+  field_transforms: FieldTransformSpec[];
+  row_transforms: RowTransformSpec[];
+  metadata: Record<string, any>;
+}
+
+export interface SourceSpec {
+  type: 'file' | 'database';
+  file_type?: string;
+  database_type?: string;
+  connection?: Record<string, any>;
+  path?: string;
+  delimiter?: string;
+}
+
+export interface TargetSpec {
+  type: 'file' | 'database';
+  file_type?: string;
+  database_type?: string;
+  connection?: Record<string, any>;
+  path?: string;
+  delimiter?: string;
+}
+
+export interface FieldTransformSpec {
+  field: string;
+  transforms: TransformSpec[];
+}
+
+export interface RowTransformSpec {
+  type: string;
+  params: Record<string, any>;
+}
+
+export interface TransformSpec {
+  type: string;
+  params: Record<string, any>;
+}
+
+export interface CodeGenerationTask {
+  task_id: string;
+  status: string;
+  created_at: string;
+}
+
+export interface CodeGenerationStatus {
+  task_id: string;
+  status: string;
+  progress: number;
+  code?: string;
   error?: string;
-  logs?: string[];
 }
-
-const ExecutePipeline: React.FC<ExecutePipelineProps> = ({ config }) => {
-  const [pipelineJson, setPipelineJson] = useState<any>(null);
-  const [execution, setExecution] = useState<PipelineExecution | null>(null);
-  const [savedConfigs, setSavedConfigs] = useState<any[]>([]);
-  const [selectedConfig, setSelectedConfig] = useState<string>('');
-  const [pipelineName, setPipelineName] = useState<string>('');
-  const [runMode, setRunMode] = useState<string>('FULL');
-
-  // Get API URL from environment variable
-  const API_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:9001';
-
-  useEffect(() => {
-    loadSavedConfigs();
-  }, []);
-
-  const loadSavedConfigs = async () => {
-    try {
-      const response = await fetch(`${API_URL}/api/list-configs`);
-      const data = await response.json();
-      if (data.success) {
-        setSavedConfigs(data.configs);
-      }
-    } catch (error) {
-      console.error('Error loading configs:', error);
-    }
-  };
-
-  const generatePipelineJson = () => {
-    const isSourceDb = config.dataSource.mode === 'db-to-file' || config.dataSource.mode === 'db-to-db';
-    const isTargetDb = config.dataSource.mode === 'file-to-db' || config.dataSource.mode === 'db-to-db';
-
-    // Build field mappings (column selection and renaming)
-    const fieldMappings: any[] = [];
-
-    console.log('=== Generating Field Mappings ===');
-    console.log('Field Transforms:', config.fieldTransforms);
-
-    config.fieldTransforms.forEach((ft, index) => {
-      console.log(`Field ${index}:`, {
-        fieldName: ft.fieldName,
-        targetField: ft.targetField,
-        hasTransformations: ft.transformations.length
-      });
-
-      fieldMappings.push({
-        source_column: ft.fieldName,
-        target_column: ft.targetField || ft.fieldName,
-        order: index  // Maintain order
-      });
-    });
-
-    console.log('Generated Field Mappings:', fieldMappings);
-
-    // Map transformations to backend format
-    const transformations: any[] = [];
-
-    // Add field transformations
-    config.fieldTransforms.forEach(ft => {
-      ft.transformations.forEach(t => {
-        if (t.type === 'upper') {
-          transformations.push({
-            type: 'column',
-            action: 'upper',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'lower') {
-          transformations.push({
-            type: 'column',
-            action: 'lower',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'trim') {
-          transformations.push({
-            type: 'column',
-            action: 'trim',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'cast') {
-          transformations.push({
-            type: 'column',
-            action: 'cast',
-            column: ft.fieldName,
-            target_type: t.params?.targetType || 'string'
-          });
-        } else if (t.type === 'literal') {
-          transformations.push({
-            type: 'column',
-            action: 'literal',
-            column: ft.fieldName,
-            value: t.params?.value || '',
-            data_type: t.params?.data_type || 'string'
-          });
-        } else if (t.type === 'sequence') {
-          transformations.push({
-            type: 'column',
-            action: 'sequence',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'current_date') {
-          transformations.push({
-            type: 'column',
-            action: 'current_date',
-            column: ft.fieldName
-          });
-        } else if (t.type === 'if_then_else') {
-          transformations.push({
-            type: 'column',
-            action: 'if_then_else',
-            column: ft.fieldName,
-            condition: t.params?.condition || '',
-            trueValue: t.params?.trueValue || '',
-            falseValue: t.params?.falseValue || ''
-          });
-        } else if (t.type === 'data_masking') {
-          transformations.push({
-            type: 'column',
-            action: 'data_masking',
-            column: ft.fieldName, // using column field mapping
-            masking_type: t.params?.masking_type || 'full',
-            key: t.params?.key || '',
-            show_first: t.params?.show_first ?? 2,
-            show_last: t.params?.show_last ?? 2
-          });
-        } else if (t.type === 'data_unmasking') {
-          transformations.push({
-            type: 'column',
-            action: 'data_unmasking',
-            column: ft.fieldName,
-            unmasking_type: t.params?.unmasking_type || 'base64',
-            key: t.params?.key || ''
-          });
-        }
-      });
-    });
-
-    // Add row transformations
-    config.rowTransforms.forEach(rt => {
-      if (rt.type === 'filter') {
-        transformations.push({
-          type: 'row',
-          action: 'filter',
-          condition: rt.params?.condition || 'true'
-        });
-      } else if (rt.type === 'distinct') {
-        // fields may be a pre-split array or a comma-separated string (e.g. "EMP_ID, DEPT_ID")
-        const rawFields = rt.params?.fields;
-        const parsedFields: string[] = Array.isArray(rawFields)
-          ? rawFields
-          : typeof rawFields === 'string'
-            ? rawFields.split(/[;,\s]+/).map((s: string) => s.trim()).filter((s: string) => s)
-            : [];
-        transformations.push({
-          type: 'row',
-          action: 'distinct',
-          columns: parsedFields,
-          duplicate_handling: rt.params?.duplicate_handling || 'drop'
-        });
-      } else if (rt.type === 'sort') {
-        transformations.push({
-          type: 'row',
-          action: 'sort',
-          columns: rt.params?.columns || [],
-          ascending: rt.params?.ascending !== false
-        });
-      } else if (rt.type === 'cdc_compare') {
-        transformations.push({
-          type: 'cdc_compare',
-          target_type: rt.params?.target_type || 'FILE',
-          target_path: rt.params?.target_path || '',
-          db_type: rt.params?.db_type,
-          schema: rt.params?.schema || 'public',
-          connection_string: rt.params?.connection_string,
-          format: rt.params?.format,
-          key_columns: typeof rt.params?.key_columns === 'string'
-            ? rt.params.key_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.key_columns || []),
-          compare_columns: typeof rt.params?.compare_columns === 'string'
-            ? rt.params.compare_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.compare_columns || []),
-          exclude_columns: typeof rt.params?.exclude_columns === 'string'
-            ? rt.params.exclude_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.exclude_columns || []),
-          op_column: rt.params?.op_column || 'op_type',
-          // New mapping support
-          source_key_columns: typeof rt.params?.source_key_columns === 'string'
-            ? rt.params.source_key_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.source_key_columns || []),
-          target_key_columns: typeof rt.params?.target_key_columns === 'string'
-            ? rt.params.target_key_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.target_key_columns || []),
-          source_compare_columns: typeof rt.params?.source_compare_columns === 'string'
-            ? rt.params.source_compare_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.source_compare_columns || []),
-          target_compare_columns: typeof rt.params?.target_compare_columns === 'string'
-            ? rt.params.target_compare_columns.split(',').map((s: string) => s.trim()).filter((s: string) => s)
-            : (rt.params?.target_compare_columns || [])
-        });
-      } else if (rt.type === 'lookup') {
-        const lookupParams: any = {
-          type: 'lookup',
-          lookup_table: rt.params?.lookup_table,
-          operation: rt.params?.operation || 'join',
-          schema: rt.params?.schema,
-          table: rt.params?.table,
-        };
-
-        if (lookupParams.operation === 'surrogate_key') {
-          lookupParams.source_column = rt.params?.source_column;
-          lookupParams.target_column = rt.params?.target_column;
-
-          // Auto-inject Target Config if available and source not valid
-          if (!rt.params?.source_type && !rt.params?.path) {
-            const targetConfig = config.dataSource.target as any;
-
-            if (isTargetDb) {
-              let schema = targetConfig.schema;
-              let table = targetConfig.table;
-
-              // Handle case where user entered "schema.table" in the Table field
-              if (table && table.includes('.')) {
-                const parts = table.split('.');
-                if (parts.length === 2) {
-                  schema = parts[0];
-                  table = parts[1];
-                }
-              }
-
-              lookupParams.source_type = targetConfig.db_type;
-              lookupParams.table = table;
-              lookupParams.schema = schema;
-              lookupParams.connection_string = targetConfig.connectionString;
-              lookupParams.db_type = targetConfig.db_type;
-              lookupParams.path = table; // Fallback matches table name
-            } else {
-              // File Target
-              lookupParams.source_type = targetConfig.type;
-              lookupParams.path = targetConfig.path;
-              lookupParams.file_format = targetConfig.type;
-            }
-          }
-        } else {
-          lookupParams.join_keys = rt.params?.join_keys;
-          lookupParams.join_type = rt.params?.join_type;
-          lookupParams.broadcast = rt.params?.broadcast;
-          lookupParams.column_mapping = rt.params?.column_mapping;
-          lookupParams.aggregation = rt.params?.aggregation;
-          // Include lookup_filter only if user provided a value
-          if (rt.params?.lookup_filter) {
-            lookupParams.lookup_filter = rt.params.lookup_filter;
-          }
-        }
-
-        // Common optional params
-        if (rt.params?.source_type && rt.params?.path) {
-          lookupParams.source_type = rt.params.source_type;
-          lookupParams.path = rt.params.path;
-          lookupParams.file_format = rt.params.file_format;
-          lookupParams.options = rt.params.options || {};
-
-          // Inject DB params if missing (assume same DB as target if not specified)
-          if (rt.params.source_type === 'DB') {
-            lookupParams.db_type = rt.params.db_type || (isTargetDb ? (config.dataSource.target as any).type : undefined);
-            lookupParams.connection_string = rt.params.connection_string || (isTargetDb ? (config.dataSource.target as any).connectionString : undefined);
-            // Also inject table if path is provided but table is missing
-            if (!lookupParams.table && lookupParams.path && !lookupParams.path.includes('/')) {
-              if (lookupParams.path.includes('.')) {
-                const parts = lookupParams.path.split('.');
-                if (parts.length === 2) {
-                  lookupParams.schema = parts[0];
-                  lookupParams.table = parts[1];
-                } else {
-                  lookupParams.table = lookupParams.path;
-                }
-              } else {
-                lookupParams.table = lookupParams.path;
-              }
-            }
-          }
-        }
-
-        transformations.push(lookupParams);
-      }
-    });
-
-    // Debug: Log target configuration before building JSON
-    console.log('=== Target Configuration Debug ===');
-    console.log('Target Config:', config.dataSource.target);
-    console.log('Batchsize:', (config.dataSource.target as any).batchsize);
-    console.log('IsolationLevel:', (config.dataSource.target as any).isolationLevel);
-
-    // Sanitize Source and Target Table Names (Handle schema.table input)
-    const sourceConfig = config.dataSource.source as any;
-    let sourceSchema = sourceConfig.schema || 'public';
-    let sourceTable = sourceConfig.table || '';
-    if (sourceTable && sourceTable.includes('.')) {
-      const parts = sourceTable.split('.');
-      if (parts.length === 2) {
-        sourceSchema = parts[0];
-        sourceTable = parts[1];
-      }
-    }
-
-    const targetConfig = config.dataSource.target as any;
-    let targetSchema = targetConfig.schema || 'public';
-    let targetTable = targetConfig.table || '';
-    if (targetTable && targetTable.includes('.')) {
-      const parts = targetTable.split('.');
-      if (parts.length === 2) {
-        targetSchema = parts[0];
-        targetTable = parts[1];
-      }
-    }
-
-    // Compute chunked load config
-    const targetAny = config.dataSource.target as any;
-    const isChunkedAppend = isTargetDb && targetAny.chunkedLoad && (targetAny.writeMode || 'append') === 'append';
-
-    const pipelineConfig: any = {
-      pipeline: {
-        pipeline_id: pipelineName || `PIPELINE_${Date.now()}`,
-        pipeline_type: config.dataSource.mode.toUpperCase().replace(/-/g, '_'),
-        execution_mode: 'BATCH',
-        run_mode: isChunkedAppend ? runMode : 'FULL',
-        run_date: new Date().toISOString().split('T')[0],
-        version: '1.0',
-        log_level: 'INFO'
-      },
-      field_mappings: fieldMappings,  // NEW: Column selection and ordering
-      source: isSourceDb ? {
-        type: 'DB',
-        db_type: config.dataSource.source.type,
-        table: sourceTable,
-        connectionString: (config.dataSource.source as any).connectionString || '',
-        schema: sourceSchema,
-        partitionColumn: (config.dataSource.source as any).partitionColumn,
-        lowerBound: (config.dataSource.source as any).lowerBound,
-        upperBound: (config.dataSource.source as any).upperBound,
-        numPartitions: (config.dataSource.source as any).numPartitions,
-        fetchsize: (config.dataSource.source as any).fetchsize
-      } : {
-        type: 'FILE',
-        format: config.dataSource.source.type || 'csv',
-        path: (config.dataSource.source as any).path || '',
-        options: {
-          header: true,
-          delimiter: (config.dataSource.source as any).delimiter || ','
-        }
-      },
-      transformations: transformations,
-      target: isTargetDb ? {
-        type: 'DB',
-        db_type: config.dataSource.target.type,
-        table: targetTable,
-        connectionString: (config.dataSource.target as any).connectionString || '',
-        schema: targetSchema,
-        mode: (config.dataSource.target as any).writeMode || 'append',
-        batchsize: (config.dataSource.target as any).batchsize,
-        isolationLevel: (config.dataSource.target as any).isolationLevel,
-        primary_key: (config.dataSource.target as any).primaryKey
-      } : {
-        type: 'FILE',
-        format: config.dataSource.target.type || 'parquet',
-        path: (config.dataSource.target as any).path || '',
-        mode: 'overwrite',
-        options: ['csv', 'txt', 'dat'].includes(config.dataSource.target.type) ? {
-          header: true,
-          delimiter: (config.dataSource.target as any).delimiter || ','
-        } : {
-          compression: 'snappy'
-        }
-      },
-      audit: {
-        enable: true,
-        capture_row_count: true,
-        capture_duration: true,
-        path: (config.dataSource.target as any).path
-          ? `${(config.dataSource.target as any).path.substring(0, (config.dataSource.target as any).path.lastIndexOf('/'))}/audit`
-          : './audit'
-      },
-      reject: {
-        enable: true,
-        path: (config.dataSource.target as any).path
-          ? `${(config.dataSource.target as any).path.substring(0, (config.dataSource.target as any).path.lastIndexOf('/'))}/reject`
-          : './reject',
-        include_reason: true
-      },
-      error_handling: {
-        mode: config.dataSource.errorHandling?.mode || 'reject_and_continue'
-      }
-    };
-
-    // Add chunked_load config if enabled
-    if (isChunkedAppend) {
-      const businessKeysStr = targetAny.businessKeys || '';
-      const businessKeysArr = businessKeysStr
-        .split(/[;,]+/)
-        .map((s: string) => s.trim())
-        .filter((s: string) => s.length > 0);
-
-      pipelineConfig.chunked_load = {
-        enabled: true,
-        num_chunks: targetAny.numChunks || 5,
-        business_keys: businessKeysArr,
-        metadata_path: './audit/chunks'
-      };
-    }
-
-    setPipelineJson(pipelineConfig);
-    return pipelineConfig;
-  };
-
-  const saveConfiguration = async () => {
-    if (!pipelineName) {
-      alert('Please enter a pipeline name');
-      return;
-    }
-
-    const jsonConfig = pipelineJson || generatePipelineJson();
-
-    try {
-      const response = await fetch(`${API_URL}/api/save-config`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          config: jsonConfig,
-          filename: `${pipelineName}.json`
-        })
-      });
-
-      const data = await response.json();
-      if (data.success) {
-        alert('Configuration saved successfully!');
-        loadSavedConfigs();
-      } else {
-        alert('Failed to save configuration: ' + data.error);
-      }
-    } catch (error) {
-      console.error('Error saving config:', error);
-      alert('Error saving configuration');
-    }
-  };
-
-  const executePipeline = async () => {
-    const jsonConfig = pipelineJson || generatePipelineJson();
-
-    setExecution({
-      id: jsonConfig.pipeline.pipeline_id,
-      status: 'running',
-      startTime: new Date().toISOString(),
-      logs: ['Pipeline execution started...', 'Validating configuration...']
-    });
-
-    try {
-      // First, validate the configuration
-      const validateResponse = await fetch(`${API_URL}/api/validate-config`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(jsonConfig)
-      });
-
-      const validateData = await validateResponse.json();
-
-      if (!validateData.valid) {
-        throw new Error('Configuration validation failed: ' + JSON.stringify(validateData.errors));
-      }
-
-      setExecution(prev => ({
-        ...prev!,
-        logs: [...(prev?.logs || []), '✓ Configuration validated', 'Executing pipeline...']
-      }));
-
-      // Execute the pipeline
-      // Note: This would call your backend ETL engine
-      // For now, we'll simulate the execution
-      const executeResponse = await fetch(`${API_URL}/api/execute-pipeline`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(jsonConfig)
-      });
-
-      const executeData = await executeResponse.json();
-
-      if (executeData.success) {
-        const m = executeData.metrics || {};
-        const isCdc = m.cdc_insert_row_count !== undefined;
-        setExecution(prev => ({
-          ...prev!,
-          status: 'success',
-          endTime: new Date().toISOString(),
-          duration: executeData.duration || 0,
-          sourceRowCount: m.source_row_count || 0,
-          targetRowCount: m.target_row_count || 0,
-          rejectRowCount: m.reject_row_count || 0,
-          cdcInsertCount: isCdc ? (m.cdc_insert_row_count || 0) : undefined,
-          cdcUpdateCount: isCdc ? (m.cdc_update_row_count || 0) : undefined,
-          cdcDeleteCount: isCdc ? (m.cdc_delete_row_count || 0) : undefined,
-          logs: [
-            ...(prev?.logs || []),
-            '✓ Pipeline executed successfully',
-            `Source rows: ${m.source_row_count || 0}`,
-            isCdc
-              ? `CDC — Inserts: ${m.cdc_insert_row_count || 0}, Updates: ${m.cdc_update_row_count || 0}, Deletes: ${m.cdc_delete_row_count || 0}`
-              : `Target rows: ${m.target_row_count || 0}`,
-            `Rejected rows: ${m.reject_row_count || 0}`,
-            `Duration: ${executeData.duration || 0}s`
-          ]
-        }));
-      } else {
-        throw new Error(executeData.error || 'Pipeline execution failed');
-      }
-    } catch (error: any) {
-      console.error('Error executing pipeline:', error);
-      setExecution(prev => ({
-        ...prev!,
-        status: 'failed',
-        endTime: new Date().toISOString(),
-        error: error.message,
-        logs: [...(prev?.logs || []), `✗ Error: ${error.message}`]
-      }));
-    }
-  };
-
-  const loadConfiguration = async (filename: string) => {
-    try {
-      const response = await fetch(`${API_URL}/api/get-config/${filename}`);
-      const data = await response.json();
-
-      if (data.success) {
-        setPipelineJson(data.config);
-        setPipelineName(filename.replace('.json', ''));
-      }
-    } catch (error) {
-      console.error('Error loading config:', error);
-      alert('Error loading configuration');
-    }
-  };
-
-  return (
-    <div className="execute-pipeline">
-      <div className="section">
-        <h3>Pipeline Configuration</h3>
-
-        <div className="config-actions">
-          <div className="input-group">
-            <label>Pipeline Name:</label>
-            <input
-              type="text"
-              value={pipelineName}
-              onChange={(e) => setPipelineName(e.target.value)}
-              placeholder="Enter pipeline name"
-              className="form-control"
-            />
-          </div>
-
-          {/* Run Mode — shown only when chunked load is active */}
-          {(() => {
-            const tgt = config.dataSource.target as any;
-            const isTargetDatabase = config.dataSource.mode === 'file-to-db' || config.dataSource.mode === 'db-to-db';
-            const showRunMode = isTargetDatabase && tgt.chunkedLoad && (tgt.writeMode || 'append') === 'append';
-            return showRunMode ? (
-              <div className="input-group" style={{ marginTop: '10px' }}>
-                <label>Run Mode:</label>
-                <select
-                  value={runMode}
-                  onChange={(e) => setRunMode(e.target.value)}
-                  className="form-control"
-                  style={{ maxWidth: '250px' }}
-                >
-                  <option value="FULL">FULL (Process all chunks)</option>
-                  <option value="RETRY_FAILED">RETRY_FAILED (Retry failed chunks only)</option>
-                </select>
-              </div>
-            ) : null;
-          })()}
-
-          <div className="button-group">
-            <button
-              className="btn btn-primary"
-              onClick={() => generatePipelineJson()}
-            >
-              Generate JSON Config
-            </button>
-            <button
-              className="btn btn-success"
-              onClick={saveConfiguration}
-              disabled={!pipelineName}
-            >
-              Save Configuration
-            </button>
-          </div>
-        </div>
-
-        {savedConfigs.length > 0 && (
-          <div className="saved-configs">
-            <h4>Saved Configurations</h4>
-            <select
-              className="form-control"
-              value={selectedConfig}
-              onChange={(e) => {
-                setSelectedConfig(e.target.value);
-                if (e.target.value) {
-                  loadConfiguration(e.target.value);
-                }
-              }}
-            >
-              <option value="">Select a saved configuration...</option>
-              {savedConfigs.map((cfg) => (
-                <option key={cfg.filename} value={cfg.filename}>
-                  {cfg.pipeline_id} ({cfg.pipeline_type})
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-      </div>
-
-      {pipelineJson && (
-        <div className="section">
-          <h3>Generated Configuration</h3>
-          <div className="json-display">
-            <pre>{JSON.stringify(pipelineJson, null, 2)}</pre>
-          </div>
-        </div>
-      )}
-
-      {pipelineJson && (
-        <div className="section">
-          <h3>Execute Pipeline</h3>
-          <button
-            className="btn btn-primary btn-large"
-            onClick={executePipeline}
-            disabled={execution?.status === 'running'}
-          >
-            {execution?.status === 'running' ? '⏳ Executing...' : '▶️ Execute Pipeline'}
-          </button>
-        </div>
-      )}
-
-      {execution && (
-        <div className="section">
-          <h3>Execution Status</h3>
-          <div className={`execution-status status-${execution.status}`}>
-            <div className="status-header">
-              <span className="status-badge">{execution.status.toUpperCase()}</span>
-              <span className="pipeline-id">{execution.id}</span>
-            </div>
-
-            {execution.status === 'success' && (
-              <div className="metrics">
-                <div className="metric">
-                  <span className="metric-label">Source Rows:</span>
-                  <span className="metric-value">{execution.sourceRowCount}</span>
-                </div>
-
-                {(execution as any).cdcInsertCount !== undefined ? (
-                  // CDC pipeline — show Insert / Update / Delete breakdown
-                  <>
-                    <div className="metric" style={{ borderLeft: '3px solid #28a745' }}>
-                      <span className="metric-label">Target Insert Rows:</span>
-                      <span className="metric-value" style={{ color: '#28a745', fontWeight: 700 }}>
-                        {(execution as any).cdcInsertCount}
-                      </span>
-                    </div>
-                    <div className="metric" style={{ borderLeft: '3px solid #fd7e14' }}>
-                      <span className="metric-label">Target Update Rows:</span>
-                      <span className="metric-value" style={{ color: '#fd7e14', fontWeight: 700 }}>
-                        {(execution as any).cdcUpdateCount}
-                      </span>
-                    </div>
-                    <div className="metric" style={{ borderLeft: '3px solid #dc3545' }}>
-                      <span className="metric-label">Target Delete Rows:</span>
-                      <span className="metric-value" style={{ color: '#dc3545', fontWeight: 700 }}>
-                        {(execution as any).cdcDeleteCount}
-                      </span>
-                    </div>
-                  </>
-                ) : (
-                  <div className="metric">
-                    <span className="metric-label">Target Rows:</span>
-                    <span className="metric-value">{execution.targetRowCount}</span>
-                  </div>
-                )}
-
-                <div className="metric">
-                  <span className="metric-label">Rejected Rows:</span>
-                  <span className="metric-value">{execution.rejectRowCount}</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">Duration:</span>
-                  <span className="metric-value">{execution.duration}s</span>
-                </div>
-              </div>
-            )}
-
-            {execution.error && (
-              <div className="error-message">
-                <strong>Error:</strong> {execution.error}
-              </div>
-            )}
-
-            <div className="logs">
-              <h4>Execution Logs</h4>
-              <div className="log-content">
-                {execution.logs?.map((log, index) => (
-                  <div key={index} className="log-line">{log}</div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-export default ExecutePipeline;
