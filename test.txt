@@ -394,21 +394,11 @@ const ExecutePipeline: React.FC<ExecutePipelineProps> = ({ config }) => {
         enable: true,
         capture_row_count: true,
         capture_duration: true,
-        path: (() => {
-          const p = (config.dataSource.target as any).path || '';
-          if (!p) return './audit';
-          const lastSep = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
-          return lastSep > 0 ? p.substring(0, lastSep) + '/audit' : './audit';
-        })()
+        path: './audit'
       },
       reject: {
         enable: true,
-        path: (() => {
-          const p = (config.dataSource.target as any).path || '';
-          if (!p) return './reject';
-          const lastSep = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
-          return lastSep > 0 ? p.substring(0, lastSep) + '/reject' : './reject';
-        })(),
+        path: './reject',
         include_reason: true
       },
       error_handling: {
