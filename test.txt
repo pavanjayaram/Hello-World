@@ -1,56 +1,143 @@
-def check_service(cfg):
-    name = cfg.get("name", "UNKNOWN")
-    ignore_if_down = cfg.get("ignore_if_down", True)
+import React, { useState } from 'react';
+import DataSourceConfigComponent from './components/DataSourceConfig';
+import TransformationBuilder from './components/TransformationBuilder';
+import ExecutePipeline from './components/ExecutePipeline';
+import CodeDisplay from './components/CodeDisplay';
+import { TransformationConfig, DataSourceConfig, FieldTransformation, RowTransformation } from './types';
+import './components/styles.css';
 
-    env_config = cfg.get("environments", {}).get(ENV)
+const App: React.FC = () => {
+  console.log('App component rendering at:', new Date().toISOString());
 
-    if not env_config:
-        return False, f"{name} -> No config for ENV {ENV}"
+  const [currentStep, setCurrentStep] = useState(1);
+  const [config, setConfig] = useState<TransformationConfig>({
+    dataSource: {
+      mode: 'file-to-file',
+      source: {
+        type: 'csv',
+        delimiter: ',',
+        path: ''
+      },
+      target: {
+        type: 'csv',
+        delimiter: ',',
+        path: ''
+      }
+    },
+    fieldTransforms: [],
+    rowTransforms: []
+  });
 
-    lb_url = env_config.get("lb_url")
-    nodes = env_config.get("nodes", [])
+  const [spec, setSpec] = useState<any>(null);
 
-    failures = []
-    success_msgs = []
+  const updateDataSource = (dataSource: DataSourceConfig) => {
+    setConfig(prev => ({ ...prev, dataSource }));
+  };
 
-    # =========================
-    # 1. CHECK LOAD BALANCER
-    # =========================
-    if lb_url:
-        status, msg = check_api({
-            "name": f"{name}_LB",
-            "url": lb_url,
-            "ignore_if_down": False
-        })
+  const updateFieldTransforms = (fieldTransforms: FieldTransformation[]) => {
+    console.log('App: updateFieldTransforms called with:', fieldTransforms.map(f => f.fieldName));
+    setConfig(prev => ({ ...prev, fieldTransforms }));
+  };
 
-        log(msg)
+  const updateRowTransforms = (rowTransforms: RowTransformation[]) => {
+    setConfig(prev => ({ ...prev, rowTransforms }));
+  };
 
-        if not status:
-            failures.append(msg)
-        else:
-            success_msgs.append(msg)
+  const steps = [
+    { id: 1, title: 'Data Source Configuration', component: 'datasource' },
+    { id: 2, title: 'Transformation Builder', component: 'transformations' },
+    { id: 3, title: 'Review & Execute Pipeline', component: 'execute' },
+    { id: 4, title: 'AI Code Generation', component: 'codedisplay' }
+  ];
 
-    # =========================
-    # 2. CHECK NODES
-    # =========================
-    for i, node_url in enumerate(nodes, start=1):
-        status, msg = check_api({
-            "name": f"{name}_NODE{i}",
-            "url": node_url,
-            "ignore_if_down": ignore_if_down
-        })
+  const renderCurrentStep = () => {
+    switch (currentStep) {
+      case 1:
+        return (
+          <DataSourceConfigComponent
+            config={config.dataSource}
+            onChange={updateDataSource}
+          />
+        );
+      case 2:
+        return (
+          <TransformationBuilder
+            config={config.dataSource}
+            fieldTransforms={config.fieldTransforms}
+            rowTransforms={config.rowTransforms}
+            onFieldTransformsChange={updateFieldTransforms}
+            onRowTransformsChange={updateRowTransforms}
+          />
+        );
+      case 3:
+        return <ExecutePipeline config={config} />;
+      case 4:
+        return (
+          <CodeDisplay
+            config={config}
+            spec={spec}
+            onSpecChange={setSpec}
+          />
+        );
+      default:
+        return <div>Unknown step</div>;
+    }
+  };
 
-        log(msg)
+  return (
+    <div className="app">
+      <header className="app-header">
+        <h1>Config-Driven PySpark ETL Engine</h1>
+        <p>Design your data pipeline and execute it with PySpark</p>
+      </header>
 
-        if not status:
-            failures.append(msg)
-        else:
-            success_msgs.append(msg)
+      <nav className="step-navigation">
+        <div className="steps">
+          {steps.map((step) => (
+            <button
+              key={step.id}
+              className={`step ${currentStep === step.id ? 'active' : ''} enabled`}
+              onClick={() => setCurrentStep(step.id)}
+            >
+              <span className="step-number">{step.id}</span>
+              <span className="step-title">{step.title}</span>
+            </button>
+          ))}
+        </div>
+      </nav>
 
-    # =========================
-    # FINAL RESULT
-    # =========================
-    if failures:
-        return False, "\n".join(failures)
+      <main className="app-content">
+        <div className="step-content">
+          <h2>{steps.find(s => s.id === currentStep)?.title}</h2>
+          {renderCurrentStep()}
+        </div>
 
-    return True, f"{name} -> ALL HEALTHY"
+        <div className="step-controls">
+          {currentStep > 1 && (
+            <button
+              className="btn btn-secondary"
+              onClick={() => setCurrentStep(currentStep - 1)}
+            >
+              Previous
+            </button>
+          )}
+
+          {currentStep < steps.length && (
+            <button
+              className="btn btn-primary"
+              onClick={() => setCurrentStep(currentStep + 1)}
+            >
+              Next
+            </button>
+          )}
+        </div>
+      </main>
+
+      <footer className="app-footer">
+        <p>Config-Driven PySpark ETL Engine - "Give me a JSON, I'll run your pipeline."</p>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
