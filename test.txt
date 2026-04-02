@@ -1,147 +1,243 @@
-// Type definitions for the data transformation system
+#!/usr/bin/env python3
+"""
+Standalone PySpark ETL Pipeline Runner
+======================================
+Production-grade CLI entry point for running ETL pipelines without the Flask/React stack.
+Designed for Autosys job scheduling and batch execution.
 
-export interface DataSourceConfig {
-  mode: 'file-to-file' | 'file-to-db' | 'db-to-db' | 'db-to-file';
-  source: FileSource | DatabaseSource;
-  target: FileTarget | DatabaseTarget;
-  errorHandling?: {
-    mode: 'reject_and_continue' | 'reject_and_fail';
-  };
-}
+Usage:
+    python run_pipeline.py --config <config.json> [--params <parameterfile.txt>] [--env-file <.env>] [--log-dir <path>]
 
-export interface FileSource {
-  type: 'csv' | 'dat' | 'txt' | 'excel';
-  delimiter?: string;
-  path: string;
-}
+Exit Codes:
+    0 = Pipeline completed successfully
+    1 = Pipeline execution failed (runtime error)
+    2 = Bad arguments, missing files, or invalid configuration
+"""
 
-export interface DatabaseSource {
-  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
-  connectionString: string;
-  schema: string;
-  table: string;
-  partitionColumn?: string;
-  lowerBound?: string;
-  upperBound?: string;
-  numPartitions?: string;
-  fetchsize?: string;
-}
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime
 
-export interface FileTarget {
-  type: 'csv' | 'dat' | 'txt' | 'excel';
-  delimiter?: string;
-  path: string;
-}
 
-export interface DatabaseTarget {
-  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
-  connectionString: string;
-  schema: string;
-  table: string;
-  batchsize?: string;
-  isolationLevel?: string;
-  primaryKey?: string;
-  writeMode?: 'append' | 'truncate_and_load';
-  chunkedLoad?: boolean;
-  numChunks?: number;
-  businessKeys?: string;
-}
+# ---------------------------------------------------------------------------
+# Resolve the backend directory so we can import etl_engine and siblings
+# ---------------------------------------------------------------------------
+STANDALONE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(STANDALONE_DIR)
+BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
 
-export interface FieldTransformation {
-  fieldName: string;
-  targetField?: string;
-  transformations: Transform[];
-}
+# Add backend to sys.path so etl_engine.py and its siblings can be imported
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
 
-export interface Transform {
-  type: 'add' | 'upper' | 'lower' | 'trim' | 'ltrim' | 'rtrim' | 'substring' | 'concat' | 'replace' | 'pad' |
-  'cast' | 'to_date' | 'to_timestamp' | 'to_number' | 'format' |
-  'if_then_else' | 'case_when' | 'coalesce' | 'nvl' |
-  'lookup' | 'cdc' |
-  'round' | 'ceil' | 'floor' | 'abs' | 'arithmetic' |
-  'sum' | 'avg' | 'min' | 'max' | 'count' | 'group_by' |
-  'deduplication' | 'validation' | 'masking' | 'data_masking' | 'data_unmasking' |
-  'literal' | 'row_number' | 'sequence' | 'current_date';
-  params: Record<string, any>;
-}
 
-export interface RowTransformation {
-  type: 'distinct' | 'filter' | 'sort' | 'sample' | 'union' | 'intersect' | 'except' | 'pivot' | 'unpivot' | 'lookup' | 'cdc_compare';
-  params: Record<string, any>;
-}
+# ---------------------------------------------------------------------------
+# Exit Code Constants
+# ---------------------------------------------------------------------------
+EXIT_SUCCESS = 0
+EXIT_PIPELINE_FAILURE = 1
+EXIT_BAD_ARGS = 2
 
-export interface LLMConfig {
-  provider: 'ollama' | 'gemini';
-  model: string;
-  apiKey?: string;
-}
 
-export interface TransformationConfig {
-  dataSource: DataSourceConfig;
-  fieldTransforms: FieldTransformation[];
-  rowTransforms: RowTransformation[];
-  llmConfig?: LLMConfig;
-}
+def setup_logging(log_dir=None, pipeline_id="pipeline"):
+    """
+    Configure logging to both console (stdout) and an optional log file.
+    Autosys captures stdout/stderr, so console logging is always enabled.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_format = "%(asctime)s - %(levelname)s - %(message)s"
 
-export interface ValidationResult {
-  valid: boolean;
-  errors: string[];
-  warnings: string[];
-}
+    handlers = [logging.StreamHandler(sys.stdout)]
 
-export interface TransformationSpec {
-  version: string;
-  created_at: string;
-  source: SourceSpec;
-  target: TargetSpec;
-  field_transforms: FieldTransformSpec[];
-  row_transforms: RowTransformSpec[];
-  metadata: Record<string, any>;
-}
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"pipeline_{pipeline_id}_{timestamp}.log")
+        handlers.append(logging.FileHandler(log_file, mode="w"))
+        print(f"[Standalone] Log file: {log_file}")
 
-export interface SourceSpec {
-  type: 'file' | 'database';
-  file_type?: string;
-  database_type?: string;
-  connection?: Record<string, any>;
-  path?: string;
-  delimiter?: string;
-}
+    # Reset root logger
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    for h in handlers:
+        h.setFormatter(logging.Formatter(log_format))
+        root.addHandler(h)
 
-export interface TargetSpec {
-  type: 'file' | 'database';
-  file_type?: string;
-  database_type?: string;
-  connection?: Record<string, any>;
-  path?: string;
-  delimiter?: string;
-}
 
-export interface FieldTransformSpec {
-  field: string;
-  transforms: TransformSpec[];
-}
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="PySpark ETL Pipeline Runner — Standalone mode for Autosys jobs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic run with config only
+  python run_pipeline.py --config /path/to/pipeline.json
 
-export interface RowTransformSpec {
-  type: string;
-  params: Record<string, any>;
-}
+  # Full run with all options
+  python run_pipeline.py \\
+      --config  /path/to/pipeline.json \\
+      --params  /path/to/parameterfile.txt \\
+      --env-file /path/to/.env \\
+      --log-dir /path/to/logs
 
-export interface TransformSpec {
-  type: string;
-  params: Record<string, any>;
-}
+Autosys JIL Example:
+  insert_job: ETL_DAILY_LOAD
+  job_type: CMD
+  command: /opt/etl/standalone/run_pipeline.sh --config /opt/etl/configs/daily_load.json --params /opt/etl/parameterfile.txt
+  machine: etl-server-01
+  owner: etl_user
+  date_conditions: 1
+  days_of_week: mo,tu,we,th,fr
+  start_times: "06:00"
+        """
+    )
+    parser.add_argument(
+        "--config", "-c",
+        required=True,
+        help="Path to the JSON pipeline configuration file (required)"
+    )
+    parser.add_argument(
+        "--params", "-p",
+        default=None,
+        help="Path to parameterfile.txt for environment-specific overrides (optional)"
+    )
+    parser.add_argument(
+        "--env-file", "-e",
+        default=None,
+        help="Path to .env file containing database credentials (optional, defaults to project_root/.env)"
+    )
+    parser.add_argument(
+        "--log-dir", "-l",
+        default=None,
+        help="Directory to write execution log files (optional, defaults to stdout only)"
+    )
+    parser.add_argument(
+        "--run-mode", "-m",
+        default=None,
+        choices=["FULL", "RETRY_FAILED"],
+        help="Execution mode: FULL (default) or RETRY_FAILED (reprocess only failed chunks)"
+    )
+    parser.add_argument(
+        "--retry-job-run-id",
+        default=None,
+        help="Specific job_run_id to retry (optional, defaults to latest failed run)"
+    )
+    return parser.parse_args()
 
-export interface CodeGenerationTask {
-  task_id: string;
-  status: string;
-  created_at: string;
-}
 
-export interface CodeGenerationStatus {
-  task_id: string;
-  status: string;
-  progress: number;
-  code?: string;
-  error?: string;
-}
+def validate_inputs(args):
+    """
+    Validate that input files exist and the JSON config is structurally valid.
+    Returns (config_dict, errors_list).
+    """
+    errors = []
+
+    # Check config file exists
+    if not os.path.isfile(args.config):
+        errors.append(f"Config file not found: {args.config}")
+        return None, errors
+
+    # Check params file exists (if provided)
+    if args.params and not os.path.isfile(args.params):
+        errors.append(f"Parameter file not found: {args.params}")
+
+    # Check env file exists (if provided)
+    if args.env_file and not os.path.isfile(args.env_file):
+        errors.append(f"Env file not found: {args.env_file}")
+
+    # Try to parse and validate JSON
+    try:
+        with open(args.config, "r") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        errors.append(f"Invalid JSON in config file: {e}")
+        return None, errors
+    except Exception as e:
+        errors.append(f"Failed to read config file: {e}")
+        return None, errors
+
+    # Structural validation via etl_engine
+    from etl_engine import PySparkETLEngine
+    struct_errors = PySparkETLEngine.validate_config(config)
+    errors.extend(struct_errors)
+
+    return config, errors
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+
+    # --- Pre-flight Validation ---
+    config, errors = validate_inputs(args)
+    if errors:
+        # Print errors to stderr so Autosys captures them
+        for err in errors:
+            print(f"[VALIDATION ERROR] {err}", file=sys.stderr)
+        sys.exit(EXIT_BAD_ARGS)
+
+    # Extract pipeline ID for logging
+    pipeline_id = config.get("pipeline", {}).get("pipeline_id", "unknown")
+
+    # --- Setup Logging ---
+    setup_logging(log_dir=args.log_dir, pipeline_id=pipeline_id)
+
+    logger = logging.getLogger(__name__)
+    logger.info("=" * 70)
+    logger.info(f"  STANDALONE PIPELINE EXECUTION")
+    logger.info(f"  Pipeline ID : {pipeline_id}")
+    logger.info(f"  Config File : {args.config}")
+    logger.info(f"  Params File : {args.params or '(none)'}")
+    logger.info(f"  Env File    : {args.env_file or '(auto-detect)'}")
+    logger.info(f"  Log Dir     : {args.log_dir or '(stdout only)'}")
+    logger.info(f"  Timestamp   : {datetime.now().isoformat()}")
+    logger.info("=" * 70)
+
+    # --- Execute Pipeline ---
+    try:
+        from etl_engine import PySparkETLEngine
+
+        engine = PySparkETLEngine(
+            config_path=args.config,
+            param_path=args.params,
+            env_path=args.env_file
+        )
+
+        # Override run_mode in config if provided via CLI
+        if args.run_mode:
+            if 'pipeline' not in engine.config:
+                engine.config['pipeline'] = {}
+            engine.config['pipeline']['run_mode'] = args.run_mode
+            logger.info(f"  Run Mode overridden via CLI: {args.run_mode}")
+
+        # Override retry_job_run_id if provided via CLI
+        if args.retry_job_run_id:
+            if 'chunked_load' not in engine.config:
+                engine.config['chunked_load'] = {}
+            engine.config['chunked_load']['retry_job_run_id'] = args.retry_job_run_id
+            logger.info(f"  Retry Job Run ID: {args.retry_job_run_id}")
+
+        engine.run_pipeline()
+
+        logger.info("=" * 70)
+        logger.info("  PIPELINE COMPLETED SUCCESSFULLY")
+        logger.info("=" * 70)
+        sys.exit(EXIT_SUCCESS)
+
+    except Exception as e:
+        logger.error("=" * 70)
+        logger.error(f"  PIPELINE FAILED: {str(e)}")
+        logger.error("=" * 70)
+        # Log full traceback for debugging
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(EXIT_PIPELINE_FAILURE)
+
+
+if __name__ == "__main__":
+    main()
