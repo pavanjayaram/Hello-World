@@ -1,243 +1,190 @@
-#!/usr/bin/env python3
-"""
-Standalone PySpark ETL Pipeline Runner
-======================================
-Production-grade CLI entry point for running ETL pipelines without the Flask/React stack.
-Designed for Autosys job scheduling and batch execution.
-
-Usage:
-    python run_pipeline.py --config <config.json> [--params <parameterfile.txt>] [--env-file <.env>] [--log-dir <path>]
-
-Exit Codes:
-    0 = Pipeline completed successfully
-    1 = Pipeline execution failed (runtime error)
-    2 = Bad arguments, missing files, or invalid configuration
-"""
-
-import argparse
 import json
+import sys
 import logging
 import os
-import sys
-from datetime import datetime
+from file_to_file_etl import FileToFileETL
+from dotenv import load_dotenv
 
+# Setup global logging configuration to write to Console so app.py can capture it
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
-# ---------------------------------------------------------------------------
-# Resolve the backend directory so we can import etl_engine and siblings
-# ---------------------------------------------------------------------------
-STANDALONE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(STANDALONE_DIR)
-BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
-
-# Add backend to sys.path so etl_engine.py and its siblings can be imported
-if BACKEND_DIR not in sys.path:
-    sys.path.insert(0, BACKEND_DIR)
-
-
-# ---------------------------------------------------------------------------
-# Exit Code Constants
-# ---------------------------------------------------------------------------
-EXIT_SUCCESS = 0
-EXIT_PIPELINE_FAILURE = 1
-EXIT_BAD_ARGS = 2
-
-
-def setup_logging(log_dir=None, pipeline_id="pipeline"):
-    """
-    Configure logging to both console (stdout) and an optional log file.
-    Autosys captures stdout/stderr, so console logging is always enabled.
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_format = "%(asctime)s - %(levelname)s - %(message)s"
-
-    handlers = [logging.StreamHandler(sys.stdout)]
-
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"pipeline_{pipeline_id}_{timestamp}.log")
-        handlers.append(logging.FileHandler(log_file, mode="w"))
-        print(f"[Standalone] Log file: {log_file}")
-
-    # Reset root logger
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    for h in root.handlers[:]:
-        root.removeHandler(h)
-    for h in handlers:
-        h.setFormatter(logging.Formatter(log_format))
-        root.addHandler(h)
-
-
-def parse_args():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="PySpark ETL Pipeline Runner — Standalone mode for Autosys jobs",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic run with config only
-  python run_pipeline.py --config /path/to/pipeline.json
-
-  # Full run with all options
-  python run_pipeline.py \\
-      --config  /path/to/pipeline.json \\
-      --params  /path/to/parameterfile.txt \\
-      --env-file /path/to/.env \\
-      --log-dir /path/to/logs
-
-Autosys JIL Example:
-  insert_job: ETL_DAILY_LOAD
-  job_type: CMD
-  command: /opt/etl/standalone/run_pipeline.sh --config /opt/etl/configs/daily_load.json --params /opt/etl/parameterfile.txt
-  machine: etl-server-01
-  owner: etl_user
-  date_conditions: 1
-  days_of_week: mo,tu,we,th,fr
-  start_times: "06:00"
+class PySparkETLEngine:
+    
+    @staticmethod
+    def validate_config(config):
         """
-    )
-    parser.add_argument(
-        "--config", "-c",
-        required=True,
-        help="Path to the JSON pipeline configuration file (required)"
-    )
-    parser.add_argument(
-        "--params", "-p",
-        default=None,
-        help="Path to parameterfile.txt for environment-specific overrides (optional)"
-    )
-    parser.add_argument(
-        "--env-file", "-e",
-        default=None,
-        help="Path to .env file containing database credentials (optional, defaults to project_root/.env)"
-    )
-    parser.add_argument(
-        "--log-dir", "-l",
-        default=None,
-        help="Directory to write execution log files (optional, defaults to stdout only)"
-    )
-    parser.add_argument(
-        "--run-mode", "-m",
-        default=None,
-        choices=["FULL", "RETRY_FAILED"],
-        help="Execution mode: FULL (default) or RETRY_FAILED (reprocess only failed chunks)"
-    )
-    parser.add_argument(
-        "--retry-job-run-id",
-        default=None,
-        help="Specific job_run_id to retry (optional, defaults to latest failed run)"
-    )
-    return parser.parse_args()
-
-
-def validate_inputs(args):
-    """
-    Validate that input files exist and the JSON config is structurally valid.
-    Returns (config_dict, errors_list).
-    """
-    errors = []
-
-    # Check config file exists
-    if not os.path.isfile(args.config):
-        errors.append(f"Config file not found: {args.config}")
-        return None, errors
-
-    # Check params file exists (if provided)
-    if args.params and not os.path.isfile(args.params):
-        errors.append(f"Parameter file not found: {args.params}")
-
-    # Check env file exists (if provided)
-    if args.env_file and not os.path.isfile(args.env_file):
-        errors.append(f"Env file not found: {args.env_file}")
-
-    # Try to parse and validate JSON
-    try:
-        with open(args.config, "r") as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
-        errors.append(f"Invalid JSON in config file: {e}")
-        return None, errors
-    except Exception as e:
-        errors.append(f"Failed to read config file: {e}")
-        return None, errors
-
-    # Structural validation via etl_engine
-    from etl_engine import PySparkETLEngine
-    struct_errors = PySparkETLEngine.validate_config(config)
-    errors.extend(struct_errors)
-
-    return config, errors
-
-
-def main():
-    """Main entry point."""
-    args = parse_args()
-
-    # --- Pre-flight Validation ---
-    config, errors = validate_inputs(args)
-    if errors:
-        # Print errors to stderr so Autosys captures them
-        for err in errors:
-            print(f"[VALIDATION ERROR] {err}", file=sys.stderr)
-        sys.exit(EXIT_BAD_ARGS)
-
-    # Extract pipeline ID for logging
-    pipeline_id = config.get("pipeline", {}).get("pipeline_id", "unknown")
-
-    # --- Setup Logging ---
-    setup_logging(log_dir=args.log_dir, pipeline_id=pipeline_id)
-
-    logger = logging.getLogger(__name__)
-    logger.info("=" * 70)
-    logger.info(f"  STANDALONE PIPELINE EXECUTION")
-    logger.info(f"  Pipeline ID : {pipeline_id}")
-    logger.info(f"  Config File : {args.config}")
-    logger.info(f"  Params File : {args.params or '(none)'}")
-    logger.info(f"  Env File    : {args.env_file or '(auto-detect)'}")
-    logger.info(f"  Log Dir     : {args.log_dir or '(stdout only)'}")
-    logger.info(f"  Timestamp   : {datetime.now().isoformat()}")
-    logger.info("=" * 70)
-
-    # --- Execute Pipeline ---
-    try:
-        from etl_engine import PySparkETLEngine
-
-        engine = PySparkETLEngine(
-            config_path=args.config,
-            param_path=args.params,
-            env_path=args.env_file
-        )
-
-        # Override run_mode in config if provided via CLI
-        if args.run_mode:
-            if 'pipeline' not in engine.config:
-                engine.config['pipeline'] = {}
-            engine.config['pipeline']['run_mode'] = args.run_mode
-            logger.info(f"  Run Mode overridden via CLI: {args.run_mode}")
-
-        # Override retry_job_run_id if provided via CLI
-        if args.retry_job_run_id:
-            if 'chunked_load' not in engine.config:
-                engine.config['chunked_load'] = {}
-            engine.config['chunked_load']['retry_job_run_id'] = args.retry_job_run_id
-            logger.info(f"  Retry Job Run ID: {args.retry_job_run_id}")
-
-        engine.run_pipeline()
-
-        logger.info("=" * 70)
-        logger.info("  PIPELINE COMPLETED SUCCESSFULLY")
-        logger.info("=" * 70)
-        sys.exit(EXIT_SUCCESS)
-
-    except Exception as e:
-        logger.error("=" * 70)
-        logger.error(f"  PIPELINE FAILED: {str(e)}")
-        logger.error("=" * 70)
-        # Log full traceback for debugging
-        import traceback
-        logger.error(traceback.format_exc())
-        sys.exit(EXIT_PIPELINE_FAILURE)
-
-
+        Validates the structure of a JSON configuration dict.
+        Returns a list of error strings. Empty list means valid.
+        """
+        errors = []
+        if not isinstance(config, dict):
+            return ["Configuration must be a JSON object"]
+            
+        if 'pipeline' not in config:
+            errors.append("Missing required 'pipeline' block")
+        elif 'pipeline_type' not in config.get('pipeline', {}):
+            errors.append("Missing 'pipeline_type' in pipeline block")
+            
+        if 'source' not in config:
+            errors.append("Missing required 'source' block")
+            
+        if 'target' not in config:
+            errors.append("Missing required 'target' block")
+            
+        return errors
+    
+    def __init__(self, config_path, param_path=None, env_path=None):
+        """
+        Initializes the ETL Engine by loading the configuration.
+        This serves as the main Factory that routes to the correct pipeline based on config.
+        
+        Args:
+            config_path: Path to the JSON configuration file.
+            param_path:  Optional path to parameterfile.txt for environment-specific overrides.
+            env_path:    Optional explicit path to .env file. If not provided, falls back to
+                         project_root/.env (relative to backend/ directory).
+        """
+        self.config_path = config_path
+        self.param_path = param_path
+        
+        # Ensure env vars are loaded so PySpark can read credentials automatically
+        if env_path and os.path.exists(env_path):
+            load_dotenv(env_path)
+            logging.info(f"[Engine] Loaded environment from: {env_path}")
+        else:
+            backend_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(backend_dir)
+            default_env = os.path.join(project_root, '.env')
+            if os.path.exists(default_env):
+                load_dotenv(default_env)
+                logging.info(f"[Engine] Loaded environment from default: {default_env}")
+        
+        self.config = self._load_config()
+        self._inject_parameters()
+        
+    def _inject_parameters(self):
+        """Reads parameterfile.txt and injects values into the config dict dynamically."""
+        if not self.param_path:
+            return
+            
+        logging.info(f"[Engine] Loading parameters from: {self.param_path}")
+        params = {}
+        try:
+            with open(self.param_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, val = line.split('=', 1)
+                        params[key.strip()] = val.strip()
+            
+            # Inject Audit Path if available in parameters
+            if 'AUDIT_PATH' in params:
+                if 'audit' not in self.config:
+                    self.config['audit'] = {}
+                self.config['audit']['path'] = params['AUDIT_PATH']
+                logging.info(f"[Engine] Injected AUDIT_PATH: {params['AUDIT_PATH']}")
+                
+            # Inject Reject Path if available in parameters
+            if 'REJECT_PATH' in params:
+                if 'reject' not in self.config:
+                    self.config['reject'] = {}
+                self.config['reject']['path'] = params['REJECT_PATH']
+                self.config['reject']['enable'] = True
+                logging.info(f"[Engine] Injected REJECT_PATH: {params['REJECT_PATH']} and enabled Reject Handler")
+                
+            # Inject Global JDBC JARs if available in parameters
+            if 'SPARK_JARS' in params:
+                if 'pipeline' not in self.config:
+                    self.config['pipeline'] = {}
+                # The jars parameter expects an array. We split the string by comma.
+                jar_list = [j.strip() for j in params['SPARK_JARS'].split(',')]
+                self.config['pipeline']['jars'] = jar_list
+                logging.info(f"[Engine] Injected Global SPARK_JARS: {jar_list}")
+        except Exception as e:
+            logging.warning(f"[Engine] WARNING: Failed to read parameter file {self.param_path}: {e}")
+        
+    def _load_config(self):
+        """Loads the JSON configuration file."""
+        logging.info(f"[Engine] Loading configuration from: {self.config_path}")
+        with open(self.config_path, 'r') as f:
+            return json.load(f)
+            
+    def run_pipeline(self):
+        """
+        The Factory Method: Reads the pipeline_type from JSON and invokes the respective ETL class.
+        """
+        pipeline_type = self.config.get("pipeline", {}).get("pipeline_type")
+        pipeline_id = self.config.get("pipeline", {}).get("pipeline_id", "Unknown_Pipeline")
+        
+        logging.info(f"[Engine] Starting Pipeline ID: {pipeline_id}")
+        logging.info(f"[Engine] Identified Pipeline Type: {pipeline_type}")
+        
+        if pipeline_type == "FILE_TO_FILE":
+            from file_to_file_etl import FileToFileETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to FILE_TO_FILE ETL process...")
+            etl_process = FileToFileETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "FILE_TO_DB":
+            from file_to_db_etl import FileToDBETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to FILE_TO_DB ETL process...")
+            etl_process = FileToDBETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "DB_TO_FILE":
+            from db_to_file_etl import DBToFileETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to DB_TO_FILE ETL process...")
+            etl_process = DBToFileETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "DB_TO_DB":
+            from db_to_db_etl import DBToDBETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to DB_TO_DB ETL process...")
+            etl_process = DBToDBETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        else:
+            raise ValueError(f"Unsupported pipeline_type: {pipeline_type}")
+            
 if __name__ == "__main__":
-    main()
+    # Usage: python etl_engine.py <config.json> [parameterfile.txt]
+    if len(sys.argv) < 2:
+        print("ERROR: Config file path is required.", file=sys.stderr)
+        print("Usage: python etl_engine.py <config.json> [parameterfile.txt]", file=sys.stderr)
+        sys.exit(2)
+    
+    config_file = sys.argv[1]
+    param_file = sys.argv[2] if len(sys.argv) > 2 else None
+        
+    engine = PySparkETLEngine(config_file, param_file)
+    engine.run_pipeline()
