@@ -29,24 +29,9 @@ class FileToFileETL:
         app_name = self.config.get("pipeline", {}).get("pipeline_id", "Dynamic_ETL")
         logging.info(f"Initializing SparkSession: {app_name}")
         
-        builder = SparkSession.builder.appName(app_name)
-        
-        # Look for custom JARs (like excel reader or DB drivers)
-        jars = self.config.get("pipeline", {}).get("jars", [])
-        if jars:
-            # Filter out JARs that don't exist on this machine
-            valid_jars = []
-            for j in jars:
-                if os.path.exists(j):
-                    valid_jars.append(j)
-                else:
-                    logging.warning(f"JAR not found, skipping: {j}")
-            
-            if valid_jars:
-                builder = builder.config("spark.jars", ",".join(valid_jars))
-                builder = builder.config("spark.driver.extraClassPath", os.pathsep.join(valid_jars))
-            
-        spark = builder.getOrCreate()
+        # JARs are configured via PYSPARK_SUBMIT_ARGS in etl_engine.py
+        # before PySpark is imported — no need to set them here.
+        spark = SparkSession.builder.appName(app_name).getOrCreate()
             
         log_level = self.config.get("pipeline", {}).get("log_level", "WARN")
         spark.sparkContext.setLogLevel(log_level)
