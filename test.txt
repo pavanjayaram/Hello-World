@@ -176,14 +176,18 @@ class LookupTransformationHandler(TransformationHandler):
                         sconf = {'type': stype, 'path': path, 'table': config.get('table') or path, 'schema': config.get('schema'), 'db_type': config.get('db_type'), 'connectionString': config.get('connection_string'), 'format': config.get('file_format', 'csv'), 'options': config.get('options', {})}
                         lookup_df = SourceFactory.get_handler(stype).read(df.sparkSession, sconf)
                         DataFrameRegistry.register(lookup_table, lookup_df)
-                    else: raise ValueError()
+                    else: raise ValueError(f"No source_type or path defined for lookup: {lookup_table}")
                 max_val = lookup_df.agg(F.max(scol)).collect()[0][0]
                 start_val = max_val if max_val is not None else 0
-            except:
+                logging.info(f"[Surrogate Key] MAX({scol}) from {lookup_table} = {max_val} → next value = {start_val + 1}")
+            except Exception as e:
+                logging.warning(f"[Surrogate Key] Failed to read MAX({scol}) from {lookup_table}: {e}. Defaulting to 1.")
                 start_val = 0
             
             is_batch = any(x in tcol.upper() for x in ['LOAD_ID', 'BATCH_ID', 'JOB_ID'])
-            if is_batch: return df.withColumn(tcol, F.lit(start_val + 1))
+            if is_batch:
+                logging.info(f"[Surrogate Key] Batch mode: setting {tcol} = {start_val + 1} for all rows")
+                return df.withColumn(tcol, F.lit(start_val + 1))
             else:
                 from pyspark.sql import Window
                 w = Window.orderBy(F.monotonically_increasing_id())
@@ -329,6 +333,12 @@ class CDCTransformationHandler(TransformationHandler):
         if not s_cc:
             common = [c for c in set(df.columns).intersection(set(target_df.columns)) if c not in s_kc and c not in t_kc and c not in ec]
             s_cc = sorted(common); t_cc = sorted(common)
+        
+        logging.info(f"[CDC] Key columns: source={s_kc}, target={t_kc}")
+        logging.info(f"[CDC] Checksum columns: source={s_cc}")
+        logging.info(f"[CDC]                   target={t_cc}")
+        logging.info(f"[CDC] Excluded from compare: {ec}")
+        logging.info(f"[CDC] Row-level checksum = MD5( {'||'.join(s_cc)} ) — compared via EMP_ID join")
 
         # 3. Schema Prep for Normalization
         def get_field_type(schema, name):
