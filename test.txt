@@ -151,12 +151,29 @@ class ChunkProcessor:
         self.spark = spark
 
         chunked_config = config.get("chunked_load", {})
-        self.num_chunks = chunked_config.get("num_chunks", 5)
+        requested_chunks = chunked_config.get("num_chunks", 5)
         self.business_keys = chunked_config.get("business_keys", [])
         self.metadata_path = chunked_config.get("metadata_path", "./audit/chunks")
 
         pipeline = config.get("pipeline", {})
         self.pipeline_id = pipeline.get("pipeline_id", "unknown")
+
+        # --- Core-Aware Auto-Tuning ---
+        # Detect available parallelism (cores) and cap chunks accordingly.
+        # On local mode (typical for Windows), Spark uses CPU cores as executors.
+        # Requesting more chunks than cores creates unnecessary shuffle overhead
+        # and memory pressure, which can cause stage materialization failures.
+        available_cores = spark.sparkContext.defaultParallelism
+        if requested_chunks > available_cores:
+            self.num_chunks = max(1, available_cores)
+            logging.warning(
+                f"[ChunkProcessor] Auto-tuned num_chunks from {requested_chunks} → {self.num_chunks} "
+                f"(available cores/parallelism: {available_cores}). "
+                f"Requesting more chunks than cores causes unnecessary shuffle overhead."
+            )
+        else:
+            self.num_chunks = requested_chunks
+        logging.info(f"[ChunkProcessor] Using {self.num_chunks} chunks (cores: {available_cores}, requested: {requested_chunks})")
 
         # Generate a unique job_run_id per execution
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
