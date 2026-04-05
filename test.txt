@@ -1,411 +1,229 @@
-"""
-Chunk-Based Parallel Processing with Metadata Tracking and Retry
-=================================================================
-Provides chunked loading for APPEND mode DB targets. Splits a DataFrame into
-N partitions, writes each independently with per-chunk status tracking, and
-supports retrying only failed chunks on subsequent runs.
+# ============================================================
+# CRITICAL: Configure PySpark environment *before* importing PySpark.
+# Once PySpark is imported the JVM process arguments are fixed.
+# ============================================================
+import os as _pre_os
+import sys as _pre_sys
 
-Usage:
-    processor = ChunkProcessor(config, spark)
-    processor.process_all_chunks(df)       # FULL run
-    processor.retry_failed_chunks(df)      # RETRY_FAILED run
-"""
+def _configure_pyspark_env():
+    """Configure JVM args and Windows workarounds before PySpark import."""
+    
+    # --- Java 17+ compatibility: open required JVM modules ---
+    _pre_os.environ.setdefault('JAVA_TOOL_OPTIONS', (
+        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
+        "--add-opens=java.base/java.lang=ALL-UNNAMED "
+        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
+        "--add-opens=java.base/java.io=ALL-UNNAMED "
+        "--add-opens=java.base/java.util=ALL-UNNAMED "
+        "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED "
+        "--add-exports=java.base/javax.security.auth=ALL-UNNAMED"
+    ))
+    
+    # --- Bypass Kerberos/LDAP Subject.getSubject() on Java 21+ ---
+    _pre_os.environ['HADOOP_USER_NAME'] = 'spark'
+    
+    # --- CRITICAL: Set driver memory BEFORE JVM starts ---
+    # spark.driver.memory set via .config() is SILENTLY IGNORED when running
+    # via `python` directly because the JVM has already launched with default 1GB.
+    # PYSPARK_SUBMIT_ARGS is the only way to control JVM memory at launch time
+    # when NOT using spark-submit.
+    _pre_os.environ.setdefault('PYSPARK_SUBMIT_ARGS', (
+        '--driver-memory 4g '
+        '--executor-memory 2g '
+        '--conf spark.sql.shuffle.partitions=10 '
+        'pyspark-shell'
+    ))
+
+_configure_pyspark_env()
+# ============================================================
 
 import json
-import os
+import sys
 import logging
-from datetime import datetime
-from typing import Dict, List, Optional
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import spark_partition_id
+import os
+from file_to_file_etl import FileToFileETL
+from dotenv import load_dotenv
 
+# Setup global logging configuration to write to Console so app.py can capture it
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
-# ---------------------------------------------------------------------------
-# Chunk Metadata Store (JSON file-based)
-# ---------------------------------------------------------------------------
-class ChunkMetadataStore:
-    """Manages per-chunk metadata in a JSON file on disk."""
-
-    def __init__(self, metadata_path: str, pipeline_id: str, job_run_id: str):
-        self.metadata_path = metadata_path
-        self.pipeline_id = pipeline_id
-        self.job_run_id = job_run_id
-        self.metadata_file = os.path.join(
-            metadata_path,
-            f"chunk_metadata_{pipeline_id}_{job_run_id}.json"
-        )
-        self.data: Dict = {}
-
-    def initialize(self, total_chunks: int, record_counts: Dict[int, int]):
-        """Create initial metadata with all chunks in PENDING state."""
-        os.makedirs(self.metadata_path, exist_ok=True)
-
-        self.data = {
-            "job_run_id": self.job_run_id,
-            "pipeline_id": self.pipeline_id,
-            "total_chunks": total_chunks,
-            "status": "RUNNING",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "chunks": []
-        }
-
-        for chunk_id in range(total_chunks):
-            self.data["chunks"].append({
-                "chunk_id": chunk_id,
-                "status": "PENDING",
-                "record_count": record_counts.get(chunk_id, 0),
-                "start_time": None,
-                "end_time": None,
-                "error_message": None
-            })
-
-        self._save()
-        logging.info(f"[ChunkMeta] Initialized metadata for {total_chunks} chunks at {self.metadata_file}")
-
-    def load_existing(self) -> bool:
-        """Load an existing metadata file for retry. Returns True if found."""
-        if not os.path.exists(self.metadata_file):
-            return False
-        try:
-            with open(self.metadata_file, 'r') as f:
-                self.data = json.load(f)
-            logging.info(f"[ChunkMeta] Loaded existing metadata from {self.metadata_file}")
-            return True
-        except Exception as e:
-            logging.error(f"[ChunkMeta] Failed to load metadata: {e}")
-            return False
-
-    def update_chunk_status(self, chunk_id: int, status: str, error_message: str = None):
-        """Update a single chunk's status and timestamps."""
-        chunk = self.data["chunks"][chunk_id]
-        chunk["status"] = status
-
-        if status == "RUNNING":
-            chunk["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            chunk["end_time"] = None
-            chunk["error_message"] = None
-        elif status in ("SUCCESS", "FAILED"):
-            chunk["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if error_message:
-                chunk["error_message"] = error_message
-
-        # Update overall status
-        statuses = [c["status"] for c in self.data["chunks"]]
-        if all(s == "SUCCESS" for s in statuses):
-            self.data["status"] = "SUCCESS"
-        elif any(s == "FAILED" for s in statuses):
-            if any(s in ("PENDING", "RUNNING") for s in statuses):
-                self.data["status"] = "RUNNING"
-            else:
-                self.data["status"] = "PARTIAL_FAILURE"
-        elif all(s == "PENDING" for s in statuses):
-            self.data["status"] = "PENDING"
-        else:
-            self.data["status"] = "RUNNING"
-
-        self._save()
-
-    def get_failed_chunk_ids(self) -> List[int]:
-        """Return list of chunk IDs that have FAILED status."""
-        return [c["chunk_id"] for c in self.data.get("chunks", []) if c["status"] == "FAILED"]
-
-    def get_pending_chunk_ids(self) -> List[int]:
-        """Return list of chunk IDs that have PENDING status."""
-        return [c["chunk_id"] for c in self.data.get("chunks", []) if c["status"] == "PENDING"]
-
-    def get_summary(self) -> Dict:
-        """Return a summary of chunk statuses."""
-        if not self.data:
-            return {}
-        statuses = [c["status"] for c in self.data.get("chunks", [])]
-        return {
-            "job_run_id": self.data.get("job_run_id"),
-            "total_chunks": self.data.get("total_chunks", 0),
-            "overall_status": self.data.get("status"),
-            "success": statuses.count("SUCCESS"),
-            "failed": statuses.count("FAILED"),
-            "pending": statuses.count("PENDING"),
-            "running": statuses.count("RUNNING")
-        }
-
-    def _save(self):
-        """Persist metadata to disk."""
-        try:
-            with open(self.metadata_file, 'w') as f:
-                json.dump(self.data, f, indent=2)
-        except Exception as e:
-            logging.error(f"[ChunkMeta] Failed to save metadata: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Chunk Processor — orchestrates chunked loading
-# ---------------------------------------------------------------------------
-class ChunkProcessor:
-    """
-    Splits a DataFrame into N chunks and writes each independently to a DB target,
-    tracking per-chunk status in a metadata file. Supports retry of failed chunks.
-    """
-
-    def __init__(self, config: Dict, spark: SparkSession):
-        self.config = config
-        self.spark = spark
-
-        chunked_config = config.get("chunked_load", {})
-        requested_chunks = chunked_config.get("num_chunks", 5)
-        self.business_keys = chunked_config.get("business_keys", [])
-        self.metadata_path = chunked_config.get("metadata_path", "./audit/chunks")
-
-        pipeline = config.get("pipeline", {})
-        self.pipeline_id = pipeline.get("pipeline_id", "unknown")
-
-        # --- Core-Aware Auto-Tuning ---
-        # Detect available parallelism (cores) and cap chunks accordingly.
-        # On local mode (typical for Windows), Spark uses CPU cores as executors.
-        # Requesting more chunks than cores creates unnecessary shuffle overhead
-        # and memory pressure, which can cause stage materialization failures.
-        available_cores = spark.sparkContext.defaultParallelism
-        if requested_chunks > available_cores:
-            self.num_chunks = max(1, available_cores)
-            logging.warning(
-                f"[ChunkProcessor] Auto-tuned num_chunks from {requested_chunks} → {self.num_chunks} "
-                f"(available cores/parallelism: {available_cores}). "
-                f"Requesting more chunks than cores causes unnecessary shuffle overhead."
-            )
-        else:
-            self.num_chunks = requested_chunks
-        logging.info(f"[ChunkProcessor] Using {self.num_chunks} chunks (cores: {available_cores}, requested: {requested_chunks})")
-
-        # Generate a unique job_run_id per execution
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.job_run_id = f"{self.pipeline_id}_{timestamp}"
-
-    def process_all_chunks(self, df: DataFrame):
+class PySparkETLEngine:
+    
+    @staticmethod
+    def validate_config(config):
         """
-        FULL run: repartition, initialize metadata, process all chunks.
+        Validates the structure of a JSON configuration dict.
+        Returns a list of error strings. Empty list means valid.
         """
-        logging.info(f"[ChunkProcessor] Starting FULL chunked load with {self.num_chunks} chunks")
-
-        # Repartition DataFrame
-        df_repartitioned = df.repartition(self.num_chunks)
-        df_repartitioned = df_repartitioned.withColumn("__chunk_id", spark_partition_id())
-        df_repartitioned.cache()
-
-        # Count records per chunk
-        chunk_counts = {}
-        count_rows = df_repartitioned.groupBy("__chunk_id").count().collect()
-        for row in count_rows:
-            chunk_counts[row["__chunk_id"]] = row["count"]
-
-        logging.info(f"[ChunkProcessor] Chunk distribution: {chunk_counts}")
-
-        # Initialize metadata
-        metadata = ChunkMetadataStore(self.metadata_path, self.pipeline_id, self.job_run_id)
-        metadata.initialize(self.num_chunks, chunk_counts)
-
-        # Process each chunk
-        self._process_chunks(df_repartitioned, metadata, list(range(self.num_chunks)))
-
-        # Cleanup
-        df_repartitioned.unpersist()
-
-        # Report
-        summary = metadata.get_summary()
-        logging.info(f"[ChunkProcessor] Completed. Summary: {summary}")
-
-        if summary.get("failed", 0) > 0:
-            logging.warning(
-                f"[ChunkProcessor] {summary['failed']} chunks FAILED. "
-                f"Retry with run_mode=RETRY_FAILED using job_run_id={self.job_run_id}"
-            )
-
-        return summary
-
-    def retry_failed_chunks(self, df: DataFrame, job_run_id: str = None):
+        errors = []
+        if not isinstance(config, dict):
+            return ["Configuration must be a JSON object"]
+            
+        if 'pipeline' not in config:
+            errors.append("Missing required 'pipeline' block")
+        elif 'pipeline_type' not in config.get('pipeline', {}):
+            errors.append("Missing 'pipeline_type' in pipeline block")
+            
+        if 'source' not in config:
+            errors.append("Missing required 'source' block")
+            
+        if 'target' not in config:
+            errors.append("Missing required 'target' block")
+            
+        return errors
+    
+    def __init__(self, config_path, param_path=None, env_path=None):
         """
-        RETRY_FAILED run: load existing metadata, reprocess only FAILED chunks.
-        """
-        # Find the most recent metadata file if job_run_id not specified
-        if not job_run_id:
-            job_run_id = self._find_latest_job_run_id()
-            if not job_run_id:
-                raise ValueError("No previous job run found for retry. Specify job_run_id or run in FULL mode first.")
-
-        logging.info(f"[ChunkProcessor] RETRY_FAILED mode for job_run_id: {job_run_id}")
-
-        metadata = ChunkMetadataStore(self.metadata_path, self.pipeline_id, job_run_id)
-        if not metadata.load_existing():
-            raise FileNotFoundError(f"Metadata file not found for job_run_id: {job_run_id}")
-
-        failed_chunks = metadata.get_failed_chunk_ids()
-        if not failed_chunks:
-            logging.info("[ChunkProcessor] No failed chunks found. Nothing to retry.")
-            return metadata.get_summary()
-
-        logging.info(f"[ChunkProcessor] Retrying {len(failed_chunks)} failed chunks: {failed_chunks}")
-
-        # Repartition to the same number of chunks as the original run
-        original_num_chunks = metadata.data.get("total_chunks", self.num_chunks)
-        df_repartitioned = df.repartition(original_num_chunks)
-        df_repartitioned = df_repartitioned.withColumn("__chunk_id", spark_partition_id())
-        df_repartitioned.cache()
-
-        # Process only failed chunks
-        self._process_chunks(df_repartitioned, metadata, failed_chunks)
-
-        df_repartitioned.unpersist()
-
-        summary = metadata.get_summary()
-        logging.info(f"[ChunkProcessor] Retry completed. Summary: {summary}")
-        return summary
-
-    def _process_chunks(self, df: DataFrame, metadata: ChunkMetadataStore, chunk_ids: List[int]):
-        """Process specified chunks sequentially with metadata tracking."""
-        target_config = self.config.get("target", {})
-        db_type = target_config.get("db_type", "postgres")
-        connection_string = target_config.get("connectionString", "")
-        schema = target_config.get("schema", "public")
-        table = target_config.get("table", "")
-
-        # Resolve connection string from env if needed
-        if connection_string and connection_string in os.environ:
-            connection_string = os.environ[connection_string]
-
-        # Parse connection string if needed
-        if connection_string and not connection_string.startswith("jdbc:"):
-            from sources import DBSourceHandler
-            handler = DBSourceHandler()
-            connection_string, parsed_props = handler._parse_connection_string(connection_string, db_type)
+        Initializes the ETL Engine by loading the configuration.
+        This serves as the main Factory that routes to the correct pipeline based on config.
         
-        qualified_table = f"{schema}.{table}" if schema and db_type in ['postgres', 'sqlserver', 'oracle'] else table
-
-        properties = {
-            "user": target_config.get("user", ""),
-            "password": target_config.get("password", ""),
-            **target_config.get("options", {})
-        }
-
-        from targets import DBTargetHandler
-        db_handler = DBTargetHandler()
-        properties["driver"] = db_handler._get_driver(db_type)
-
-        for chunk_id in chunk_ids:
-            logging.info(f"[ChunkProcessor] === Processing Chunk {chunk_id} ===")
-            metadata.update_chunk_status(chunk_id, "RUNNING")
-
-            try:
-                # Filter to this chunk only, drop the helper column
-                chunk_df = df.where(df["__chunk_id"] == chunk_id).drop("__chunk_id")
-
-                # Use pre-computed count from metadata (avoid extra materialization)
-                chunk_count = metadata.data["chunks"][chunk_id].get("record_count", -1)
-                if chunk_count == 0:
-                    logging.info(f"[ChunkProcessor] Chunk {chunk_id} is empty, marking SUCCESS")
-                    metadata.update_chunk_status(chunk_id, "SUCCESS")
-                    continue
-
-                logging.info(f"[ChunkProcessor] Chunk {chunk_id}: ~{chunk_count} rows")
-
-                if self.business_keys:
-                    # Dedup via staging table + MERGE
-                    self._write_chunk_with_dedup(
-                        chunk_df, chunk_id, qualified_table,
-                        connection_string, properties, db_type, db_handler
-                    )
-                else:
-                    # Direct append (no dedup)
-                    chunk_df.write.jdbc(
-                        url=connection_string,
-                        table=qualified_table,
-                        mode="append",
-                        properties=properties
-                    )
-
-                metadata.update_chunk_status(chunk_id, "SUCCESS")
-                logging.info(f"[ChunkProcessor] Chunk {chunk_id}: SUCCESS")
-
-            except Exception as e:
-                error_msg = str(e)
-                metadata.update_chunk_status(chunk_id, "FAILED", error_message=error_msg)
-                logging.error(f"[ChunkProcessor] Chunk {chunk_id}: FAILED — {error_msg}")
-
-    def _write_chunk_with_dedup(self, chunk_df: DataFrame, chunk_id: int,
-                                 qualified_table: str, jdbc_url: str,
-                                 properties: dict, db_type: str,
-                                 db_handler):
-        """Write a chunk using staging table + INSERT WHERE NOT EXISTS for deduplication."""
-        staging_table = f"{qualified_table}_chunk_stg"
-
-        # Step 1: Write chunk to staging table (overwrite each time)
-        logging.info(f"[ChunkProcessor] Writing chunk {chunk_id} to staging: {staging_table}")
-        chunk_df.write.jdbc(url=jdbc_url, table=staging_table, mode="overwrite", properties=properties)
-
-        # Step 2: MERGE from staging to target using business keys
-        jvm = self.spark._jvm
-        props = jvm.java.util.Properties()
-        props.put("user", properties.get("user", ""))
-        props.put("password", properties.get("password", ""))
-        props.put("driver", properties["driver"])
-
-        conn = jvm.java.sql.DriverManager.getConnection(jdbc_url, props)
-        stmt = conn.createStatement()
-
+        Args:
+            config_path: Path to the JSON configuration file.
+            param_path:  Optional path to parameterfile.txt for environment-specific overrides.
+            env_path:    Optional explicit path to .env file. If not provided, falls back to
+                         project_root/.env (relative to backend/ directory).
+        """
+        self.config_path = config_path
+        self.param_path = param_path
+        
+        # Ensure env vars are loaded so PySpark can read credentials automatically
+        if env_path and os.path.exists(env_path):
+            load_dotenv(env_path)
+            logging.info(f"[Engine] Loaded environment from: {env_path}")
+        else:
+            backend_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(backend_dir)
+            default_env = os.path.join(project_root, '.env')
+            if os.path.exists(default_env):
+                load_dotenv(default_env)
+                logging.info(f"[Engine] Loaded environment from default: {default_env}")
+        
+        self.config = self._load_config()
+        self._inject_parameters()
+        
+    def _inject_parameters(self):
+        """Reads parameterfile.txt and injects values into the config dict dynamically."""
+        if not self.param_path:
+            return
+            
+        logging.info(f"[Engine] Loading parameters from: {self.param_path}")
+        params = {}
         try:
-            # Build WHERE NOT EXISTS condition using business keys
-            join_condition = " AND ".join(
-                [f't."{k}" = s."{k}"' for k in self.business_keys]
-            )
-
-            # Get columns from staging for INSERT
-            staging_cols = self.spark.read.jdbc(url=jdbc_url, table=staging_table, properties=properties).columns
-            col_str = ", ".join([f'"{c}"' for c in staging_cols])
-
-            insert_sql = f"""
-                INSERT INTO {qualified_table} ({col_str})
-                SELECT {col_str} FROM {staging_table} s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM {qualified_table} t
-                    WHERE {join_condition}
-                )
-            """
-            logging.info(f"[ChunkProcessor] Executing dedup INSERT for chunk {chunk_id}")
-            inserted = stmt.executeUpdate(insert_sql)
-            logging.info(f"[ChunkProcessor] Chunk {chunk_id}: inserted {inserted} new rows (deduped)")
-
-            # Step 3: Drop staging table
-            stmt.execute(f"DROP TABLE IF EXISTS {staging_table}")
-
+            with open(self.param_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, val = line.split('=', 1)
+                        params[key.strip()] = val.strip()
+            
+            # Inject Audit Path if available in parameters
+            if 'AUDIT_PATH' in params:
+                if 'audit' not in self.config:
+                    self.config['audit'] = {}
+                self.config['audit']['path'] = params['AUDIT_PATH']
+                logging.info(f"[Engine] Injected AUDIT_PATH: {params['AUDIT_PATH']}")
+                
+            # Inject Reject Path if available in parameters
+            if 'REJECT_PATH' in params:
+                if 'reject' not in self.config:
+                    self.config['reject'] = {}
+                self.config['reject']['path'] = params['REJECT_PATH']
+                self.config['reject']['enable'] = True
+                logging.info(f"[Engine] Injected REJECT_PATH: {params['REJECT_PATH']} and enabled Reject Handler")
+                
+            # Inject Global JDBC JARs if available in parameters
+            if 'SPARK_JARS' in params:
+                if 'pipeline' not in self.config:
+                    self.config['pipeline'] = {}
+                # The jars parameter expects an array. We split the string by comma.
+                jar_list = [j.strip() for j in params['SPARK_JARS'].split(',')]
+                self.config['pipeline']['jars'] = jar_list
+                logging.info(f"[Engine] Injected Global SPARK_JARS: {jar_list}")
         except Exception as e:
-            # Attempt cleanup
-            try:
-                stmt.execute(f"DROP TABLE IF EXISTS {staging_table}")
-            except Exception:
-                pass
-            raise e
-        finally:
-            stmt.close()
-            conn.close()
-
-    def _find_latest_job_run_id(self) -> Optional[str]:
-        """Find the most recent metadata file for this pipeline."""
-        if not os.path.exists(self.metadata_path):
-            return None
-
-        prefix = f"chunk_metadata_{self.pipeline_id}_"
-        candidates = []
-        for f in os.listdir(self.metadata_path):
-            if f.startswith(prefix) and f.endswith(".json"):
-                candidates.append(f)
-
-        if not candidates:
-            return None
-
-        # Sort by name (timestamp-based) and pick the latest
-        candidates.sort(reverse=True)
-        latest = candidates[0]
-
-        # Extract job_run_id: remove prefix "chunk_metadata_" and suffix ".json"
-        job_run_id = latest.replace("chunk_metadata_", "").replace(".json", "")
-        # The job_run_id includes pipeline_id prefix, so extract just the full ID
-        # File: chunk_metadata_{pipeline_id}_{timestamp}.json
-        # job_run_id = {pipeline_id}_{timestamp}
-        return job_run_id
+            logging.warning(f"[Engine] WARNING: Failed to read parameter file {self.param_path}: {e}")
+        
+    def _load_config(self):
+        """Loads the JSON configuration file."""
+        logging.info(f"[Engine] Loading configuration from: {self.config_path}")
+        with open(self.config_path, 'r') as f:
+            return json.load(f)
+            
+    def run_pipeline(self):
+        """
+        The Factory Method: Reads the pipeline_type from JSON and invokes the respective ETL class.
+        """
+        pipeline_type = self.config.get("pipeline", {}).get("pipeline_type")
+        pipeline_id = self.config.get("pipeline", {}).get("pipeline_id", "Unknown_Pipeline")
+        
+        logging.info(f"[Engine] Starting Pipeline ID: {pipeline_id}")
+        logging.info(f"[Engine] Identified Pipeline Type: {pipeline_type}")
+        
+        if pipeline_type == "FILE_TO_FILE":
+            from file_to_file_etl import FileToFileETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to FILE_TO_FILE ETL process...")
+            etl_process = FileToFileETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "FILE_TO_DB":
+            from file_to_db_etl import FileToDBETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to FILE_TO_DB ETL process...")
+            etl_process = FileToDBETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "DB_TO_FILE":
+            from db_to_file_etl import DBToFileETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to DB_TO_FILE ETL process...")
+            etl_process = DBToFileETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        elif pipeline_type == "DB_TO_DB":
+            from db_to_db_etl import DBToDBETL
+            from audit_logger import AuditMetrics
+            from reject_handler import RejectHandler
+            
+            logging.info("[Engine] Routing to DB_TO_DB ETL process...")
+            etl_process = DBToDBETL(self.config_path, config=self.config)
+            
+            etl_process.audit = AuditMetrics(self.config)
+            etl_process.reject = RejectHandler(self.config)
+            etl_process.run()
+            
+        else:
+            raise ValueError(f"Unsupported pipeline_type: {pipeline_type}")
+            
+if __name__ == "__main__":
+    # Usage: python etl_engine.py <config.json> [parameterfile.txt]
+    if len(sys.argv) < 2:
+        print("ERROR: Config file path is required.", file=sys.stderr)
+        print("Usage: python etl_engine.py <config.json> [parameterfile.txt]", file=sys.stderr)
+        sys.exit(2)
+    
+    config_file = sys.argv[1]
+    param_file = sys.argv[2] if len(sys.argv) > 2 else None
+        
+    engine = PySparkETLEngine(config_file, param_file)
+    engine.run_pipeline()
