@@ -1,496 +1,450 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from abc import ABC, abstractmethod
+from typing import Dict, List, Any
+import logging
 import os
-import sys
-import json
-import subprocess
-import glob
+import time
 from datetime import datetime
-from werkzeug.utils import secure_filename
 
-app = Flask(__name__)
-# Allow CORS for local development (React runs on 5173 by default)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Import Source handling for lookups/CDC
+from sources import SourceFactory, DataFrameRegistry
 
-# Constants
-BACKEND_DIR = os.path.dirname(os.path.abspath(__name__))
-if not BACKEND_DIR.endswith("backend"):
-    BACKEND_DIR = os.path.join(BACKEND_DIR, "backend")
-    
-CONFIG_DIR = os.path.join(BACKEND_DIR, "config")
-os.makedirs(CONFIG_DIR, exist_ok=True)
+CDC_DEBUG_LOGS = []
+def log_cdc(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    CDC_DEBUG_LOGS.append(formatted_msg)
+    print(f"CDC_LIVE: {formatted_msg}")
 
-ENGINE_SCRIPT = os.path.join(BACKEND_DIR, "etl_engine.py")
-PARAM_FILE = os.path.join(BACKEND_DIR, "parameterfile.txt")
+class TransformationHandler(ABC):
+    @abstractmethod
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        pass
 
-@app.route('/', methods=['GET'])
-def index():
-    return """
-    <h1>PySpark ETL Backend is Running! 🚀</h1>
-    <p>This is the API server. Please open the React Frontend UI to use the application.</p>
-    <p>👉 <b><a href="http://localhost:3007">Go to Frontend (http://localhost:3007)</a></b></p>
-    """
-
-@app.route('/api/connections', methods=['GET'])
-def get_connections():
-    """Returns a list of saved database connections from the local .env file."""
-    connections = []
-    
-    # In earlier versions, we checked inside BACKEND_DIR.
-    # The true .env file is actually in the root PROJECT directory.
-    project_root = os.path.dirname(BACKEND_DIR)
-    env_file = os.path.join(project_root, '.env')
-    
-    if os.path.exists(env_file):
-        with open(env_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, val = line.split('=', 1)
-                    key = key.strip()
-                    val = val.strip()
-                    
-                    # Optional: Add jdbc: prefix if not present but looks like a DB URL
-                    # so that PySpark handles it cleanly, just in case.
-                    if val.startswith('postgresql://'):
-                        val = 'jdbc:' + val
-                    elif val.startswith('mysql://'):
-                        val = 'jdbc:' + val
-                    elif val.startswith('oracle:'):
-                        pass # Typically jdbc:oracle:... but we leave it to user
-                        
-                    connections.append({"key": key, "value": val})
-    else:
-        # Fallback if .env doesn't exist at all
-        connections = [
-            {"key": "Local PostgreSQL", "value": "jdbc:postgresql://localhost:5432/postgres"}
-        ]
+class ColumnTransformationHandler(TransformationHandler):
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        action = config.get('action')
+        column = config.get('column')
         
-    return jsonify({
-        "success": True,
-        "connections": connections
-    })
-
-@app.route('/api/fs/list', methods=['GET'])
-def fs_list():
-    """Returns directory contents for the frontend file browser."""
-    try:
-        req_path = request.args.get('path', '')
-        # Default to the Project Root if no path is provided
-        current_path = req_path if req_path else os.path.dirname(BACKEND_DIR)
+        if action not in ['sequence', 'literal', 'current_date'] and (not column or column not in df.columns):
+            raise ValueError(f"Invalid column: {column}")
         
-        if not os.path.exists(current_path):
-            current_path = os.path.dirname(BACKEND_DIR)
+        logging.info(f"Applying column transformation: {action} on {column}")
+        
+        if action == 'upper':
+            return df.withColumn(column, F.upper(F.col(column)))
+        elif action == 'lower':
+            return df.withColumn(column, F.lower(F.col(column)))
+        elif action == 'trim':
+            return df.withColumn(column, F.trim(F.col(column)))
+        elif action == 'cast':
+            target_type = config.get('target_type')
+            formats = config.get('formats')
+            fmt = config.get('format')
+            if formats and isinstance(formats, list) and target_type in ['timestamp', 'date', 'TimestampType', 'DateType']:
+                func_name = "try_to_timestamp" if target_type in ['timestamp', 'TimestampType'] else "try_to_date"
+                cols = [F.expr(f"{func_name}({column}, '{f}')") for f in formats]
+                return df.withColumn(column, F.coalesce(*cols))
+            elif fmt and target_type in ['timestamp', 'date', 'TimestampType', 'DateType']:
+                func = F.to_timestamp if target_type in ['timestamp', 'TimestampType'] else F.to_date
+                return df.withColumn(column, func(F.col(column), fmt))
+            else:
+                if target_type.lower() == 'date':
+                    # Natively strip time components generated by driver/JVM default server TimeZones
+                    return df.withColumn(column, F.date_format(F.to_date(F.col(column)), "yyyy-MM-dd"))
+                return df.withColumn(column, F.col(column).cast(target_type))
+        elif action == 'rename':
+            return df.withColumnRenamed(column, config.get('new_name'))
+        elif action == 'add':
+            return df.withColumn(column, F.expr(config.get('expression')))
+        elif action == 'drop':
+            return df.drop(column)
+        elif action == 'sequence':
+            # High Performance Distributed ID Generator (Informatica equivalent for Big Data)
+            # Generates unique, increasing 64-bit integers cleanly across hundreds of partitions.
+            # E.g., Worker 1: 0,1,2 | Worker 2: 8589934592,8589934593
+            return df.withColumn(column, F.monotonically_increasing_id())
+        elif action == 'literal':
+            val = config.get('value', '')
+            dtype = config.get('data_type', 'string')
             
-        items = []
-        # Sort directories first, then files
-        for item in sorted(os.listdir(current_path)):
-            if item.startswith('.'):
-                continue # Skip hidden files
+            # Handle empty values as None (Null) for non-string types to prevent cast errors
+            if val == '' and dtype != 'string':
+                lit_val = F.lit(None).cast(dtype if dtype != 'integer' else 'int')
+            elif dtype == 'integer': 
+                lit_val = F.lit(int(val) if val else 0)
+            elif dtype in ['double', 'float']: 
+                lit_val = F.lit(float(val) if val else 0.0)
+            elif dtype == 'boolean': 
+                lit_val = F.lit(str(val).lower() in ['true', '1'])
+            elif dtype == 'date': 
+                lit_val = F.to_date(F.lit(val))
+            elif dtype == 'timestamp': 
+                lit_val = F.to_timestamp(F.lit(val))
+            else: 
+                lit_val = F.lit(str(val))
+            return df.withColumn(column, lit_val)
+        elif action == 'current_date':
+            return df.withColumn(column, F.current_date())
+        elif action == 'if_then_else':
+            return df.withColumn(column, F.when(F.expr(config.get('condition')), F.expr(config.get('trueValue'))).otherwise(F.expr(config.get('falseValue'))))
+        elif action == 'data_masking':
+            mask_type = config.get('masking_type', 'full')
+            if mask_type == 'full': return df.withColumn(column, F.lit('****'))
+            elif mask_type == 'hash': return df.withColumn(column, F.md5(F.col(column).cast('string')))
+            elif mask_type == 'null': return df.withColumn(column, F.lit(None).cast('string'))
+            elif mask_type == 'partial':
+                sf = config.get('show_first', 2)
+                sl = config.get('show_last', 2)
+                sc = F.col(column).cast('string')
+                ln = F.length(sc)
+                return df.withColumn(column, F.when(F.col(column).isNull(), F.lit(None).cast('string')).when(ln <= (sf + sl), F.lit('****')).otherwise(F.concat(F.substring(sc, 1, sf), F.lit('****'), F.substring(sc, ln - sl + 1, sl))))
+            elif mask_type == 'base64': return df.withColumn(column, F.base64(F.encode(F.col(column).cast('string'), 'utf-8')))
+            elif mask_type == 'aes':
+                key = config.get('key', '')
+                return df.withColumn(column, F.expr(f"base64(aes_encrypt(cast({column} as string), '{key}'))"))
+            return df
+        elif action == 'data_unmasking':
+            unmask_type = config.get('unmasking_type', 'base64')
+            if unmask_type == 'base64': return df.withColumn(column, F.decode(F.unbase64(F.col(column)), 'utf-8'))
+            elif unmask_type == 'aes':
+                key = config.get('key', '')
+                return df.withColumn(column, F.expr(f"cast(aes_decrypt(unbase64({column}), '{key}') as string)"))
+            return df
+        else:
+            raise ValueError(f"Unsupported column action: {action}")
+
+class RowTransformationHandler(TransformationHandler):
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        action = config.get('action')
+        logging.info(f"Applying row transformation: {action}")
+        
+        if action == 'filter':
+            condition = config.get('condition')
+            capture_rejects = config.get('capture_rejects', False)
+            if capture_rejects and context and 'reject_handler' in context:
+                rj = context['reject_handler']
+                rejects = df.filter(f"NOT ({condition})")
+                rj.write_rejects(rejects, config.get('reject_reason', f"Failed filter: {condition}"))
+            return df.filter(condition)
+        elif action == 'if':
+            return df.withColumn(config.get('column'), F.when(F.expr(config.get('condition')), config.get('value')).otherwise(F.col(config.get('column'))))
+        elif action in ['deduplicate', 'distinct']:
+            raw_cols = config.get('columns', [])
+            cols = [c.strip() for c in raw_cols.replace(';', ',').split(',')] if isinstance(raw_cols, str) else raw_cols
+            handling = config.get('duplicate_handling', 'drop')
+            
+            if handling == 'fail':
+                dup_counts = df.groupBy(cols).count().filter("count > 1")
+                if dup_counts.count() > 0: raise ValueError(f"Duplicates found in {cols}")
+                return df
+            elif handling == 'capture':
+                from pyspark.sql.window import Window
+                part_cols = [F.col(c) for c in cols] if cols else [F.col(c) for c in df.columns]
+                w = Window.partitionBy(*part_cols).orderBy(F.monotonically_increasing_id())
+                df_w = df.withColumn("_row_num", F.row_number().over(w))
+                if context and 'reject_handler' in context:
+                    context['reject_handler'].write_rejects(df_w.filter("_row_num > 1").drop("_row_num"), "Duplicate record")
+                return df_w.filter("_row_num == 1").drop("_row_num")
+            else:
+                return df.dropDuplicates(cols) if cols else df.dropDuplicates()
+        elif action == 'sort':
+            cols = config.get('columns', [])
+            asc = config.get('ascending', True)
+            sort_e = [F.col(c).asc() if asc else F.col(c).desc() for c in cols if c in df.columns]
+            return df.orderBy(*sort_e) if sort_e else df
+        elif action == 'sample':
+            return df.sample(fraction=config.get('fraction', 0.1))
+        else:
+            raise ValueError(f"Unsupported row action: {action}")
+
+class LookupTransformationHandler(TransformationHandler):
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        lookup_table = config.get('lookup_table')
+        operation = config.get('operation', 'join')
+        
+        if operation == 'surrogate_key':
+            scol = config.get('source_column')
+            tcol = config.get('target_column')
+            try:
+                try: lookup_df = DataFrameRegistry.get_dataframe(lookup_table)
+                except:
+                    stype = config.get('source_type')
+                    path = config.get('path')
+                    if stype and path:
+                        sconf = {'type': stype, 'path': path, 'table': config.get('table') or path, 'schema': config.get('schema'), 'db_type': config.get('db_type'), 'connectionString': config.get('connection_string'), 'format': config.get('file_format', 'csv'), 'options': config.get('options', {})}
+                        lookup_df = SourceFactory.get_handler(stype).read(df.sparkSession, sconf)
+                        DataFrameRegistry.register(lookup_table, lookup_df)
+                    else: raise ValueError()
+                max_val = lookup_df.agg(F.max(scol)).collect()[0][0]
+                start_val = max_val if max_val is not None else 0
+            except:
+                start_val = 0
+            
+            is_batch = any(x in tcol.upper() for x in ['LOAD_ID', 'BATCH_ID', 'JOB_ID'])
+            if is_batch: return df.withColumn(tcol, F.lit(start_val + 1))
+            else:
+                from pyspark.sql import Window
+                w = Window.orderBy(F.monotonically_increasing_id())
+                return df.withColumn(tcol, F.lit(start_val) + F.row_number().over(w))
+
+        jkeys = config.get('join_keys', {})
+        jtype = config.get('join_type', 'left')
+        bcast = config.get('broadcast', False)
+        
+        try: lookup_df = DataFrameRegistry.get_dataframe(lookup_table)
+        except:
+            stype = config.get('source_type')
+            path = config.get('path')
+            sconf = {'type': stype, 'path': path, 'table': config.get('table') or path, 'schema': config.get('schema'), 'db_type': config.get('db_type'), 'connectionString': config.get('connection_string'), 'format': config.get('file_format', 'csv'), 'options': config.get('options', {})}
+            lookup_df = SourceFactory.get_handler(stype).read(df.sparkSession, sconf)
+            DataFrameRegistry.register(lookup_table, lookup_df)
+
+        def resolve_col(val, frame):
+            bare = val.split('.')[-1].strip('"').strip("'")
+            return (frame[bare], bare, False) if bare in frame.columns else (F.lit(bare), bare, True)
+            
+        join_conds = []
+        if isinstance(jkeys, dict):
+            for s_raw, t_raw in jkeys.items():
+                s_e, _, _ = resolve_col(s_raw, df)
+                t_e, _, _ = resolve_col(t_raw, lookup_df)
+                join_conds.append(s_e == t_e)
                 
-            item_path = os.path.join(current_path, item)
-            is_dir = os.path.isdir(item_path)
-            
-            items.append({
-                "name": item,
-                "path": item_path,
-                "is_dir": is_dir,
-                "size": os.path.getsize(item_path) if not is_dir else 0
-            })
-            
-        parent_path = os.path.dirname(current_path) if current_path != '/' else None
+        final_cond = join_conds[0]
+        for c in join_conds[1:]: final_cond = final_cond & c
         
-        return jsonify({
-            "current_path": current_path,
-            "parent_path": parent_path,
-            "items": sorted(items, key=lambda x: (not x["is_dir"], x["name"].lower()))
-        })
-    except Exception as e:
-        return jsonify({"current_path": "", "parent_path": None, "items": [], "error": str(e)}), 500
+        if bcast: lookup_df = F.broadcast(lookup_df)
+        res = df.join(lookup_df, final_cond, jtype)
+        return res
 
-@app.route('/api/preview/file-headers', methods=['POST'])
-def get_file_headers():
-    """Reads headers from a file to support the UI Transformation Builder dropdowns."""
-    try:
-        data = request.json
-        path = data.get('path')
-        if not path or not os.path.exists(path):
-            return jsonify({"headers": []})
+class CDCTransformationHandler(TransformationHandler):
+
+    def apply(self, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+        mode = config.get('mode')
+        ttype = config.get('type')
+
+        if mode == 'SCD_TYPE_2':
+            df = df.withColumn(config.get('effective_start', 'eff_start_dt'), F.current_timestamp())
+            df = df.withColumn(config.get('effective_end', 'eff_end_dt'), F.lit(None).cast('timestamp'))
+            df = df.withColumn(config.get('current_flag', 'is_current'), F.lit(True))
+            df = df.withColumn(config.get('operation_flag', 'op_type'), F.lit('INSERT'))
+            return df
+
+        elif ttype == 'cdc_compare' or mode == 'CDC_COMPARE':
+            return self._apply_cdc_compare(df, config)
+
+        return df
+
+
+    def _normalize_column(self, col, col_type: str) -> F.Column:
+        """Standardizes a column value for stable hashing while avoiding invalid casts on NULLs."""
+        col_type = col_type.lower()
+        c = F.col(col)
+        
+        # Check for Null/Empty first (to be used in final when)
+        is_empty = (c.cast("string") == "") | (c.isNull())
+        
+        # 1. Date/Timestamp Normalization (Strip timezone offsets)
+        if 'date' in col_type or 'timestamp' in col_type:
+            ex_str = c.cast("string")
+            cleaned_ex = F.regexp_replace(ex_str, r" [\+\-]\d{2}(:\d{2})?$", "")
+            res = F.date_format(cleaned_ex.cast("timestamp"), "yyyy-MM-dd HH:mm:ss")
+        # 2. Numeric Normalization (Use high-precision decimal)
+        elif any(t in col_type for t in ['double', 'float', 'decimal', 'long', 'integer', 'int']):
+            res = c.cast("decimal(20,2)").cast("string")
+        # 3. String Normalization
+        else:
+            res = F.lower(F.trim(c.cast("string")))
             
-        import csv
-        with open(path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter=data.get('delimiter', ','))
-            headers = next(reader, [])
-            # Strip BOM or whitespace just in case
-            headers = [h.strip() for h in headers]
-            return jsonify({"headers": headers})
-    except Exception as e:
-        print(f"Error reading file headers: {e}")
-        return jsonify({"headers": []})
+        # Return "__NULL__" if originally empty or if normalization resulted in null.
+        # This prevents casting the literal "__NULL__" to a numeric type during normalization.
+        return F.when(is_empty | res.isNull(), F.lit("__NULL__")).otherwise(res)
 
-@app.route('/api/preview/db-columns', methods=['POST'])
-def get_db_columns():
-    """Fetches real DB columns by spawning a quick PySpark JDBC job."""
-    try:
-        data = request.json
+    def _apply_cdc_compare(self, df: DataFrame, config: Dict) -> DataFrame:
+        spark = df.sparkSession
+        op = config.get('op_column', 'op_type')
+        t_type = config.get('target_type', 'DB')
+        path = config.get('target_path')
+        
         import time
-        temp_file = os.path.join(CONFIG_DIR, f"temp_db_query_{int(time.time())}.json")
+        cdc_start = time.time()
         
-        with open(temp_file, 'w') as f:
-            json.dump(data, f)
-            
-        fetcher_script = os.path.join(BACKEND_DIR, "get_db_columns.py")
-        cmd = [sys.executable, fetcher_script, temp_file]
-        
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=BACKEND_DIR
-        )
-        stdout, stderr = process.communicate()
-        
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-            
-        if process.returncode != 0:
-            print(f"Error fetching DB columns: {stderr}")
-            return jsonify({"columns": [], "error": stderr})
-            
-        # Try to find the JSON output in the stdout
-        for line in reversed(stdout.split('\n')):
-            if line.strip().startswith('{'):
-                try:
-                    result = json.loads(line)
-                    if "columns" in result:
-                        return jsonify(result)
-                    elif "error" in result:
-                        return jsonify({"columns": [], "error": result["error"]})
-                except json.JSONDecodeError:
-                    pass
-                    
-        return jsonify({"columns": []})
-        
-    except Exception as e:
-        print(f"Server error fetching DB columns: {e}")
-        return jsonify({"columns": [], "error": str(e)})
+        # 1. Resolve Keys and Comparison Columns
+        s_kc = [k.strip() for k in config.get('source_key_columns', config.get('key_columns', []))]
+        t_kc = [k.strip() for k in config.get('target_key_columns', config.get('key_columns', []))]
+        s_cc = [c.strip() for c in config.get('source_compare_columns', config.get('compare_columns', []))]
+        t_cc = [c.strip() for c in config.get('target_compare_columns', config.get('compare_columns', []))]
+        ec = [e.strip() for e in config.get('exclude_columns', [])]
 
-@app.route('/api/test-connection', methods=['POST'])
-def test_connection():
-    """Mock implementation for DB connection test."""
-    return jsonify({"success": True})
+        if len(s_kc) != len(t_kc):
+            raise ValueError(f"CDC Join Key mismatch: {len(s_kc)} vs {len(t_kc)}")
+        if len(s_cc) != len(t_cc):
+            raise ValueError(f"CDC Compare Column mismatch: {len(s_cc)} vs {len(t_cc)}")
 
-@app.route('/api/list-configs', methods=['GET'])
-def list_configs():
-    """Returns a list of all saved JSON pipeline configurations."""
-    try:
-        # Search for all JSON files in the config directory
-        search_pattern = os.path.join(CONFIG_DIR, "*.json")
-        json_files = glob.glob(search_pattern)
-        
-        configs = []
-        for file_path in json_files:
-            filename = os.path.basename(file_path)
-            # Skip temporary execution files
-            if filename.startswith("temp_"):
-                continue
-                
-            with open(file_path, 'r') as f:
-                try:
-                    data = json.load(f)
-                    pipeline = data.get("pipeline", {})
-                    configs.append({
-                        "filename": filename,
-                        "pipeline_id": pipeline.get("pipeline_id", "Unknown"),
-                        "pipeline_type": pipeline.get("pipeline_type", "Unknown")
-                    })
-                except json.JSONDecodeError:
-                    continue
-                    
-        return jsonify({"success": True, "configs": configs})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/get-config/<filename>', methods=['GET'])
-def get_config(filename):
-    """Fetches a specific configuration file."""
-    try:
-        secure_name = secure_filename(filename)
-        file_path = os.path.join(CONFIG_DIR, secure_name)
-        
-        if not os.path.exists(file_path):
-            return jsonify({"success": False, "error": "File not found"}), 404
-            
-        with open(file_path, 'r') as f:
-            config = json.load(f)
-            
-        return jsonify({"success": True, "config": config})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/save-config', methods=['POST'])
-def save_config():
-    """Saves a JSON configuration payload to disk."""
-    try:
-        data = request.json
-        config = data.get('config')
-        filename = secure_filename(data.get('filename', 'pipeline.json'))
-        
-        if not config:
-            return jsonify({"success": False, "error": "No config provided"}), 400
-            
-        if not filename.endswith('.json'):
-            filename += '.json'
-            
-        file_path = os.path.join(CONFIG_DIR, filename)
-        
-        with open(file_path, 'w') as f:
-            json.dump(config, f, indent=4)
-            
-        return jsonify({"success": True, "message": f"Saved {filename} successfully"})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/export-config/<filename>', methods=['GET'])
-def export_config(filename):
-    """Returns a JSON configuration file as a downloadable attachment for standalone/Autosys use."""
-    try:
-        from flask import send_from_directory
-        secure_name = secure_filename(filename)
-        file_path = os.path.join(CONFIG_DIR, secure_name)
-        
-        if not os.path.exists(file_path):
-            return jsonify({"success": False, "error": "File not found"}), 404
-            
-        return send_from_directory(
-            CONFIG_DIR, 
-            secure_name, 
-            as_attachment=True,
-            mimetype='application/json'
-        )
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/validate-config', methods=['POST'])
-def validate_config():
-    """Validates the structure of the JSON payload before execution."""
-    try:
-        config = request.json
-        errors = []
-        
-        if 'pipeline' not in config:
-            errors.append("Missing 'pipeline' metadata block")
-        elif 'pipeline_type' not in config['pipeline']:
-            errors.append("Missing 'pipeline_type' in pipeline block")
-            
-        if 'source' not in config:
-            errors.append("Missing 'source' block")
-            
-        if 'target' not in config:
-            errors.append("Missing 'target' block")
-            
-        if errors:
-            return jsonify({"valid": False, "errors": errors})
-            
-        return jsonify({"valid": True})
-    except Exception as e:
-        return jsonify({"valid": False, "errors": [str(e)]})
-
-@app.route('/api/execute-pipeline', methods=['POST'])
-def execute_pipeline():
-    """Writes the payload to a temp file and executes etl_engine.py."""
-    try:
-        config = request.json
-        pipeline_id = config.get("pipeline", {}).get("pipeline_id", "dynamic_run")
-        
-        # 1. Save temp config inside config folder
-        temp_filename = f"temp_execution_{pipeline_id}.json"
-        temp_path = os.path.join(CONFIG_DIR, temp_filename)
-        
-        with open(temp_path, 'w') as f:
-            json.dump(config, f, indent=4)
-            
-        # 2. Run PySpark Engine via spark-submit (most reliable for JVM/JAR setup on Windows)
-        import glob as _glob
-        
-        # Find JDBC JARs
-        jars_dir = os.path.join(BACKEND_DIR, 'jars')
-        jar_files = _glob.glob(os.path.join(jars_dir, '*.jar')) if os.path.isdir(jars_dir) else []
-        
-        # Java 17+ compatibility
-        os.environ.setdefault('JAVA_TOOL_OPTIONS', (
-            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
-            "--add-opens=java.base/java.lang=ALL-UNNAMED "
-            "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
-            "--add-opens=java.base/java.io=ALL-UNNAMED "
-            "--add-opens=java.base/java.util=ALL-UNNAMED "
-            "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED "
-            "--add-exports=java.base/javax.security.auth=ALL-UNNAMED"
-        ))
-        
-        cmd = ['spark-submit', '--driver-memory', '4g', '--executor-memory', '2g',
-               '--conf', 'spark.sql.shuffle.partitions=10']
-        
-        if jar_files:
-            is_windows = sys.platform == 'win32'
-            # Forward slashes for all Spark/JVM args — backslash paths break on Windows
-            fwd_jar_files = [f.replace('\\', '/') for f in jar_files]
-            jars_arg = ','.join(fwd_jar_files)
-            cp_sep = ';' if is_windows else ':'
-            classpath_arg = cp_sep.join(fwd_jar_files)
-            
-            cmd.extend(['--jars', jars_arg])
-            cmd.extend(['--driver-class-path', classpath_arg])
-            cmd.extend(['--conf', f'spark.driver.extraClassPath={classpath_arg}'])
-            cmd.extend(['--conf', f'spark.executor.extraClassPath={classpath_arg}'])
-        
-        cmd.extend([ENGINE_SCRIPT, temp_path, PARAM_FILE])
-        
+        # 2. Load Target Table — CACHE immediately to avoid re-reading JDBC on every operation
+        sconf = {
+            'type': t_type, 'path': path, 'table': path, 'schema': config.get('schema'),
+            'db_type': config.get('db_type'), 'connectionString': config.get('connection_string')
+        }
+        target_is_empty = False
         try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=os.path.dirname(BACKEND_DIR)
-            )
-        except FileNotFoundError:
-            # spark-submit not found — fall back to plain Python
-            # Set PYSPARK_SUBMIT_ARGS so driver memory is applied before JVM starts
-            os.environ.setdefault('PYSPARK_SUBMIT_ARGS', (
-                '--driver-memory 4g '
-                '--executor-memory 2g '
-                '--conf spark.sql.shuffle.partitions=10 '
-                'pyspark-shell'
-            ))
-            cmd = [sys.executable, ENGINE_SCRIPT, temp_path, PARAM_FILE]
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=os.path.dirname(BACKEND_DIR)
-            )
-        stdout, stderr = process.communicate()
-        
-        # Cleanup temp file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+            target_df = SourceFactory.get_handler(t_type).read(spark, sconf)
+            active_col = next((c for c in target_df.columns if c.lower() in ('active_flag', 'is_active', 'is_current')), None)
+            if active_col:
+                a_type = next((f.dataType.typeName().lower() for f in target_df.schema.fields if f.name == active_col), "string")
+                if 'bool' in a_type:
+                    target_df = target_df.filter(F.col(active_col) == True)
+                elif any(t in a_type for t in ['int', 'long', 'short', 'byte']):
+                    target_df = target_df.filter(F.col(active_col) == 1)
+                else:
+                    target_df = target_df.filter(F.col(active_col).isin('Y', 'y', '1'))
             
-        # 3. Read the Audit Log generated to send back metrics
-        metrics = {}
-        duration = 0
-        # Default status based on exit code: if subprocess exited cleanly, assume success
-        # unless the audit log explicitly says otherwise.
-        status = "success" if process.returncode == 0 else "failed"
-        
-        # Determine the true Audit Path (Check parameterfile.txt first, then fallback to JSON)
-        audit_path = ""
-        if os.path.exists(PARAM_FILE):
-            with open(PARAM_FILE, 'r') as f:
-                for line in f:
-                    if line.startswith('AUDIT_PATH='):
-                        audit_path = line.split('=', 1)[1].strip()
-                        break
-                        
-        if not audit_path:
-            audit_path = config.get("audit", {}).get("path", "")
+            # CRITICAL: Cache target to prevent repeated JDBC reads during join
+            target_df = target_df.cache()
+            target_count = target_df.count()  # Force cache materialization
+            logging.info(f"[CDC] Target table loaded and cached: {target_count} active rows ({time.time() - cdc_start:.1f}s)")
             
-        if audit_path and os.path.exists(audit_path):
-            # Look for recent JSONs in the audit folder, sort by modified time
-            search_pattern = os.path.join(audit_path, "*.json")
-            audit_files = glob.glob(search_pattern)
-            
-            if audit_files:
-                latest_log = max(audit_files, key=os.path.getmtime)
-                
-                # Wait up to 2 seconds for OS to flush the file to disk
-                import time
-                wait_time = 0
-                while os.path.getsize(latest_log) == 0 and wait_time < 2.0:
-                    time.sleep(0.1)
-                    wait_time += 0.1
-                    
-                try:
-                    with open(latest_log, 'r') as f:
-                        log_data = json.load(f)
-                        
-                        # Ensure it belongs to our execution
-                        if log_data.get("pipeline_id") == pipeline_id:
-                            metrics = log_data
-                            duration = log_data.get("duration_seconds", 0)
-                            status = log_data.get("status", status).lower()
-                except Exception as e:
-                    print(f"Warning: Could not parse Audit JSON ({e}). Using exit-code based status.")
-                        
-        # 4. Write execution output to dedicated files per run
-        log_dir = os.path.join(BACKEND_DIR, "Logs")
-        os.makedirs(log_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        step_log_file = os.path.join(log_dir, f"step_by_step_{pipeline_id}_{timestamp}.log")
-        error_log_file = os.path.join(log_dir, f"error_{pipeline_id}_{timestamp}.log")
-        
-        # Always write step-by-step logs (Standard Output)
-        with open(step_log_file, 'w') as f:
-            f.write(f"=== PIPELINE EXECUTION: {pipeline_id} ===\n")
-            f.write(f"TIMESTAMP: {timestamp}\n")
-            f.write(f"EXIT CODE: {process.returncode}\n\n")
-            if stdout: 
-                f.write(stdout)
-                
-        # Only write error logs if there actually was an error stream or a crash
-        if stderr or process.returncode != 0:
-            with open(error_log_file, 'w') as f:
-                f.write(f"=== PIPELINE ERROR LOG: {pipeline_id} ===\n")
-                f.write(f"TIMESTAMP: {timestamp}\n")
-                f.write(f"EXIT CODE: {process.returncode}\n\n")
-                if stderr:
-                    f.write(stderr)
-            
-        # 5. Determine final result based on exit code or captured exceptions
-        if process.returncode != 0:
-            return jsonify({
-                "success": False, 
-                "error": stderr or stdout or "Engine crashed unexpectedly",
-                "logs": stdout.split("\n")
-            })
-            
-        return jsonify({
-            "success": status == "success",
-            "duration": duration,
-            "metrics": metrics,
-            "logs": stdout.split("\n"),
-            "error": "Engine reported failure in audit log" if status == "failed" else None
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+            if target_count == 0:
+                target_is_empty = True
+        except:
+            target_df = spark.createDataFrame([], df.schema)
+            target_is_empty = True
+            logging.info("[CDC] Target table is empty or does not exist — all rows will be INSERTs")
 
-@app.route('/api/generate-ollama-code', methods=['POST'])
-def generate_ollama_code_endpoint():
-    """Generates Python-Polars code using AI (Ollama or Gemini)."""
-    try:
-        # Import inside handler to avoid circular imports or early failures
-        sys.path.append(BACKEND_DIR)
-        from ai_generator import generate_code
-        
-        config = request.json
-        # Pass PARAM_FILE to read the key
-        code = generate_code(config, PARAM_FILE)
-        
-        return jsonify({
-            "status": "success",
-            "code": code
-        })
-    except Exception as e:
-        print(f"Error generating code: {e}")
-        return jsonify({
-            "status": "error",
-            "error": str(e)
-        }), 500
+        # Fast path: if target is empty, ALL source rows are inserts — skip the expensive join
+        if target_is_empty:
+            logging.info("[CDC] Fast path: skipping full outer join (target is empty)")
+            result = df.withColumn(op, F.lit("I")) \
+                       .withColumn("__debug_src", F.lit("")) \
+                       .withColumn("__debug_tgt", F.lit(""))
+            return result
 
-if __name__ == '__main__':
-    # Start the Flask API on port 9001 (Must match React ExecutePipeline.tsx API_URL)
-    app.run(host='0.0.0.0', port=9001, debug=True)
+        # Cache source too — it gets referenced multiple times in the join plan
+        df = df.cache()
+        src_count = df.count()
+        logging.info(f"[CDC] Source cached: {src_count} rows ({time.time() - cdc_start:.1f}s)")
+
+        if not s_cc:
+            common = [c for c in set(df.columns).intersection(set(target_df.columns)) if c not in s_kc and c not in t_kc and c not in ec]
+            s_cc = sorted(common); t_cc = sorted(common)
+
+        # 3. Schema Prep for Normalization
+        def get_field_type(schema, name):
+            field = next((f for f in schema.fields if f.name.lower() == name.lower()), None)
+            return str(field.dataType).lower() if field else "string"
+
+        # 4. Normalization + Debug String Construction
+        src_norm_exprs = []
+        for sc, tc in zip(s_cc, t_cc):
+            m_type = get_field_type(target_df.schema, tc)
+            src_norm_exprs.append(self._normalize_column(f"__src_{sc}", m_type))
+            
+        tgt_norm_exprs = []
+        for sc, tc in zip(s_cc, t_cc):
+            m_type = get_field_type(target_df.schema, tc)
+            tgt_norm_exprs.append(self._normalize_column(f"__tgt_{tc}", m_type))
+
+        src_str_expr = F.concat_ws("||", *src_norm_exprs)
+        tgt_str_expr = F.concat_ws("||", *tgt_norm_exprs)
+
+        # 5. Full Outer Join — use broadcast for smaller DataFrame
+        sdf_fin = df.select([F.col(c).alias(f"__src_{c}") for c in df.columns])
+        tdf_fin = target_df.select([F.col(c).alias(f"__tgt_{c}") for c in target_df.columns])
+
+        jconds = [sdf_fin[f"__src_{sk}"] == tdf_fin[f"__tgt_{tk}"] for sk, tk in zip(s_kc, t_kc)]
+        fc = jconds[0]
+        for c in jconds[1:]: fc = fc & c
+        
+        # Broadcast the smaller side to avoid shuffle
+        if src_count <= target_count:
+            logging.info(f"[CDC] Broadcasting source ({src_count} rows) for join")
+            jdf = F.broadcast(sdf_fin).join(tdf_fin, fc, "full_outer")
+        else:
+            logging.info(f"[CDC] Broadcasting target ({target_count} rows) for join")
+            jdf = sdf_fin.join(F.broadcast(tdf_fin), fc, "full_outer")
+
+        logging.info(f"[CDC] Full outer join constructed ({time.time() - cdc_start:.1f}s)")
+
+        # 6. Status Identification with Hash and Debug
+        src_h = F.md5(src_str_expr)
+        tgt_h = F.md5(tgt_str_expr)
+        
+        se = F.col(f"__src_{s_kc[0]}").isNotNull()
+        te = F.col(f"__tgt_{t_kc[0]}").isNotNull()
+        
+        jdf = jdf.withColumn(op, F.when(se & (~te), F.lit("I"))
+                                 .when((~se) & te, F.lit("D"))
+                                 .when(se & te & (src_h != tgt_h), F.lit("U"))
+                                 .otherwise(F.lit("NC"))) \
+                 .withColumn("__debug_src", src_str_expr) \
+                 .withColumn("__debug_tgt", tgt_str_expr)
+
+        # 7. Split for SCD Type 2
+        jdf = jdf.filter(F.col(op) != 'NC')
+        df_i = jdf.filter(F.col(op).isin('I', 'U'))
+        df_d = jdf.filter(F.col(op).isin('D', 'U')).withColumn(op, F.lit("D"))
+        jdf_final = df_i.unionByName(df_d)
+
+        # 8. Final Projection
+        fcols = []
+        for c in df.columns:
+            if c == op: continue
+            match_t = next((tc for sc, tc in zip(s_cc, t_cc) if sc == c), None)
+            if not match_t: match_t = next((tk for sk, tk in zip(s_kc, t_kc) if sk == c), c)
+
+            if match_t in target_df.columns:
+                fcols.append(F.when(F.col(op) == 'D', F.col(f"__tgt_{match_t}")).otherwise(F.col(f"__src_{c}")).alias(c))
+            else:
+                fcols.append(F.col(f"__src_{c}").alias(c))
+        
+        fcols.extend([F.col(op), F.col("__debug_src"), F.col("__debug_tgt")])
+        
+        # Unpersist cached DataFrames to free memory
+        df.unpersist()
+        target_df.unpersist()
+        
+        logging.info(f"[CDC] Compare complete ({time.time() - cdc_start:.1f}s)")
+        return jdf_final.select(*fcols)
+
+
+class TransformationFactory:
+    _handlers = {'column': ColumnTransformationHandler, 'row': RowTransformationHandler, 'lookup': LookupTransformationHandler, 'cdc': CDCTransformationHandler, 'cdc_compare': CDCTransformationHandler}
+    @classmethod
+    def get_handler(cls, t_type: str) -> TransformationHandler:
+        if t_type not in cls._handlers: raise ValueError(f"Unsupported transform: {t_type}")
+        return cls._handlers[t_type]()
+
+def apply_all_transformations(engine, df: DataFrame, config: Dict, context: Dict = None) -> DataFrame:
+    """Helper to apply array of transformations checking scope"""
+    pipeline_type = config.get('pipeline', {}).get('pipeline_type')
+    is_file_target = pipeline_type in ['FILE_TO_FILE', 'DB_TO_FILE']
+    
+    transforms = config.get('transformations', [])
+    for t_conf in transforms:
+        t_type = t_conf.get('type')
+        if is_file_target and t_type in ['cdc', 'cdc_compare', 'lookup']:
+            logging.warning(f"Skipping {t_type} transformation because Target is FILE. (CDC and lookups are out of scope for FILE targets).")
+            continue
+        handler = TransformationFactory.get_handler(t_type)
+        df = handler.apply(df, t_conf, context)
+        
+    return df
+
+def apply_field_mappings(df: DataFrame, config: Dict) -> DataFrame:
+    mappings = config.get('field_mappings', [])
+    if not mappings: return df
+    s_map = sorted(mappings, key=lambda x: x.get('order', 0))
+    selects = []
+    selected_cols = set()
+    for m in s_map:
+        scol, tcol = m.get('source_column'), m.get('target_column', m.get('source_column'))
+        if scol in df.columns and scol not in selected_cols:
+            selects.append(F.col(scol).alias(tcol) if scol != tcol else F.col(scol))
+            selected_cols.add(scol)
+    for d in ['__debug_src', '__debug_tgt']:
+        if d in df.columns and d not in selected_cols: 
+            selects.append(F.col(d))
+            selected_cols.add(d)
+    return df.select(*selects)
