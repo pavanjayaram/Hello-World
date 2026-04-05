@@ -268,9 +268,12 @@ class CDCTransformationHandler(TransformationHandler):
 
     def _apply_cdc_compare(self, df: DataFrame, config: Dict) -> DataFrame:
         """
-        CDC Compare — based on proven logic from etl_engine_old_app.py.
-        Joins source and target on key columns, computes row-level MD5 checksum
-        from compare columns, and flags each row as I/U/D/NC.
+        CDC Compare — Optimized for large datasets (200K+).
+        Instead of a full outer join (which materializes ALL rows including unchanged),
+        uses 3 targeted joins that only produce changed rows:
+          - LEFT ANTI  → Inserts (source keys not in target)
+          - RIGHT ANTI → Deletes (target keys not in source)
+          - INNER JOIN  → Updates (matching keys where checksum differs)
         """
         spark = df.sparkSession
         import time
@@ -331,7 +334,7 @@ class CDCTransformationHandler(TransformationHandler):
             target_df = spark.createDataFrame([], df.schema)
             target_is_empty = True
 
-        # Fast path: empty target = all inserts, skip join entirely
+        # Fast path: empty target = all inserts
         if target_is_empty:
             logging.info("[CDC] Fast path: target empty — all INSERT")
             return df.withColumn(op_col, F.lit("I")) \
@@ -348,90 +351,106 @@ class CDCTransformationHandler(TransformationHandler):
         
         logging.info(f"[CDC] Checksum src cols: {s_cc}")
         logging.info(f"[CDC] Checksum tgt cols: {t_cc}")
-        logging.info(f"[CDC] Excluded: {exclude_cols}")
         
-        # --- 4. Alias to avoid column name collision ---
-        source_aliased = df.select([F.col(c).alias(f"__src_{c}") for c in df.columns])
-        target_aliased = target_df.select([F.col(c).alias(f"__tgt_{c}") for c in target_df.columns])
-        
-        # --- 5. Full Outer Join on Key Columns ---
-        join_cond = [source_aliased[f"__src_{sk}"] == target_aliased[f"__tgt_{tk}"] for sk, tk in zip(s_kc, t_kc)]
-        final_cond = join_cond[0]
-        for c in join_cond[1:]:
-            final_cond = final_cond & c
-        
-        src_count = df.count()
-        if src_count <= target_count:
-            joined_df = F.broadcast(source_aliased).join(target_aliased, final_cond, "full_outer")
-        else:
-            joined_df = source_aliased.join(F.broadcast(target_aliased), final_cond, "full_outer")
-        logging.info(f"[CDC] Join built ({time.time() - cdc_start:.1f}s)")
-        
-        # --- 6. Row-Level Checksum (MD5) ---
+        # --- 4. Build Normalization Helpers ---
         src_schema = {f.name: str(f.dataType).lower() for f in df.schema.fields}
         tgt_schema = {f.name: str(f.dataType).lower() for f in target_df.schema.fields}
         
-        def get_norm_expr(col_name, is_tgt=False):
-            """Normalize column for stable comparison — matches old engine logic."""
-            ex = F.col(f"__tgt_{col_name}") if is_tgt else F.col(f"__src_{col_name}")
-            s_type = src_schema.get(col_name, '')
-            t_type = tgt_schema.get(col_name, '')
-            
-            is_dt = any(x in s_type or x in t_type for x in ['date', 'timestamp'])
-            is_num = any(x in s_type or x in t_type for x in ['double', 'float', 'decimal'])
-            
+        def norm_col(col_ref, col_name, schema):
+            """Normalize a column for consistent checksum comparison."""
+            dtype = schema.get(col_name, '')
+            is_dt = 'date' in dtype or 'timestamp' in dtype
+            is_num = any(x in dtype for x in ['double', 'float', 'decimal'])
             try:
                 if is_dt:
-                    ex_str = ex.cast("string")
-                    cleaned = F.regexp_replace(ex_str, r" [\+\-]\d{2}(:\d{2})?$", "")
+                    s = col_ref.cast("string")
+                    cleaned = F.regexp_replace(s, r" [\+\-]\d{2}(:\d{2})?$", "")
                     return F.date_format(cleaned.cast("timestamp"), "yyyy-MM-dd HH:mm:ss")
                 elif is_num:
-                    return ex.cast("decimal(20,2)").cast("string")
+                    return col_ref.cast("decimal(20,2)").cast("string")
                 else:
-                    return ex.cast("string")
+                    return col_ref.cast("string")
             except:
-                return ex.cast("string")
+                return col_ref.cast("string")
         
-        src_exprs = [F.coalesce(get_norm_expr(sc, False), F.lit("")) for sc in s_cc]
-        tgt_exprs = [F.coalesce(get_norm_expr(tc, True), F.lit("")) for tc in t_cc]
+        # --- 5. Pre-compute MD5 hash on source and target BEFORE joins ---
+        # This is the key optimization: compute hash once, then use it in joins
         
-        src_str_expr = F.concat_ws("||", *src_exprs)
-        tgt_str_expr = F.concat_ws("||", *tgt_exprs)
+        # Source: add __src_hash column
+        src_hash_parts = [F.coalesce(norm_col(F.col(sc), sc, src_schema), F.lit("")) for sc in s_cc]
+        src_hash_expr = F.md5(F.concat_ws("||", *src_hash_parts))
+        df_with_hash = df.withColumn("__src_hash", src_hash_expr)
         
-        src_hash = F.md5(src_str_expr)
-        tgt_hash = F.md5(tgt_str_expr)
+        # Target: select only key columns + hash (minimal projection for performance)
+        tgt_hash_parts = [F.coalesce(norm_col(F.col(tc), tc, tgt_schema), F.lit("")) for tc in t_cc]
+        tgt_hash_expr = F.md5(F.concat_ws("||", *tgt_hash_parts))
+        # Keep all target columns for Delete row projection, plus the hash
+        target_with_hash = target_df.withColumn("__tgt_hash", tgt_hash_expr)
         
-        # --- 7. Determine Row Status ---
-        src_exists = F.col(f"__src_{s_kc[0]}").isNotNull()
-        tgt_exists = F.col(f"__tgt_{t_kc[0]}").isNotNull()
+        logging.info(f"[CDC] Hashes computed ({time.time() - cdc_start:.1f}s)")
         
-        joined_df = joined_df.withColumn(op_col,
-            F.when(src_exists & (~tgt_exists), F.lit("I"))
-             .when((~src_exists) & tgt_exists, F.lit("D"))
-             .when(src_exists & tgt_exists & (src_hash != tgt_hash), F.lit("U"))
-             .otherwise(F.lit("NC"))
-        ).withColumn("__debug_src", src_str_expr) \
-         .withColumn("__debug_tgt", tgt_str_expr)
+        # --- 6. Three Targeted Joins (NO full outer join!) ---
         
-        # --- 8. Final Projection ---
-        final_cols = []
+        # Build simple key-based join condition (same column names on both sides)
+        key_join = [df_with_hash[sk] == target_with_hash[tk] for sk, tk in zip(s_kc, t_kc)]
+        key_cond = key_join[0]
+        for c in key_join[1:]:
+            key_cond = key_cond & c
+        
+        # 6a. INSERTS: source rows whose keys don't exist in target
+        df_inserts = df_with_hash.join(F.broadcast(target_with_hash.select(t_kc)), key_cond, "left_anti") \
+                                 .withColumn(op_col, F.lit("I"))
+        insert_count = df_inserts.count()
+        logging.info(f"[CDC] Inserts: {insert_count} rows ({time.time() - cdc_start:.1f}s)")
+        
+        # 6b. DELETES: target rows whose keys don't exist in source
+        # For deletes, we need target column values (source is NULL)
+        del_key_join = [target_with_hash[tk] == df_with_hash[sk] for sk, tk in zip(s_kc, t_kc)]
+        del_key_cond = del_key_join[0]
+        for c in del_key_join[1:]:
+            del_key_cond = del_key_cond & c
+        
+        df_deletes_raw = target_with_hash.join(F.broadcast(df_with_hash.select(s_kc)), del_key_cond, "left_anti")
+        # Project delete rows into source schema (use target values)
+        del_cols = []
         for c in df.columns:
             if c in target_df.columns:
-                final_cols.append(
-                    F.when(F.col(op_col) == 'D', F.col(f"__tgt_{c}"))
-                     .otherwise(F.col(f"__src_{c}")).alias(c)
-                )
+                del_cols.append(F.col(c))
             else:
-                final_cols.append(F.col(f"__src_{c}").alias(c))
+                del_cols.append(F.lit(None).alias(c))
+        df_deletes = df_deletes_raw.select(del_cols) \
+                                   .withColumn("__src_hash", F.lit("")) \
+                                   .withColumn(op_col, F.lit("D"))
+        delete_count = df_deletes.count()
+        logging.info(f"[CDC] Deletes: {delete_count} rows ({time.time() - cdc_start:.1f}s)")
         
-        final_cols.append(F.col(op_col))
-        final_cols.append(F.col("__debug_src"))
-        final_cols.append(F.col("__debug_tgt"))
+        # 6c. UPDATES: matching keys where checksum differs
+        # Inner join, then filter where hashes are different
+        df_updates = df_with_hash.join(F.broadcast(target_with_hash.select(t_kc + ["__tgt_hash"])), key_cond, "inner") \
+                                 .filter(F.col("__src_hash") != F.col("__tgt_hash")) \
+                                 .drop("__tgt_hash") \
+                                 .withColumn(op_col, F.lit("U"))
+        update_count = df_updates.count()
+        logging.info(f"[CDC] Updates: {update_count} rows ({time.time() - cdc_start:.1f}s)")
         
-        result = joined_df.select(*final_cols)
+        # --- 7. Union only the changed rows ---
+        # Ensure all DataFrames have the same columns before union
+        all_cols = df.columns + ["__src_hash", op_col]
+        
+        result = df_inserts.select(all_cols) \
+                    .unionByName(df_deletes.select(all_cols)) \
+                    .unionByName(df_updates.select(all_cols))
+        
+        # Add debug columns (empty for performance, the hash is the checksum)
+        result = result.withColumn("__debug_src", F.col("__src_hash")) \
+                       .withColumn("__debug_tgt", F.lit("")) \
+                       .drop("__src_hash")
         
         target_df.unpersist()
-        logging.info(f"[CDC] Compare complete ({time.time() - cdc_start:.1f}s)")
+        
+        total_changes = insert_count + delete_count + update_count
+        logging.info(f"[CDC] Complete: {total_changes} changes (I={insert_count}, U={update_count}, D={delete_count}) "
+                     f"out of {df.count()} source rows ({time.time() - cdc_start:.1f}s)")
         return result
 
 
