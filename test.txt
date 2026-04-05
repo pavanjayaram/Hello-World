@@ -267,34 +267,50 @@ class CDCTransformationHandler(TransformationHandler):
         return F.when(is_empty | res.isNull(), F.lit("__NULL__")).otherwise(res)
 
     def _apply_cdc_compare(self, df: DataFrame, config: Dict) -> DataFrame:
+        """
+        CDC Compare — based on proven logic from etl_engine_old_app.py.
+        Joins source and target on key columns, computes row-level MD5 checksum
+        from compare columns, and flags each row as I/U/D/NC.
+        """
         spark = df.sparkSession
-        op = config.get('op_column', 'op_type')
-        t_type = config.get('target_type', 'DB')
-        path = config.get('target_path')
-        
         import time
         cdc_start = time.time()
         
-        # 1. Resolve Keys and Comparison Columns
-        s_kc = [k.strip() for k in config.get('source_key_columns', config.get('key_columns', []))]
-        t_kc = [k.strip() for k in config.get('target_key_columns', config.get('key_columns', []))]
-        s_cc = [c.strip() for c in config.get('source_compare_columns', config.get('compare_columns', []))]
-        t_cc = [c.strip() for c in config.get('target_compare_columns', config.get('compare_columns', []))]
-        ec = [e.strip() for e in config.get('exclude_columns', [])]
-
-        if len(s_kc) != len(t_kc):
-            raise ValueError(f"CDC Join Key mismatch: {len(s_kc)} vs {len(t_kc)}")
-        if len(s_cc) != len(t_cc):
-            raise ValueError(f"CDC Compare Column mismatch: {len(s_cc)} vs {len(t_cc)}")
-
-        # 2. Load Target Table — CACHE immediately to avoid re-reading JDBC on every operation
+        target_type = config.get('target_type', 'FILE')
+        path = config.get('target_path')
+        op_col = config.get('op_column', 'op_type')
+        
+        # --- 1. Resolve Key and Compare Columns ---
+        key_cols = config.get('key_columns', [])
+        s_kc = [k.strip() for k in config.get('source_key_columns', key_cols)]
+        t_kc = [k.strip() for k in config.get('target_key_columns', key_cols)]
+        
+        compare_cols = config.get('compare_columns', [])
+        s_cc = [c.strip() for c in config.get('source_compare_columns', compare_cols)]
+        t_cc = [c.strip() for c in config.get('target_compare_columns', compare_cols)]
+        
+        exclude_cols = [e.strip() for e in config.get('exclude_columns', [])]
+        
+        if not s_kc:
+            raise ValueError("Key columns required for CDC Compare")
+        if not t_kc:
+            t_kc = s_kc
+        
+        logging.info(f"[CDC] Compare against {target_type}: {path}")
+        logging.info(f"[CDC] Key columns: source={s_kc}, target={t_kc}")
+        
+        # --- 2. Load Target Table ---
         sconf = {
-            'type': t_type, 'path': path, 'table': path, 'schema': config.get('schema'),
-            'db_type': config.get('db_type'), 'connectionString': config.get('connection_string')
+            'type': target_type, 'path': path, 'table': path,
+            'schema': config.get('schema'), 'db_type': config.get('db_type'),
+            'connectionString': config.get('connection_string'),
+            'format': config.get('format', 'parquet'),
+            'options': config.get('options', {'header': 'true', 'inferSchema': 'true'})
         }
+        
         target_is_empty = False
         try:
-            target_df = SourceFactory.get_handler(t_type).read(spark, sconf)
+            target_df = SourceFactory.get_handler(target_type).read(spark, sconf)
             active_col = next((c for c in target_df.columns if c.lower() in ('active_flag', 'is_active', 'is_current')), None)
             if active_col:
                 a_type = next((f.dataType.typeName().lower() for f in target_df.schema.fields if f.name == active_col), "string")
@@ -305,118 +321,118 @@ class CDCTransformationHandler(TransformationHandler):
                 else:
                     target_df = target_df.filter(F.col(active_col).isin('Y', 'y', '1'))
             
-            # CRITICAL: Cache target to prevent repeated JDBC reads during join
             target_df = target_df.cache()
-            target_count = target_df.count()  # Force cache materialization
-            logging.info(f"[CDC] Target table loaded and cached: {target_count} active rows ({time.time() - cdc_start:.1f}s)")
-            
+            target_count = target_df.count()
+            logging.info(f"[CDC] Target loaded: {target_count} active rows ({time.time() - cdc_start:.1f}s)")
             if target_count == 0:
                 target_is_empty = True
-        except:
+        except Exception as e:
+            logging.warning(f"[CDC] Failed to load target: {e}. All rows → INSERT.")
             target_df = spark.createDataFrame([], df.schema)
             target_is_empty = True
-            logging.info("[CDC] Target table is empty or does not exist — all rows will be INSERTs")
 
-        # Fast path: if target is empty, ALL source rows are inserts — skip the expensive join
+        # Fast path: empty target = all inserts, skip join entirely
         if target_is_empty:
-            logging.info("[CDC] Fast path: skipping full outer join (target is empty)")
-            result = df.withColumn(op, F.lit("I")) \
-                       .withColumn("__debug_src", F.lit("")) \
-                       .withColumn("__debug_tgt", F.lit(""))
-            return result
+            logging.info("[CDC] Fast path: target empty — all INSERT")
+            return df.withColumn(op_col, F.lit("I")) \
+                     .withColumn("__debug_src", F.lit("")) \
+                     .withColumn("__debug_tgt", F.lit(""))
 
-        # Cache source too — it gets referenced multiple times in the join plan
-        df = df.cache()
-        src_count = df.count()
-        logging.info(f"[CDC] Source cached: {src_count} rows ({time.time() - cdc_start:.1f}s)")
-
+        # --- 3. Determine Compare Columns ---
         if not s_cc:
-            common = [c for c in set(df.columns).intersection(set(target_df.columns)) if c not in s_kc and c not in t_kc and c not in ec]
-            s_cc = sorted(common); t_cc = sorted(common)
+            common = set(df.columns).intersection(set(target_df.columns))
+            s_cc = sorted([c for c in common if c not in s_kc and c not in t_kc and c not in exclude_cols])
+            t_cc = s_cc[:]
+        if not t_cc:
+            t_cc = s_cc[:]
         
-        logging.info(f"[CDC] Key columns: source={s_kc}, target={t_kc}")
-        logging.info(f"[CDC] Checksum columns: source={s_cc}")
-        logging.info(f"[CDC]                   target={t_cc}")
-        logging.info(f"[CDC] Excluded from compare: {ec}")
-        logging.info(f"[CDC] Row-level checksum = MD5( {'||'.join(s_cc)} ) — compared via EMP_ID join")
-
-        # 3. Schema Prep for Normalization
-        def get_field_type(schema, name):
-            field = next((f for f in schema.fields if f.name.lower() == name.lower()), None)
-            return str(field.dataType).lower() if field else "string"
-
-        # 4. Normalization + Debug String Construction
-        src_norm_exprs = []
-        for sc, tc in zip(s_cc, t_cc):
-            m_type = get_field_type(target_df.schema, tc)
-            src_norm_exprs.append(self._normalize_column(f"__src_{sc}", m_type))
-            
-        tgt_norm_exprs = []
-        for sc, tc in zip(s_cc, t_cc):
-            m_type = get_field_type(target_df.schema, tc)
-            tgt_norm_exprs.append(self._normalize_column(f"__tgt_{tc}", m_type))
-
-        src_str_expr = F.concat_ws("||", *src_norm_exprs)
-        tgt_str_expr = F.concat_ws("||", *tgt_norm_exprs)
-
-        # 5. Full Outer Join — use broadcast for smaller DataFrame
-        sdf_fin = df.select([F.col(c).alias(f"__src_{c}") for c in df.columns])
-        tdf_fin = target_df.select([F.col(c).alias(f"__tgt_{c}") for c in target_df.columns])
-
-        jconds = [sdf_fin[f"__src_{sk}"] == tdf_fin[f"__tgt_{tk}"] for sk, tk in zip(s_kc, t_kc)]
-        fc = jconds[0]
-        for c in jconds[1:]: fc = fc & c
+        logging.info(f"[CDC] Checksum src cols: {s_cc}")
+        logging.info(f"[CDC] Checksum tgt cols: {t_cc}")
+        logging.info(f"[CDC] Excluded: {exclude_cols}")
         
-        # Broadcast the smaller side to avoid shuffle
+        # --- 4. Alias to avoid column name collision ---
+        source_aliased = df.select([F.col(c).alias(f"__src_{c}") for c in df.columns])
+        target_aliased = target_df.select([F.col(c).alias(f"__tgt_{c}") for c in target_df.columns])
+        
+        # --- 5. Full Outer Join on Key Columns ---
+        join_cond = [source_aliased[f"__src_{sk}"] == target_aliased[f"__tgt_{tk}"] for sk, tk in zip(s_kc, t_kc)]
+        final_cond = join_cond[0]
+        for c in join_cond[1:]:
+            final_cond = final_cond & c
+        
+        src_count = df.count()
         if src_count <= target_count:
-            logging.info(f"[CDC] Broadcasting source ({src_count} rows) for join")
-            jdf = F.broadcast(sdf_fin).join(tdf_fin, fc, "full_outer")
+            joined_df = F.broadcast(source_aliased).join(target_aliased, final_cond, "full_outer")
         else:
-            logging.info(f"[CDC] Broadcasting target ({target_count} rows) for join")
-            jdf = sdf_fin.join(F.broadcast(tdf_fin), fc, "full_outer")
-
-        logging.info(f"[CDC] Full outer join constructed ({time.time() - cdc_start:.1f}s)")
-
-        # 6. Status Identification with Hash and Debug
-        src_h = F.md5(src_str_expr)
-        tgt_h = F.md5(tgt_str_expr)
+            joined_df = source_aliased.join(F.broadcast(target_aliased), final_cond, "full_outer")
+        logging.info(f"[CDC] Join built ({time.time() - cdc_start:.1f}s)")
         
-        se = F.col(f"__src_{s_kc[0]}").isNotNull()
-        te = F.col(f"__tgt_{t_kc[0]}").isNotNull()
+        # --- 6. Row-Level Checksum (MD5) ---
+        src_schema = {f.name: str(f.dataType).lower() for f in df.schema.fields}
+        tgt_schema = {f.name: str(f.dataType).lower() for f in target_df.schema.fields}
         
-        jdf = jdf.withColumn(op, F.when(se & (~te), F.lit("I"))
-                                 .when((~se) & te, F.lit("D"))
-                                 .when(se & te & (src_h != tgt_h), F.lit("U"))
-                                 .otherwise(F.lit("NC"))) \
-                 .withColumn("__debug_src", src_str_expr) \
-                 .withColumn("__debug_tgt", tgt_str_expr)
-
-        # 7. Split for SCD Type 2
-        jdf = jdf.filter(F.col(op) != 'NC')
-        df_i = jdf.filter(F.col(op).isin('I', 'U'))
-        df_d = jdf.filter(F.col(op).isin('D', 'U')).withColumn(op, F.lit("D"))
-        jdf_final = df_i.unionByName(df_d)
-
-        # 8. Final Projection
-        fcols = []
+        def get_norm_expr(col_name, is_tgt=False):
+            """Normalize column for stable comparison — matches old engine logic."""
+            ex = F.col(f"__tgt_{col_name}") if is_tgt else F.col(f"__src_{col_name}")
+            s_type = src_schema.get(col_name, '')
+            t_type = tgt_schema.get(col_name, '')
+            
+            is_dt = any(x in s_type or x in t_type for x in ['date', 'timestamp'])
+            is_num = any(x in s_type or x in t_type for x in ['double', 'float', 'decimal'])
+            
+            try:
+                if is_dt:
+                    ex_str = ex.cast("string")
+                    cleaned = F.regexp_replace(ex_str, r" [\+\-]\d{2}(:\d{2})?$", "")
+                    return F.date_format(cleaned.cast("timestamp"), "yyyy-MM-dd HH:mm:ss")
+                elif is_num:
+                    return ex.cast("decimal(20,2)").cast("string")
+                else:
+                    return ex.cast("string")
+            except:
+                return ex.cast("string")
+        
+        src_exprs = [F.coalesce(get_norm_expr(sc, False), F.lit("")) for sc in s_cc]
+        tgt_exprs = [F.coalesce(get_norm_expr(tc, True), F.lit("")) for tc in t_cc]
+        
+        src_str_expr = F.concat_ws("||", *src_exprs)
+        tgt_str_expr = F.concat_ws("||", *tgt_exprs)
+        
+        src_hash = F.md5(src_str_expr)
+        tgt_hash = F.md5(tgt_str_expr)
+        
+        # --- 7. Determine Row Status ---
+        src_exists = F.col(f"__src_{s_kc[0]}").isNotNull()
+        tgt_exists = F.col(f"__tgt_{t_kc[0]}").isNotNull()
+        
+        joined_df = joined_df.withColumn(op_col,
+            F.when(src_exists & (~tgt_exists), F.lit("I"))
+             .when((~src_exists) & tgt_exists, F.lit("D"))
+             .when(src_exists & tgt_exists & (src_hash != tgt_hash), F.lit("U"))
+             .otherwise(F.lit("NC"))
+        ).withColumn("__debug_src", src_str_expr) \
+         .withColumn("__debug_tgt", tgt_str_expr)
+        
+        # --- 8. Final Projection ---
+        final_cols = []
         for c in df.columns:
-            if c == op: continue
-            match_t = next((tc for sc, tc in zip(s_cc, t_cc) if sc == c), None)
-            if not match_t: match_t = next((tk for sk, tk in zip(s_kc, t_kc) if sk == c), c)
-
-            if match_t in target_df.columns:
-                fcols.append(F.when(F.col(op) == 'D', F.col(f"__tgt_{match_t}")).otherwise(F.col(f"__src_{c}")).alias(c))
+            if c in target_df.columns:
+                final_cols.append(
+                    F.when(F.col(op_col) == 'D', F.col(f"__tgt_{c}"))
+                     .otherwise(F.col(f"__src_{c}")).alias(c)
+                )
             else:
-                fcols.append(F.col(f"__src_{c}").alias(c))
+                final_cols.append(F.col(f"__src_{c}").alias(c))
         
-        fcols.extend([F.col(op), F.col("__debug_src"), F.col("__debug_tgt")])
+        final_cols.append(F.col(op_col))
+        final_cols.append(F.col("__debug_src"))
+        final_cols.append(F.col("__debug_tgt"))
         
-        # Unpersist cached DataFrames to free memory
-        df.unpersist()
+        result = joined_df.select(*final_cols)
+        
         target_df.unpersist()
-        
         logging.info(f"[CDC] Compare complete ({time.time() - cdc_start:.1f}s)")
-        return jdf_final.select(*fcols)
+        return result
 
 
 class TransformationFactory:
