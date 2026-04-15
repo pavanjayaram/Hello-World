@@ -1,19 +1,31 @@
 {
-  "load": {
-    "mode": "file_to_file",
-    "result_json": "data/reports/load_file_to_file_result.json",
-    "source": {
-      "type": "file",
-      "path": "data/source/incoming_customers.csv",
-      "delimiter": ","
-    },
-    "target": {
-      "type": "file",
-      "path": "data/target/customers_copy.psv",
-      "delimiter": "|"
-    }
+  "pipeline": {
+    "retry_count": 1,
+    "retry_delay_seconds": 2,
+    "load_config": "config/load_config.json",
+    "validation_config": "config/validation_config.json"
+  },
+  "file_copy": {
+    "source_file": "data/source/incoming_customers.csv",
+    "target_directory": "data/target",
+    "rename_pattern": "{stem}_{timestamp}_{batch_id}{suffix}",
+    "batch_id": "BATCH001"
   },
   "logging": {
-    "data_loader_log": "data/logs/data_loader.log"
+    "pipeline_log": "data/logs/main_pipeline.log",
+    "file_copy_log": "data/logs/file_copy.log",
+    "data_loader_log": "data/logs/data_loader.log",
+    "validator_log": "data/logs/validator.log"
+  },
+  "alerting": {
+    "enabled": false,
+    "smtp_host": "localhost",
+    "smtp_port": 25,
+    "sender": "etl-framework@example.com",
+    "recipients": [
+      "dataops@example.com"
+    ],
+    "subject": "ETL Pipeline Failure"
   }
 }
+
