@@ -1,22 +1,16 @@
 {
   "load": {
-    "mode": "file_to_db",
-    "result_json": "data/reports/load_file_to_db_result.json",
+    "mode": "file_to_file",
+    "result_json": "data/reports/load_file_to_file_result.json",
     "source": {
       "type": "file",
-      "path": "data/target/placeholder.csv",
+      "path": "data/source/incoming_customers.csv",
       "delimiter": ","
     },
     "target": {
-      "type": "db",
-      "db": {
-        "type": "oracle",
-        "user": "etl_user",
-        "password": "etl_password",
-        "connection_string": "hostname:1521/ORCLPDB1",
-        "table": "customers_target",
-        "load_strategy": "replace"
-      }
+      "type": "file",
+      "path": "data/target/customers_copy.psv",
+      "delimiter": "|"
     }
   },
   "logging": {
