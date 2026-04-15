@@ -1,7 +1,7 @@
 {
   "load": {
-    "mode": "db_to_db",
-    "result_json": "data/reports/load_db_to_db_result.json",
+    "mode": "db_to_file",
+    "result_json": "data/reports/load_db_to_file_result.json",
     "source": {
       "type": "db",
       "db": {
@@ -10,18 +10,12 @@
         "password": "etl_password",
         "connection_string": "hostname:1521/ORCLPDB1"
       },
-      "query": "SELECT customer_id, first_name, last_name, email, city, status FROM customers_stage"
+      "query": "SELECT customer_id, first_name, last_name, email, city, status FROM customers_source"
     },
     "target": {
-      "type": "db",
-      "db": {
-        "type": "oracle",
-        "user": "etl_user",
-        "password": "etl_password",
-        "connection_string": "hostname:1521/ORCLPDB1",
-        "table": "customers_target",
-        "load_strategy": "append"
-      }
+      "type": "file",
+      "path": "data/target/customers_export.csv",
+      "delimiter": ","
     }
   },
   "logging": {
