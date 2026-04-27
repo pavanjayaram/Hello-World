@@ -1,532 +1,181 @@
-import React, { useState, useRef } from 'react';
-import { DataSourceConfig, FileSource, FileTarget, DatabaseSource, DatabaseTarget } from '../types';
-import apiClient from '../services/apiClient';
-import './DataSourceConfig.css';
-import FileBrowserModal from './FileBrowserModal';
+import React from 'react';
+import { ApiError } from '../services/apiClient';
 
-interface DataSourceConfigProps {
-  config: DataSourceConfig;
-  onChange: (config: DataSourceConfig) => void;
+interface ErrorDisplayProps {
+  error: string | Error | ApiError | null;
+  title?: string;
+  showRetry?: boolean;
+  onRetry?: () => void;
+  className?: string;
 }
 
-const DataSourceConfigComponent: React.FC<DataSourceConfigProps> = ({ config, onChange }) => {
-  const [connectionStatus, setConnectionStatus] = useState<{
-    side: 'source' | 'target' | null;
-    testing: boolean;
-    success?: boolean;
-    error?: string;
-  }>({ side: null, testing: false });
+const ErrorDisplay: React.FC<ErrorDisplayProps> = ({
+  error,
+  title = "Error",
+  showRetry = false,
+  onRetry,
+  className = ""
+}) => {
+  if (!error) return null;
 
-  const [showFileBrowser, setShowFileBrowser] = useState(false);
-  const [browserTarget, setBrowserTarget] = useState<'source' | 'target' | null>(null);
+  const getErrorMessage = (): string => {
+    if (typeof error === 'string') {
+      return error;
+    }
+    if (error instanceof ApiError) {
+      return error.message;
+    }
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return 'An unknown error occurred';
+  };
 
-  const [showAdvancedSource, setShowAdvancedSource] = useState(false);
-  const [showAdvancedTarget, setShowAdvancedTarget] = useState(false);
+  const getErrorCode = (): string | undefined => {
+    if (error instanceof ApiError) {
+      return error.errorCode;
+    }
+    return undefined;
+  };
 
-  const sourceFileInputRef = useRef<HTMLInputElement>(null);
-  const targetFileInputRef = useRef<HTMLInputElement>(null);
+  const getErrorDetails = (): Record<string, any> | undefined => {
+    if (error instanceof ApiError) {
+      return error.details;
+    }
+    return undefined;
+  };
 
-  const [availableConnections, setAvailableConnections] = useState<{ key: string; value: string }[]>([]);
-
-  React.useEffect(() => {
-    const fetchConnections = async () => {
-      try {
-        const conns = await apiClient.getConnections();
-        setAvailableConnections(conns || []);
-      } catch (e) {
-        console.error("Failed to fetch connections", e);
+  const getTroubleshootingSteps = (): string[] => {
+    if (error instanceof ApiError) {
+      const details = error.details;
+      
+      // LLM unavailability errors
+      if (error.isErrorCode('LLM_UNAVAILABLE') || error.isErrorCode('LLM_CONNECTION_ERROR')) {
+        return details?.troubleshooting || [
+          "Please start Ollama with 'ollama serve'",
+          "Ensure codellama:7b is pulled with 'ollama pull codellama:7b'",
+          "Check if the model endpoint is accessible",
+          "Verify firewall settings allow connection to the model endpoint"
+        ];
       }
-    };
-    fetchConnections();
-  }, []);
-
-  const handleTestConnection = async (side: 'source' | 'target') => {
-    setConnectionStatus({ side, testing: true });
-    const currentConfig = side === 'source' ? config.source : config.target;
-
-    try {
-      const result = await apiClient.testDbConnection(currentConfig);
-      setConnectionStatus({
-        side,
-        testing: false,
-        success: result.success,
-        error: result.error
-      });
-    } catch (error) {
-      console.error('Test connection error:', error);
-      setConnectionStatus({
-        side,
-        testing: false,
-        success: false,
-        error: 'Test failed unexpectedly'
-      });
-    }
-  };
-
-  const updateConfig = (updates: Partial<DataSourceConfig>) => {
-    let newConfig = { ...config, ...updates };
-
-    // If mode changed, reset source/target types to defaults
-    if (updates.mode) {
-      if (updates.mode === 'file-to-db') {
-        newConfig.target = { type: 'postgres', connectionString: '', schema: 'public', table: '' } as DatabaseTarget;
-        newConfig.source = { type: 'csv', path: '', delimiter: ',' } as FileSource;
-      } else if (updates.mode === 'db-to-file') {
-        newConfig.source = { type: 'postgres', connectionString: '', schema: 'public', table: '' } as DatabaseSource;
-        newConfig.target = { type: 'csv', path: '', delimiter: ',' } as FileTarget;
-      } else if (updates.mode === 'db-to-db') {
-        newConfig.source = { type: 'postgres', connectionString: '', schema: 'public', table: '' } as DatabaseSource;
-        newConfig.target = { type: 'postgres', connectionString: '', schema: 'public', table: '' } as DatabaseTarget;
-      } else if (updates.mode === 'file-to-file') {
-        newConfig.source = { type: 'csv', path: '', delimiter: ',' } as FileSource;
-        newConfig.target = { type: 'csv', path: '', delimiter: ',' } as FileTarget;
+      
+      // Network errors
+      if (error.isNetworkError()) {
+        return [
+          "Check your internet connection",
+          "Verify the backend server is running",
+          "Check if the API endpoint is accessible",
+          "Try refreshing the page"
+        ];
+      }
+      
+      // Server errors
+      if (error.isServerError()) {
+        return [
+          "The server encountered an internal error",
+          "Please try again in a few moments",
+          "If the problem persists, contact support"
+        ];
+      }
+      
+      // Configuration validation errors
+      if (error.isErrorCode('INVALID_CONFIG')) {
+        return [
+          "Review your configuration for missing or invalid fields",
+          "Ensure all required fields are filled out",
+          "Check that file paths and connection strings are correct",
+          "Verify delimiter settings for delimited files"
+        ];
       }
     }
-    onChange(newConfig);
+    
+    return [];
   };
 
-  const updateSourceConfig = (updates: Partial<FileSource | DatabaseSource>) => {
-    onChange({ ...config, source: { ...config.source, ...updates } as any });
-  };
-
-  const updateTargetConfig = (updates: Partial<FileTarget | DatabaseTarget>) => {
-    onChange({ ...config, target: { ...config.target, ...updates } as any });
-  };
-
-  const openFileBrowser = (target: 'source' | 'target') => {
-    setBrowserTarget(target);
-    setShowFileBrowser(true);
-  };
-
-  const handleFileSelect = (path: string) => {
-    if (browserTarget === 'source') {
-      updateSourceConfig({ path });
-    } else if (browserTarget === 'target') {
-      updateTargetConfig({ path });
-    }
-    setShowFileBrowser(false);
-    setBrowserTarget(null);
-  };
-
-  // Helper to handle native file input (fallback/legacy)
-  const handleNativeFileSelect = (event: React.ChangeEvent<HTMLInputElement>, side: 'source' | 'target') => {
-    const file = event.target.files?.[0];
-    if (file) {
-      const updateHandler = side === 'source' ? updateSourceConfig : updateTargetConfig;
-      // We can only get the filename from the browser, not the full path
-      updateHandler({ path: file.name });
-    }
-  };
-
-
-  const renderFileConfig = (side: 'source' | 'target') => {
-    const isSource = side === 'source';
-    const currentConfig = isSource ? config.source as FileSource : config.target as FileTarget;
-    const updateHandler = isSource ? updateSourceConfig : updateTargetConfig;
-
-    return (
-      <div className="config-section">
-        <div className="form-group">
-          <label>File Type</label>
-          <select
-            value={currentConfig?.type || 'csv'}
-            onChange={(e) => updateHandler({ type: e.target.value as any })}
-            className="form-control"
-          >
-            <option value="csv">CSV</option>
-            <option value="json">JSON</option>
-            <option value="parquet">Parquet</option>
-            <option value="excel">Excel</option>
-            <option value="dat">DAT</option>
-            <option value="txt">Text</option>
-          </select>
-        </div>
-
-        <div className="form-group">
-          <label htmlFor={`${side}-path`}>{isSource ? 'Source' : 'Target'} File:</label>
-          <div className="file-input-group">
-            <input
-              id={`${side}-path`}
-              type="text"
-              value={currentConfig?.path || ''}
-              onChange={(e) => updateHandler({ path: e.target.value })}
-              className="form-control"
-              placeholder={`Enter absolute path (e.g., /Users/name/data.csv)`}
-            />
-            <div className="button-group">
-              <button
-                type="button"
-                onClick={() => openFileBrowser(side)}
-                className="btn btn-secondary btn-browse"
-                title="Browse server files"
-              >
-                Browse Server
-              </button>
-            </div>
-          </div>
-
-          {/* Hidden fallback file input */}
-          <input
-            ref={isSource ? sourceFileInputRef : targetFileInputRef}
-            type="file"
-            onChange={(e) => handleNativeFileSelect(e, side)}
-            style={{ display: 'none' }}
-          />
-
-          <div className="help-text">
-            <strong>Note:</strong> Use "Browse Server" to select files from the backend filesystem with full paths.
-          </div>
-        </div>
-
-        {(['csv', 'txt', 'dat'].includes(currentConfig?.type || '')) && (
-          <div className="form-group">
-            <label>Delimiter</label>
-            <select
-              value={currentConfig?.delimiter || ','}
-              onChange={(e) => updateHandler({ delimiter: e.target.value })}
-              className="form-control"
-            >
-              <option value=",">Comma (,)</option>
-              <option value="\t">Tab</option>
-              <option value="|">Pipe (|)</option>
-              <option value=";">Semicolon (;)</option>
-            </select>
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  const renderDatabaseConfig = (side: 'source' | 'target') => {
-    const isSource = side === 'source';
-    const currentConfig = isSource ? config.source as DatabaseSource : config.target as DatabaseTarget;
-    const updateHandler = isSource ? updateSourceConfig : updateTargetConfig;
-
-    return (
-      <div className="config-section">
-        <div className="form-group">
-          <label>Database Type</label>
-          <select
-            value={currentConfig?.type || 'postgres'}
-            onChange={(e) => updateHandler({ type: e.target.value as any })}
-            className="form-control"
-          >
-            <option value="postgres">PostgreSQL</option>
-            <option value="mysql">MySQL</option>
-            <option value="oracle">Oracle</option>
-            <option value="sqlserver">SQL Server</option>
-            <option value="mongodb">MongoDB</option>
-          </select>
-        </div>
-
-        <div className="form-group">
-          <label>Connection String</label>
-          <div className="input-group">
-            <input
-              type="text"
-              list={`connection-list-${side}`}
-              value={currentConfig?.connectionString || ''}
-              onChange={(e) => updateHandler({ connectionString: e.target.value })}
-              className="form-control"
-              placeholder="postgresql://... or Select Env Var"
-            />
-            <datalist id={`connection-list-${side}`}>
-              {availableConnections.map((c) => (
-                <option key={c.key} value={c.key}>{c.key} ({c.value})</option>
-              ))}
-            </datalist>
-          </div>
-          <div style={{ marginTop: '5px' }}>
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm"
-              onClick={() => handleTestConnection(side)}
-              disabled={connectionStatus.testing || !currentConfig.connectionString}
-            >
-              {connectionStatus.testing && connectionStatus.side === side ? 'Testing...' : 'Test Connection'}
-            </button>
-            {connectionStatus.side === side && connectionStatus.success === true && (
-              <span style={{ marginLeft: '10px', color: 'green' }}>✅ Connection Successful</span>
-            )}
-            {connectionStatus.side === side && connectionStatus.success === false && (
-              <div style={{ marginTop: '5px', color: 'red', fontSize: '0.9em' }}>
-                ❌ {connectionStatus.error}
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="form-row">
-          <div className="form-group half">
-            <label>Schema</label>
-            <input
-              type="text"
-              value={currentConfig?.schema || ''}
-              onChange={(e) => updateHandler({ schema: e.target.value })}
-              className="form-control"
-              placeholder="public"
-            />
-          </div>
-          <div className="form-group half">
-            <label>Table Name</label>
-            <input
-              type="text"
-              value={currentConfig?.table || ''}
-              onChange={(e) => updateHandler({ table: e.target.value })}
-              className="form-control"
-              placeholder="table_name"
-            />
-          </div>
-        </div>
-
-        {/* Write Mode Selector — only for Target */}
-        {!isSource && (
-          <div className="form-group" style={{ marginTop: '15px' }}>
-            <label>Write Mode</label>
-            <select
-              value={(currentConfig as any)?.writeMode || 'append'}
-              onChange={(e) => updateHandler({ writeMode: e.target.value } as any)}
-              className="form-control"
-            >
-              <option value="append">Append (Insert into existing table)</option>
-              <option value="truncate_and_load">Truncate &amp; Load (Clear table, then insert)</option>
-            </select>
-            <small className="form-text text-muted">
-              {(currentConfig as any)?.writeMode === 'truncate_and_load'
-                ? '⚡ Truncates the table first, preserving structure, indexes, and grants.'
-                : 'Inserts new rows into the existing table without removing existing data.'}
-            </small>
-          </div>
-        )}
-
-        {isSource && (
-          <div className="form-group" style={{ marginTop: '10px' }}>
-            <label>SQL Query (Optional)</label>
-            <textarea
-              value={(currentConfig as DatabaseSource)?.query || ''}
-              onChange={(e) => updateHandler({ query: e.target.value })}
-              className="form-control"
-              placeholder="SELECT * FROM table WHERE condition..."
-              rows={3}
-              style={{ fontFamily: 'monospace' }}
-            />
-            <small className="form-text text-muted">
-              If provided, this query will be pushed down to the database instead of reading the full table.
-            </small>
-          </div>
-        )}
-
-        {/* Advanced Options Toggle */}
-        <div style={{ marginTop: '15px' }}>
-          <button
-            type="button"
-            className="btn btn-secondary btn-sm"
-            onClick={() => isSource ? setShowAdvancedSource(!showAdvancedSource) : setShowAdvancedTarget(!showAdvancedTarget)}
-          >
-            {isSource ? (showAdvancedSource ? 'Hide Advanced Options' : 'Show Advanced Options') : (showAdvancedTarget ? 'Hide Advanced Options' : 'Show Advanced Options')}
-          </button>
-
-          {((isSource && showAdvancedSource) || (!isSource && showAdvancedTarget)) && (
-            <div style={{ marginTop: '10px', border: '1px solid #ddd', padding: '10px', borderRadius: '4px' }}>
-              <h5 style={{ marginTop: 0, marginBottom: '10px' }}>Advanced Performance Options</h5>
-
-              {isSource ? (
-                <>
-                  <div className="form-group" style={{ marginTop: '10px' }}>
-                    <label>Partition Column (Numeric)</label>
-                    <input
-                      type="text"
-                      value={(currentConfig as DatabaseSource)?.partitionColumn || ''}
-                      onChange={(e) => updateHandler({ partitionColumn: e.target.value })}
-                      className="form-control"
-                      placeholder="e.g., id"
-                    />
-                  </div>
-                  <div className="form-row">
-                    <div className="form-group half">
-                      <label>Lower Bound</label>
-                      <input
-                        type="text"
-                        value={(currentConfig as DatabaseSource)?.lowerBound || ''}
-                        onChange={(e) => updateHandler({ lowerBound: e.target.value })}
-                        className="form-control"
-                        placeholder="Min Value"
-                      />
-                    </div>
-                    <div className="form-group half">
-                      <label>Upper Bound</label>
-                      <input
-                        type="text"
-                        value={(currentConfig as DatabaseSource)?.upperBound || ''}
-                        onChange={(e) => updateHandler({ upperBound: e.target.value })}
-                        className="form-control"
-                        placeholder="Max Value"
-                      />
-                    </div>
-                  </div>
-                  <div className="form-row">
-                    <div className="form-group half">
-                      <label>Num Partitions</label>
-                      <input
-                        type="number"
-                        value={(currentConfig as DatabaseSource)?.numPartitions || ''}
-                        onChange={(e) => updateHandler({ numPartitions: e.target.value })}
-                        className="form-control"
-                        placeholder="e.g., 10"
-                      />
-                    </div>
-                    <div className="form-group half">
-                      <label>Fetch Size</label>
-                      <input
-                        type="number"
-                        value={(currentConfig as DatabaseSource)?.fetchsize || ''}
-                        onChange={(e) => updateHandler({ fetchsize: e.target.value })}
-                        className="form-control"
-                        placeholder="e.g., 1000"
-                      />
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="form-row">
-                    <div className="form-group">
-                      <label>Primary Key (for Updates/CDC)</label>
-                      <input
-                        type="text"
-                        value={(currentConfig as DatabaseTarget)?.primaryKey || ''}
-                        onChange={(e) => updateHandler({ primaryKey: e.target.value })}
-                        className="form-control"
-                        placeholder="e.g., EMP_ID"
-                      />
-                      <small className="form-text text-muted">Required for Update/Delete operations</small>
-                    </div>
-                  </div>
-                  <div className="form-row">
-                    <div className="form-group half">
-                      <label>Batch Size</label>
-                      <input
-                        type="number"
-                        value={(currentConfig as DatabaseTarget)?.batchsize || ''}
-                        onChange={(e) => updateHandler({ batchsize: e.target.value })}
-                        className="form-control"
-                        placeholder="e.g., 1000"
-                      />
-                    </div>
-                    <div className="form-group half">
-                      <label>Isolation Level</label>
-                      <select
-                        value={(currentConfig as DatabaseTarget)?.isolationLevel || 'READ_UNCOMMITTED'}
-                        onChange={(e) => updateHandler({ isolationLevel: e.target.value })}
-                        className="form-control"
-                      >
-                        <option value="NONE">None</option>
-                        <option value="READ_UNCOMMITTED">Read Uncommitted</option>
-                        <option value="READ_COMMITTED">Read Committed</option>
-                        <option value="REPEATABLE_READ">Repeatable Read</option>
-                        <option value="SERIALIZABLE">Serializable</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  {/* Chunked Load — only for Append mode */}
-                  {((currentConfig as any)?.writeMode || 'append') === 'append' && (
-                    <div style={{ marginTop: '15px', border: '1px solid #17a2b8', padding: '10px', borderRadius: '4px', backgroundColor: '#e8f4f8' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
-                        <label style={{ margin: 0, fontWeight: 600, color: '#0c5460' }}>
-                          <input
-                            type="checkbox"
-                            checked={(currentConfig as any)?.chunkedLoad || false}
-                            onChange={(e) => updateHandler({ chunkedLoad: e.target.checked } as any)}
-                            style={{ marginRight: '8px' }}
-                          />
-                          ⚡ Enable Chunked Load
-                        </label>
-                      </div>
-                      <small className="form-text text-muted" style={{ display: 'block', marginBottom: '10px' }}>
-                        Splits data into chunks with per-chunk metadata tracking and retry capability.
-                      </small>
-        
-                      {(currentConfig as any)?.chunkedLoad && (
-                        <div className="form-row">
-                          <div className="form-group half">
-                            <label>Number of Chunks</label>
-                            <input
-                              type="number"
-                              min="2"
-                              max="100"
-                              value={(currentConfig as any)?.numChunks || 5}
-                              onChange={(e) => updateHandler({ numChunks: parseInt(e.target.value) || 5 } as any)}
-                              className="form-control"
-                              placeholder="e.g., 5"
-                            />
-                          </div>
-                          <div className="form-group half">
-                            <label>Business Keys (for dedup)</label>
-                            <input
-                              type="text"
-                              value={(currentConfig as any)?.businessKeys || ''}
-                              onChange={(e) => updateHandler({ businessKeys: e.target.value } as any)}
-                              className="form-control"
-                              placeholder="e.g., EMP_ID, DEPT_ID"
-                            />
-                            <small className="form-text text-muted">Comma-separated. Leave empty for direct append (no dedup).</small>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  };
-
-  const isSourceDatabase = ['oracle', 'sqlserver', 'mongodb', 'postgres'].includes(config.source.type);
-  const isTargetDatabase = ['oracle', 'sqlserver', 'mongodb', 'postgres'].includes(config.target.type);
+  const errorCode = getErrorCode();
+  const errorDetails = getErrorDetails();
+  const troubleshootingSteps = getTroubleshootingSteps();
 
   return (
-    <div className="data-source-config">
-      <h3>Data Source Configuration</h3>
-
-      <div className="form-group">
-        <label htmlFor="mode">Data Flow Mode:</label>
-        <select
-          id="mode"
-          value={config.mode}
-          onChange={(e) => updateConfig({ mode: e.target.value as DataSourceConfig['mode'] })}
-          className="form-control mode-select"
-        >
-          <option value="file-to-file">File to File</option>
-          <option value="file-to-db">File to Database</option>
-          <option value="db-to-file">Database to File</option>
-          <option value="db-to-db">Database to Database</option>
-        </select>
+    <div className={`error-display ${className}`}>
+      <div className="error-header">
+        <h4 className="error-title">{title}</h4>
+        {errorCode && (
+          <span className="error-code">Error Code: {errorCode}</span>
+        )}
       </div>
-
-      <div className="config-container">
-        <div className="source-config">
-          <h4>Source Configuration</h4>
-          {isSourceDatabase ? renderDatabaseConfig('source') : renderFileConfig('source')}
-        </div>
-        <div className="arrow-separator">➜</div>
-        <div className="target-config">
-          <h4>Target Configuration</h4>
-          {isTargetDatabase ? renderDatabaseConfig('target') : renderFileConfig('target')}
-        </div>
+      
+      <div className="error-content">
+        <p className="error-message">{getErrorMessage()}</p>
+        
+        {/* Error Details */}
+        {errorDetails && Object.keys(errorDetails).length > 0 && (
+          <div className="error-details">
+            <h5>Details:</h5>
+            <div className="error-details-content">
+              {errorDetails.errors && Array.isArray(errorDetails.errors) && (
+                <div className="error-list">
+                  <strong>Validation Errors:</strong>
+                  <ul>
+                    {errorDetails.errors.map((err: string, idx: number) => (
+                      <li key={idx}>{err}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              
+              {errorDetails.warnings && Array.isArray(errorDetails.warnings) && (
+                <div className="warning-list">
+                  <strong>Warnings:</strong>
+                  <ul>
+                    {errorDetails.warnings.map((warning: string, idx: number) => (
+                      <li key={idx}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              
+              {errorDetails.endpoint && (
+                <div className="error-endpoint">
+                  <strong>Endpoint:</strong> <code>{errorDetails.endpoint}</code>
+                </div>
+              )}
+              
+              {errorDetails.request_id && (
+                <div className="error-request-id">
+                  <strong>Request ID:</strong> <code>{errorDetails.request_id}</code>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        
+        {/* Troubleshooting Steps */}
+        {troubleshootingSteps.length > 0 && (
+          <div className="troubleshooting">
+            <h5>Troubleshooting:</h5>
+            <ul className="troubleshooting-list">
+              {troubleshootingSteps.map((step, idx) => (
+                <li key={idx}>{step}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        
+        {/* Retry Button */}
+        {showRetry && onRetry && (
+          <div className="error-actions">
+            <button
+              onClick={onRetry}
+              className="btn btn-primary retry-button"
+            >
+              Try Again
+            </button>
+          </div>
+        )}
       </div>
-
-      <FileBrowserModal
-        isOpen={showFileBrowser}
-        onClose={() => setShowFileBrowser(false)}
-        onSelect={handleFileSelect}
-        initialPath={(browserTarget === 'source' ? (config.source as any).path : (config.target as any).path)}
-      />
     </div>
   );
 };
 
-export default DataSourceConfigComponent;
+export default ErrorDisplay;
