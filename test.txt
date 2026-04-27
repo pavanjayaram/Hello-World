@@ -1,145 +1,149 @@
-// Type definitions for the data transformation system
+import React, { useState } from 'react';
+import DataSourceConfigComponent from './components/DataSourceConfig';
+import TransformationBuilder from './components/TransformationBuilder';
+import ExecutePipeline from './components/ExecutePipeline';
+import CodeDisplay from './components/CodeDisplay';
+import { TransformationConfig, DataSourceConfig, FieldTransformation, RowTransformation } from './types';
+import './components/styles.css';
 
-export interface DataSourceConfig {
-  mode: 'file-to-file' | 'file-to-db' | 'db-to-db' | 'db-to-file';
-  source: FileSource | DatabaseSource;
-  target: FileTarget | DatabaseTarget;
-  errorHandling?: {
-    mode: 'reject_and_continue' | 'reject_and_fail';
+const App: React.FC = () => {
+  console.log('App component rendering at:', new Date().toISOString());
+
+  const [currentStep, setCurrentStep] = useState(1);
+  const [config, setConfig] = useState<TransformationConfig>({
+    dataSource: {
+      mode: 'file-to-file',
+      source: {
+        type: 'csv',
+        delimiter: ',',
+        path: ''
+      },
+      target: {
+        type: 'csv',
+        delimiter: ',',
+        path: ''
+      }
+    },
+    fieldTransforms: [],
+    rowTransforms: []
+  });
+
+  const [spec, setSpec] = useState<any>(null);
+
+  const updateDataSource = (dataSource: DataSourceConfig) => {
+    setConfig(prev => ({ ...prev, dataSource }));
   };
-}
 
-export interface FileSource {
-  type: 'csv' | 'dat' | 'txt' | 'excel';
-  delimiter?: string;
-  path: string;
-}
+  const updateFieldTransforms = (fieldTransforms: FieldTransformation[]) => {
+    console.log('App: updateFieldTransforms called with:', fieldTransforms.map(f => f.fieldName));
+    setConfig(prev => ({ ...prev, fieldTransforms }));
+  };
 
-export interface DatabaseSource {
-  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
-  connectionString: string;
-  schema: string;
-  table: string;
-  query?: string;
-  partitionColumn?: string;
-  lowerBound?: string;
-  upperBound?: string;
-  numPartitions?: string;
-  fetchsize?: string;
-}
+  const updateRowTransforms = (rowTransforms: RowTransformation[]) => {
+    setConfig(prev => ({ ...prev, rowTransforms }));
+  };
 
-export interface FileTarget {
-  type: 'csv' | 'dat' | 'txt' | 'excel';
-  delimiter?: string;
-  path: string;
-}
+  const steps = [
+    { id: 1, title: 'Data Source Configuration', component: 'datasource' },
+    { id: 2, title: 'Transformation Builder', component: 'transformations' },
+    { id: 3, title: 'Review & Execute Pipeline', component: 'execute' },
+    { id: 4, title: 'AI Code Generation', component: 'codedisplay' }
+  ];
 
-export interface DatabaseTarget {
-  type: 'oracle' | 'sqlserver' | 'mongodb' | 'postgres';
-  connectionString: string;
-  schema: string;
-  table: string;
-  query?: string;
-  batchsize?: string;
-  isolationLevel?: string;
-  primaryKey?: string;
-}
+  const renderCurrentStep = () => {
+    console.log('App: renderCurrentStep called with currentStep:', currentStep);
+    switch (currentStep) {
+      case 1:
+        console.log('App: Rendering step 1 - DataSourceConfig');
+        return (
+          <DataSourceConfigComponent
+            config={config.dataSource}
+            onChange={updateDataSource}
+          />
+        );
+      case 2:
+        console.log('App: Rendering step 2 - TransformationBuilder');
+        return (
+          <TransformationBuilder
+            config={config.dataSource}
+            fieldTransforms={config.fieldTransforms}
+            rowTransforms={config.rowTransforms}
+            onFieldTransformsChange={updateFieldTransforms}
+            onRowTransformsChange={updateRowTransforms}
+          />
+        );
+      case 3:
+        console.log('App: Rendering step 3 - ExecutePipeline with config:', config);
+        return <ExecutePipeline config={config} />;
+      case 4:
+        console.log('App: Rendering step 4 - CodeDisplay');
+        return (
+          <CodeDisplay
+            config={config}
+            spec={spec}
+            onSpecChange={setSpec}
+          />
+        );
+      default:
+        console.log('App: Unknown step:', currentStep);
+        return <div>Unknown step</div>;
+    }
+  };
 
-export interface FieldTransformation {
-  fieldName: string;
-  targetField?: string;
-  transformations: Transform[];
-}
+  return (
+    <div className="app">
+      <header className="app-header">
+        <h1>Config-Driven Python ETL Engine</h1>
+        <p>Design your data pipeline and execute it with Python</p>
+      </header>
 
-export interface Transform {
-  type: 'upper' | 'lower' | 'trim' | 'ltrim' | 'rtrim' | 'substring' | 'concat' | 'replace' | 'pad' |
-  'cast' | 'to_date' | 'to_timestamp' | 'to_number' | 'format' |
-  'if_then_else' | 'case_when' | 'coalesce' | 'nvl' |
-  'lookup' | 'cdc' | 'add' |
-  'round' | 'ceil' | 'floor' | 'abs' | 'arithmetic' |
-  'sum' | 'avg' | 'min' | 'max' | 'count' | 'group_by' |
-  'deduplication' | 'validation' | 'masking' | 'data_masking' | 'data_unmasking' |
-  'literal' | 'row_number' | 'current_date';
-  params: Record<string, any>;
-}
+      <nav className="step-navigation">
+        <div className="steps">
+          {steps.map((step) => (
+            <button
+              key={step.id}
+              className={`step ${currentStep === step.id ? 'active' : ''} enabled`}
+              onClick={() => setCurrentStep(step.id)}
+            >
+              <span className="step-number">{step.id}</span>
+              <span className="step-title">{step.title}</span>
+            </button>
+          ))}
+        </div>
+      </nav>
 
-export interface RowTransformation {
-  type: 'distinct' | 'filter' | 'sort' | 'sample' | 'union' | 'intersect' | 'except' | 'pivot' | 'unpivot' | 'lookup' | 'cdc_compare';
-  params: Record<string, any>;
-}
+      <main className="app-content">
+        <div className="step-content">
+          <h2>{steps.find(s => s.id === currentStep)?.title}</h2>
+          {renderCurrentStep()}
+        </div>
 
-export interface LLMConfig {
-  provider: 'ollama' | 'gemini';
-  model: string;
-  apiKey?: string;
-}
+        <div className="step-controls">
+          {currentStep > 1 && (
+            <button
+              className="btn btn-secondary"
+              onClick={() => setCurrentStep(currentStep - 1)}
+            >
+              Previous
+            </button>
+          )}
 
-export interface TransformationConfig {
-  dataSource: DataSourceConfig;
-  fieldTransforms: FieldTransformation[];
-  rowTransforms: RowTransformation[];
-  llmConfig?: LLMConfig;
-}
+          {currentStep < steps.length && (
+            <button
+              className="btn btn-primary"
+              onClick={() => setCurrentStep(currentStep + 1)}
+            >
+              Next
+            </button>
+          )}
+        </div>
+      </main>
 
-export interface ValidationResult {
-  valid: boolean;
-  errors: string[];
-  warnings: string[];
-}
+      <footer className="app-footer">
+        <p>Config-Driven Python ETL Engine - "Give me a JSON, I'll run your pipeline."</p>
+      </footer>
+    </div>
+  );
+};
 
-export interface TransformationSpec {
-  version: string;
-  created_at: string;
-  source: SourceSpec;
-  target: TargetSpec;
-  field_transforms: FieldTransformSpec[];
-  row_transforms: RowTransformSpec[];
-  metadata: Record<string, any>;
-}
-
-export interface SourceSpec {
-  type: 'file' | 'database';
-  file_type?: string;
-  database_type?: string;
-  connection?: Record<string, any>;
-  path?: string;
-  delimiter?: string;
-}
-
-export interface TargetSpec {
-  type: 'file' | 'database';
-  file_type?: string;
-  database_type?: string;
-  connection?: Record<string, any>;
-  path?: string;
-  delimiter?: string;
-}
-
-export interface FieldTransformSpec {
-  field: string;
-  transforms: TransformSpec[];
-}
-
-export interface RowTransformSpec {
-  type: string;
-  params: Record<string, any>;
-}
-
-export interface TransformSpec {
-  type: string;
-  params: Record<string, any>;
-}
-
-export interface CodeGenerationTask {
-  task_id: string;
-  status: string;
-  created_at: string;
-}
-
-export interface CodeGenerationStatus {
-  task_id: string;
-  status: string;
-  progress: number;
-  code?: string;
-  error?: string;
-}
+export default App;
