@@ -1,164 +1,153 @@
-import React, { useState, useEffect } from 'react';
-import apiClient from '../services/apiClient';
-import './FileBrowserModal.css';
+import React, { useState } from 'react';
+import { TransformationConfig, TransformationSpec } from '../types';
+import apiClient, { ApiError } from '../services/apiClient';
 
-interface FileEntry {
-    name: string;
-    path: string;
-    is_dir: boolean;
-    size: number;
-    modified: string;
+interface JsonPreviewProps {
+  config: TransformationConfig;
+  onSpecChange?: (spec: TransformationSpec) => void;
 }
 
-interface FileBrowserModalProps {
-    isOpen: boolean;
-    onClose: () => void;
-    onSelect: (path: string) => void;
-    initialPath?: string;
-}
+const JsonPreview: React.FC<JsonPreviewProps> = ({ config, onSpecChange }) => {
+  const [, setJsonSpec] = useState<TransformationSpec | null>(null);
+  const [jsonString, setJsonString] = useState<string>('');
+  const [isEditing, setIsEditing] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-const FileBrowserModal: React.FC<FileBrowserModalProps> = ({
-    isOpen,
-    onClose,
-    onSelect,
-    initialPath
-}) => {
-    const [currentPath, setCurrentPath] = useState<string>('');
-    const [parentPath, setParentPath] = useState<string | null>(null);
-    const [files, setFiles] = useState<FileEntry[]>([]);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
-    const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const generateJsonFromAPI = async () => {
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      const spec = await apiClient.generateJson(config);
+      setJsonSpec(spec);
+      setJsonString(JSON.stringify(spec, null, 2));
+      
+      if (onSpecChange) {
+        onSpecChange(spec);
+      }
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(`API Error: ${err.message}`);
+      } else {
+        setError(`Error: ${err instanceof Error ? err.message : 'Unknown error occurred'}`);
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
-    // Load files when modal opens or path changes
-    useEffect(() => {
-        if (isOpen) {
-            loadDirectory(currentPath || initialPath);
-        }
-    }, [isOpen]);
-
-    const loadDirectory = async (path?: string) => {
-        setLoading(true);
-        setError(null);
-        try {
-            const result = await apiClient.listDirectory(path);
-            setCurrentPath(result.current_path);
-            setParentPath(result.parent_path);
-            setFiles(result.items);
-        } catch (err: any) {
-            console.error("Failed to list directory:", err);
-            setError(err.message || "Failed to load directory");
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const handleEntryClick = (entry: FileEntry) => {
-        if (entry.is_dir) {
-            loadDirectory(entry.path);
-        } else {
-            setSelectedFile(entry.path);
-        }
-    };
-
-    const handleSelect = () => {
-        if (selectedFile) {
-            onSelect(selectedFile);
-            onClose();
-        }
-    };
-
-    const formatSize = (bytes: number) => {
-        if (bytes === 0) return '';
-        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(1024));
-        return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${sizes[i]}`;
-    };
-
-    if (!isOpen) return null;
-
-    return (
-        <div className="file-browser-overlay">
-            <div className="file-browser-modal">
-                <div className="file-browser-header">
-                    <h3>Browse Server Files</h3>
-                    <button className="close-btn" onClick={onClose}>&times;</button>
-                </div>
-
-                <div className="file-browser-path">
-                    <button
-                        className="nav-btn"
-                        onClick={() => parentPath && loadDirectory(parentPath)}
-                        disabled={!parentPath}
-                        title="Go Up"
-                    >
-                        ⬆️ Up
-                    </button>
-                    <input
-                        type="text"
-                        value={currentPath}
-                        readOnly
-                        className="path-input"
-                    />
-                </div>
-
-                <div className="file-browser-content">
-                    {loading ? (
-                        <div className="loading">Loading...</div>
-                    ) : error ? (
-                        <div className="error">{error}</div>
-                    ) : (
-                        <div className="file-list">
-                            {parentPath && (
-                                <div
-                                    className="file-entry directory"
-                                    onClick={() => loadDirectory(parentPath)}
-                                >
-                                    <span className="icon">📁</span>
-                                    <span className="name">..</span>
-                                </div>
-                            )}
-                            {files.map((file) => (
-                                <div
-                                    key={file.path}
-                                    className={`file-entry ${file.is_dir ? 'directory' : 'file'} ${selectedFile === file.path ? 'selected' : ''}`}
-                                    onClick={() => handleEntryClick(file)}
-                                    onDoubleClick={() => {
-                                        if (file.is_dir) loadDirectory(file.path);
-                                        else {
-                                            setSelectedFile(file.path);
-                                            handleSelect();
-                                        }
-                                    }}
-                                >
-                                    <span className="icon">{file.is_dir ? '📁' : '📄'}</span>
-                                    <span className="name">{file.name}</span>
-                                    <span className="size">{formatSize(file.size)}</span>
-                                    <span className="date">{new Date(file.modified).toLocaleDateString()}</span>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-
-                <div className="file-browser-footer">
-                    <div className="selected-info">
-                        {selectedFile ? `Selected: ${selectedFile.split(/[/\\]/).pop()}` : 'No file selected'}
-                    </div>
-                    <div className="actions">
-                        <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
-                        <button
-                            className="btn btn-primary"
-                            onClick={handleSelect}
-                            disabled={!selectedFile}
-                        >
-                            Select File
-                        </button>
-                    </div>
-                </div>
-            </div>
+  return (
+    <div className="json-preview">
+      <div className="json-preview-header">
+        <h3>JSON Specification Preview</h3>
+        <div className="json-preview-controls">
+          <button
+            onClick={generateJsonFromAPI}
+            className="btn btn-primary"
+            disabled={isLoading}
+          >
+            {isLoading ? 'Generating...' : 'Generate JSON'}
+          </button>
+          <button
+            onClick={() => setIsEditing(!isEditing)}
+            className="btn btn-secondary"
+            disabled={!jsonString}
+          >
+            {isEditing ? 'View Mode' : 'Edit Mode'}
+          </button>
         </div>
-    );
+      </div>
+
+      <div style={{ padding: '20px', backgroundColor: '#f8f9fa', borderRadius: '4px', margin: '20px 0' }}>
+        <h4>Configuration Summary:</h4>
+        <p><strong>Source:</strong> {config.dataSource.source?.type || 'Not configured'}</p>
+        <p><strong>Target:</strong> {config.dataSource.target?.type || 'Not configured'}</p>
+        <p><strong>Field Transformations:</strong> {config.fieldTransforms.length}</p>
+        <p><strong>Row Transformations:</strong> {config.rowTransforms.length}</p>
+      </div>
+
+      {error && (
+        <div style={{ 
+          padding: '15px', 
+          backgroundColor: '#f8d7da', 
+          border: '1px solid #f5c6cb', 
+          borderRadius: '4px', 
+          margin: '20px 0',
+          color: '#721c24'
+        }}>
+          <h4>Error</h4>
+          <p>{error}</p>
+        </div>
+      )}
+
+      {isLoading && (
+        <div style={{ 
+          padding: '20px', 
+          textAlign: 'center', 
+          backgroundColor: '#f8f9fa', 
+          borderRadius: '4px', 
+          margin: '20px 0' 
+        }}>
+          <div style={{ 
+            border: '4px solid #f3f3f3', 
+            borderTop: '4px solid #007bff', 
+            borderRadius: '50%', 
+            width: '40px', 
+            height: '40px', 
+            animation: 'spin 1s linear infinite', 
+            margin: '0 auto 15px' 
+          }}></div>
+          <p>Generating JSON specification...</p>
+        </div>
+      )}
+
+      {jsonString && (
+        <div className="json-editor-container">
+          <div className="json-editor-header">
+            <h4>Generated JSON Specification</h4>
+          </div>
+          
+          <div className="json-editor">
+            <textarea
+              style={{
+                width: '100%',
+                height: '400px',
+                fontFamily: 'monospace',
+                fontSize: '12px',
+                padding: '10px',
+                border: '1px solid #ccc',
+                borderRadius: '4px',
+                backgroundColor: '#f8f9fa'
+              }}
+              value={jsonString}
+              onChange={isEditing ? (e) => {
+                setJsonString(e.target.value);
+                try {
+                  const parsed = JSON.parse(e.target.value);
+                  setJsonSpec(parsed);
+                  if (onSpecChange) onSpecChange(parsed);
+                } catch (err) {
+                  // Invalid JSON, but don't break the UI
+                }
+              } : undefined}
+              readOnly={!isEditing}
+            />
+          </div>
+        </div>
+      )}
+
+      <div style={{ padding: '20px', backgroundColor: '#e7f3ff', borderRadius: '4px', margin: '20px 0' }}>
+        <h4>Next Steps:</h4>
+        <ul>
+          <li>Click "Generate JSON" to create the transformation specification</li>
+          <li>Review the generated JSON</li>
+          <li>Edit if needed using "Edit Mode"</li>
+          <li>Proceed to Code Generation step</li>
+        </ul>
+      </div>
+    </div>
+  );
 };
 
-export default FileBrowserModal;
+export default JsonPreview;
