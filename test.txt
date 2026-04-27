@@ -1,181 +1,280 @@
-import React from 'react';
-import { ApiError } from '../services/apiClient';
-
-interface ErrorDisplayProps {
-  error: string | Error | ApiError | null;
-  title?: string;
-  showRetry?: boolean;
-  onRetry?: () => void;
-  className?: string;
+.execute-pipeline {
+  padding: 20px;
 }
 
-const ErrorDisplay: React.FC<ErrorDisplayProps> = ({
-  error,
-  title = "Error",
-  showRetry = false,
-  onRetry,
-  className = ""
-}) => {
-  if (!error) return null;
+.section {
+  background: #ffffff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
 
-  const getErrorMessage = (): string => {
-    if (typeof error === 'string') {
-      return error;
-    }
-    if (error instanceof ApiError) {
-      return error.message;
-    }
-    if (error instanceof Error) {
-      return error.message;
-    }
-    return 'An unknown error occurred';
-  };
+.section h3 {
+  margin-top: 0;
+  margin-bottom: 20px;
+  color: #333;
+  border-bottom: 2px solid #007bff;
+  padding-bottom: 10px;
+}
 
-  const getErrorCode = (): string | undefined => {
-    if (error instanceof ApiError) {
-      return error.errorCode;
-    }
-    return undefined;
-  };
+.config-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
 
-  const getErrorDetails = (): Record<string, any> | undefined => {
-    if (error instanceof ApiError) {
-      return error.details;
-    }
-    return undefined;
-  };
+.input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 
-  const getTroubleshootingSteps = (): string[] => {
-    if (error instanceof ApiError) {
-      const details = error.details;
-      
-      // LLM unavailability errors
-      if (error.isErrorCode('LLM_UNAVAILABLE') || error.isErrorCode('LLM_CONNECTION_ERROR')) {
-        return details?.troubleshooting || [
-          "Please start Ollama with 'ollama serve'",
-          "Ensure codellama:7b is pulled with 'ollama pull codellama:7b'",
-          "Check if the model endpoint is accessible",
-          "Verify firewall settings allow connection to the model endpoint"
-        ];
-      }
-      
-      // Network errors
-      if (error.isNetworkError()) {
-        return [
-          "Check your internet connection",
-          "Verify the backend server is running",
-          "Check if the API endpoint is accessible",
-          "Try refreshing the page"
-        ];
-      }
-      
-      // Server errors
-      if (error.isServerError()) {
-        return [
-          "The server encountered an internal error",
-          "Please try again in a few moments",
-          "If the problem persists, contact support"
-        ];
-      }
-      
-      // Configuration validation errors
-      if (error.isErrorCode('INVALID_CONFIG')) {
-        return [
-          "Review your configuration for missing or invalid fields",
-          "Ensure all required fields are filled out",
-          "Check that file paths and connection strings are correct",
-          "Verify delimiter settings for delimited files"
-        ];
-      }
-    }
-    
-    return [];
-  };
+.input-group label {
+  font-weight: 600;
+  color: #555;
+}
 
-  const errorCode = getErrorCode();
-  const errorDetails = getErrorDetails();
-  const troubleshootingSteps = getTroubleshootingSteps();
+.form-control {
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+}
 
-  return (
-    <div className={`error-display ${className}`}>
-      <div className="error-header">
-        <h4 className="error-title">{title}</h4>
-        {errorCode && (
-          <span className="error-code">Error Code: {errorCode}</span>
-        )}
-      </div>
-      
-      <div className="error-content">
-        <p className="error-message">{getErrorMessage()}</p>
-        
-        {/* Error Details */}
-        {errorDetails && Object.keys(errorDetails).length > 0 && (
-          <div className="error-details">
-            <h5>Details:</h5>
-            <div className="error-details-content">
-              {errorDetails.errors && Array.isArray(errorDetails.errors) && (
-                <div className="error-list">
-                  <strong>Validation Errors:</strong>
-                  <ul>
-                    {errorDetails.errors.map((err: string, idx: number) => (
-                      <li key={idx}>{err}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              
-              {errorDetails.warnings && Array.isArray(errorDetails.warnings) && (
-                <div className="warning-list">
-                  <strong>Warnings:</strong>
-                  <ul>
-                    {errorDetails.warnings.map((warning: string, idx: number) => (
-                      <li key={idx}>{warning}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              
-              {errorDetails.endpoint && (
-                <div className="error-endpoint">
-                  <strong>Endpoint:</strong> <code>{errorDetails.endpoint}</code>
-                </div>
-              )}
-              
-              {errorDetails.request_id && (
-                <div className="error-request-id">
-                  <strong>Request ID:</strong> <code>{errorDetails.request_id}</code>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-        
-        {/* Troubleshooting Steps */}
-        {troubleshootingSteps.length > 0 && (
-          <div className="troubleshooting">
-            <h5>Troubleshooting:</h5>
-            <ul className="troubleshooting-list">
-              {troubleshootingSteps.map((step, idx) => (
-                <li key={idx}>{step}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-        
-        {/* Retry Button */}
-        {showRetry && onRetry && (
-          <div className="error-actions">
-            <button
-              onClick={onRetry}
-              className="btn btn-primary retry-button"
-            >
-              Try Again
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
+.form-control:focus {
+  outline: none;
+  border-color: #007bff;
+  box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
+}
 
-export default ErrorDisplay;
+.button-group {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: #007bff;
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #0056b3;
+}
+
+.btn-success {
+  background: #28a745;
+  color: white;
+}
+
+.btn-success:hover:not(:disabled) {
+  background: #218838;
+}
+
+.btn-large {
+  padding: 15px 30px;
+  font-size: 16px;
+  width: 100%;
+}
+
+.saved-configs {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #e0e0e0;
+}
+
+.saved-configs h4 {
+  margin-bottom: 10px;
+  color: #555;
+}
+
+.json-display {
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+  padding: 15px;
+  overflow-x: auto;
+}
+
+.json-display pre {
+  margin: 0;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #333;
+}
+
+.execution-status {
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.status-pending {
+  background: #fff3cd;
+  border: 1px solid #ffc107;
+}
+
+.status-running {
+  background: #cfe2ff;
+  border: 1px solid #0d6efd;
+}
+
+.status-success {
+  background: #d1e7dd;
+  border: 1px solid #28a745;
+}
+
+.status-failed {
+  background: #f8d7da;
+  border: 1px solid #dc3545;
+}
+
+.status-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding-bottom: 15px;
+  border-bottom: 2px solid rgba(0, 0, 0, 0.1);
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.status-pending .status-badge {
+  background: #ffc107;
+  color: #000;
+}
+
+.status-running .status-badge {
+  background: #0d6efd;
+  color: #fff;
+}
+
+.status-success .status-badge {
+  background: #28a745;
+  color: #fff;
+}
+
+.status-failed .status-badge {
+  background: #dc3545;
+  color: #fff;
+}
+
+.pipeline-id {
+  font-family: monospace;
+  font-size: 14px;
+  color: #666;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 15px;
+  margin-bottom: 20px;
+}
+
+.metric {
+  background: rgba(255, 255, 255, 0.7);
+  padding: 15px;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.metric-label {
+  font-size: 12px;
+  color: #666;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.metric-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: #333;
+}
+
+.error-message {
+  background: rgba(255, 255, 255, 0.9);
+  padding: 15px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+  color: #721c24;
+}
+
+.logs {
+  margin-top: 20px;
+}
+
+.logs h4 {
+  margin-bottom: 10px;
+  color: #555;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.log-content {
+  background: #2d3748;
+  color: #e2e8f0;
+  padding: 15px;
+  border-radius: 6px;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.log-line {
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.log-line:last-child {
+  border-bottom: none;
+}
+
+/* Scrollbar styling */
+.log-content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.log-content::-webkit-scrollbar-track {
+  background: #1a202c;
+  border-radius: 4px;
+}
+
+.log-content::-webkit-scrollbar-thumb {
+  background: #4a5568;
+  border-radius: 4px;
+}
+
+.log-content::-webkit-scrollbar-thumb:hover {
+  background: #718096;
+}
