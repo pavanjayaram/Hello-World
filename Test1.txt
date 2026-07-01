@@ -1,7 +1,5 @@
 """
-Generic database connector for PostgreSQL, MySQL, SQLite, SQL Server.
-
-Accepts a full SQLAlchemy connection URL or builds one from components.
+Oracle database connector using cx_Oracle + SQLAlchemy.
 """
 
 from __future__ import annotations
@@ -12,52 +10,33 @@ from typing import Any
 from connectors.base import BaseConnector
 from utils.logger import get_logger
 
-logger = get_logger("generic_connector")
-
-# Default port map
-_DEFAULT_PORTS = {
-    "postgres": 5432,
-    "mysql": 3306,
-    "sqlserver": 1433,
-    "sqlite": None,
-}
-
-# SQLAlchemy dialect prefixes
-_DIALECT_MAP = {
-    "postgres": "postgresql+psycopg2",
-    "mysql": "mysql+pymysql",
-    "sqlserver": "mssql+pyodbc",
-    "sqlite": "sqlite",
-}
+logger = get_logger("oracle_connector")
 
 
-class GenericConnector(BaseConnector):
-    """Connector supporting PostgreSQL, MySQL, SQLite, SQL Server."""
+class OracleConnector(BaseConnector):
+    """Connector for Oracle databases."""
 
-    def __init__(self, db_type: str, **kwargs: Any):
+    def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)
-        self.db_type = db_type.lower()
+        self.host = kwargs.get("host") or os.getenv("ORACLE_HOST", "localhost")
+        self.port = kwargs.get("port") or int(os.getenv("ORACLE_PORT", "1521"))
+        self.service_name = kwargs.get("service_name") or os.getenv("ORACLE_SERVICE", "")
+        self.user = kwargs.get("user") or os.getenv("ORACLE_USER", "")
+        self.password = kwargs.get("password") or os.getenv("ORACLE_PASSWORD", "")
         self.connection_url = kwargs.get("connection_url")
-        self.host = kwargs.get("host") or os.getenv(f"{db_type.upper()}_HOST", "localhost")
-        self.port = kwargs.get("port") or int(
-            os.getenv(f"{db_type.upper()}_PORT", str(_DEFAULT_PORTS.get(self.db_type, 5432)))
-        )
-        self.database = kwargs.get("database") or os.getenv(f"{db_type.upper()}_DB", "")
-        self.user = kwargs.get("user") or os.getenv(f"{db_type.upper()}_USER", "")
-        self.password = kwargs.get("password") or os.getenv(f"{db_type.upper()}_PASSWORD", "")
 
     def build_connection_url(self) -> str:
         if self.connection_url:
             return self.connection_url
 
-        if self.db_type == "sqlite":
-            # database is the file path (or ":memory:" for in-memory)
-            return f"sqlite:///{self.database}"
+        try:
+            import cx_Oracle  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "cx_Oracle is not installed. Install it with: pip install cx_Oracle"
+            )
 
-        dialect = _DIALECT_MAP.get(self.db_type)
-        if not dialect:
-            raise ValueError(f"Unsupported db_type: {self.db_type}")
-
-        url = f"{dialect}://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
-        logger.debug("Generic URL built for %s host=%s db=%s", self.db_type, self.host, self.database)
+        dsn = f"{self.host}:{self.port}/{self.service_name}"
+        url = f"oracle+cx_oracle://{self.user}:{self.password}@{dsn}"
+        logger.debug("Oracle URL built for host=%s service=%s", self.host, self.service_name)
         return url
