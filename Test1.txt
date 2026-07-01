@@ -1,96 +1,40 @@
 """
-FILE to DATABASE Pipeline.
+FILE to FILE Pipeline.
 """
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-from config.models import LoadStrategy, TableConfig, TransformationRule
-from connectors.generic_connector import GenericConnector
-from connectors.oracle_connector import OracleConnector
-from connectors.teradata_connector import TeradataConnector
+from config.models import TableConfig, TransformationRule
 from extractors.file_extractor import FileExtractor
-from loaders.cdc_type2_loader import CDCType2Loader
-from loaders.truncate_loader import TruncateLoader
-from sqlalchemy import text
+from loaders.file_loader import FileLoader
 from transformers.pandas_transformer import PandasTransformer
 from utils.logger import get_logger
 from utils.monitor import JobMonitor
 
-logger = get_logger("file_to_db")
-
-
-def get_connector(db_cfg):
-    db_type = db_cfg.db_type.value.lower()
-    kwargs = db_cfg.model_dump()
-    if db_type == "oracle":
-        return OracleConnector(**kwargs)
-    elif db_type == "teradata":
-        return TeradataConnector(**kwargs)
-    else:
-        return GenericConnector(**kwargs)
+logger = get_logger("file_to_file")
 
 
 def run(table_config: TableConfig, monitor: JobMonitor, run_id: str = None, run_timestamp: str = None) -> None:
-    """Execute a FILE → DB pipeline."""
+    """Execute a FILE → FILE pipeline."""
     t_metrics = monitor.get_table(table_config.table_id)
     t_metrics.start()
 
-    logger.info("Starting FILE_TO_DB for table_id: %s (run_id: %s)", table_config.table_id, run_id)
-    connector = None
+    logger.info("Starting FILE_TO_FILE for table_id: %s (run_id: %s)", table_config.table_id, run_id)
 
     try:
         source_cfg = table_config.source.file
-        target_cfg = table_config.target.db
+        target_cfg = table_config.target.file
         if not source_cfg or not target_cfg:
-            raise ValueError("FILE_TO_DB pipeline requires file source and DB target configs.")
+            raise ValueError("FILE_TO_FILE pipeline requires file source and target configs.")
 
         extractor = FileExtractor(source_cfg)
         transformer = PandasTransformer()
-        
+
         # Set background run metadata
         if run_id:
             transformer.set_load_metadata(run_id, run_timestamp)
 
-        connector = get_connector(target_cfg)
-        engine = connector.get_engine()
-        
-        # --- Handle Surrogate Key Logic (MAX + 1) ---
-        for rule in table_config.transformations:
-            if rule.action.lower() == "surrogate_key" or (rule.action.lower() == "lookup" and rule.params.get("operation") == "surrogate_key"):
-                col = rule.column or rule.params.get("target_column")
-                logger.info("Initializing surrogate_key for column '%s'", col)
-                
-                try:
-                    table_path = f"{target_cfg.schema_name}.{target_cfg.table}" if target_cfg.schema_name else target_cfg.table
-                    with engine.connect() as conn:
-                        res = conn.execute(text(f'SELECT MAX("{col}") FROM {table_path}')).scalar()
-                        curr_max = int(res) if res is not None else 0
-                    logger.info("Current MAX('%s') in DB is %d. Next value will be %d", col, curr_max, curr_max + 1)
-                    transformer.set_sequence_start(col, curr_max)
-                except Exception as e:
-                    logger.info("Could not fetch MAX from DB for '%s', defaulting to 0 (table may be empty or missing): %s", col, e)
-                    transformer.set_sequence_start(col, 0)
-
-        if target_cfg.load_strategy == LoadStrategy.CDC_TYPE2:
-            if not target_cfg.cdc_config:
-                raise ValueError("CDC Type 2 strategy requires cdc_config")
-            loader = CDCType2Loader(
-                engine=engine,
-                table=target_cfg.table,
-                schema=target_cfg.schema_name,
-                config=target_cfg.cdc_config,
-                batch_size=target_cfg.batch_size
-            )
-        else:
-            loader = TruncateLoader(
-                engine=engine,
-                table=target_cfg.table,
-                schema=target_cfg.schema_name,
-                batch_size=target_cfg.batch_size
-            )
+        loader = FileLoader(target_cfg)
 
         chunk_size = table_config.chunk_size
 
@@ -106,28 +50,11 @@ def run(table_config: TableConfig, monitor: JobMonitor, run_id: str = None, run_
             if not df_chunk.empty:
                 load_metrics = loader.load(df_chunk)
                 t_metrics.rows_loaded += load_metrics.get("rows_loaded", 0)
-                t_metrics.rows_inserted += load_metrics.get("rows_inserted", 0)
-                t_metrics.rows_updated += load_metrics.get("rows_updated", 0)
-                t_metrics.rows_unchanged += load_metrics.get("rows_unchanged", 0)
-
-        # 4. Finalize post-load logic (e.g. Full Volume Soft Deletes)
-        if hasattr(loader, "finalize"):
-            try:
-                final_metrics = loader.finalize()
-                deleted = final_metrics.get("rows_deleted", 0)
-                if deleted > 0:
-                    t_metrics.rows_updated += deleted
-                    t_metrics.rows_loaded += deleted
-            except Exception as e:
-                logger.error("Error during loader finalization: %s", e)
 
         t_metrics.finish()
-        logger.info("Completed FILE_TO_DB for table_id: %s", table_config.table_id)
+        logger.info("Completed FILE_TO_FILE for table_id: %s", table_config.table_id)
 
     except Exception as exc:
         t_metrics.add_error(str(exc))
         t_metrics.finish("failed")
         raise
-    finally:
-        if connector:
-            connector.dispose()
