@@ -1,49 +1,24 @@
 """
-Parallel execution utilities.
-
-Includes ThreadPool concurrency for running multiple tables
-and optional async IO helpers.
+Abstract base class for extractors.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
-from typing import Callable, List
+from abc import ABC, abstractmethod
+from typing import Iterator
 
-from config.models import TableConfig
-from utils.logger import get_logger
-from utils.monitor import JobMonitor
-
-logger = get_logger("parallel")
+import pandas as pd
 
 
-def run_tables_concurrent(
-    tables: List[TableConfig],
-    runner_func: Callable[[TableConfig, JobMonitor], None],
-    monitor: JobMonitor,
-    max_workers: int = 4,
-) -> None:
-    """Run multiple table pipelines concurrently using thread pool."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_table = {
-            executor.submit(runner_func, t_cfg, monitor): t_cfg 
-            for t_cfg in tables
-        }
+class BaseExtractor(ABC):
+    """Extract data from a source and yield DataFrames."""
 
-        for future in concurrent.futures.as_completed(future_to_table):
-            t_cfg = future_to_table[future]
-            try:
-                future.result()
-                logger.info("Table '%s' finished successfully", t_cfg.table_id)
-            except Exception as exc:
-                logger.error("Table '%s' generated an exception: %s", t_cfg.table_id, exc)
+    @abstractmethod
+    def extract(self, chunk_size: int | None = None) -> Iterator[pd.DataFrame]:
+        """Yield DataFrames, optionally in chunks."""
+        ...
 
-
-def transform_with_dask(df, transformations):
-    """
-    Placeholder for future Dask dataframe transformer.
-    If 'use_dask' is True in TableConfig, we can convert pd.DataFrame 
-    to dd.DataFrame and apply transformations in parallel using Dask.
-    """
-    import dask.dataframe as dd # noqa
-    pass
+    @abstractmethod
+    def extract_all(self) -> pd.DataFrame:
+        """Extract the entire dataset into a single DataFrame."""
+        ...
