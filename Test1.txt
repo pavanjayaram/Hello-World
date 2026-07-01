@@ -1,17 +1,40 @@
-Design and implement a robust, scalable, pure Python-based ETL validation framework that:
-Uses JSON configuration (from existing UI) to drive validation
-Supports all ETL scenarios and file/database combinations
-Provides a modular validation engine with pluggable rules
-Handles large datasets using:
-Chunk processing
-Memory-efficient techniques
-Performs:
-Data quality validation
-Transformation validation
-Source-to-target reconciliation
-Generates:
-Structured validation reports
-Exception files for failed records
-Integrates with
-Micro Focus ALM Octane
-for automated test reporting
+"""
+CLI Entry point for the ETL engine.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from core.engine import execute_job, load_config
+from utils.logger import setup_logger
+
+def main():
+    parser = argparse.ArgumentParser(description="Python ETL Engine")
+    parser.add_argument("config", help="Path to JSON job configuration file")
+    args = parser.parse_args()
+
+    config_path = Path(args.config)
+    if not config_path.exists():
+        print(f"Error: Config file not found: {config_path}")
+        sys.exit(1)
+
+    try:
+        config = load_config(config_path)
+        # Ensure base logger stands up
+        setup_logger(job_id=config.job_id)
+        
+        # Execute the job
+        monitor = execute_job(config)
+        
+        if monitor.status == "failed":
+            sys.exit(1)
+            
+    except Exception as exc:
+        print(f"ETL Job Failed: {exc}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
