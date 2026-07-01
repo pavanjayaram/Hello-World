@@ -1,60 +1,39 @@
-"""
-FILE to FILE Pipeline.
-"""
-
-from __future__ import annotations
-
-from config.models import TableConfig, TransformationRule
-from extractors.file_extractor import FileExtractor
-from loaders.file_loader import FileLoader
-from transformers.pandas_transformer import PandasTransformer
-from utils.logger import get_logger
-from utils.monitor import JobMonitor
-
-logger = get_logger("file_to_file")
-
-
-def run(table_config: TableConfig, monitor: JobMonitor, run_id: str = None, run_timestamp: str = None) -> None:
-    """Execute a FILE → FILE pipeline."""
-    t_metrics = monitor.get_table(table_config.table_id)
-    t_metrics.start()
-
-    logger.info("Starting FILE_TO_FILE for table_id: %s (run_id: %s)", table_config.table_id, run_id)
-
-    try:
-        source_cfg = table_config.source.file
-        target_cfg = table_config.target.file
-        if not source_cfg or not target_cfg:
-            raise ValueError("FILE_TO_FILE pipeline requires file source and target configs.")
-
-        extractor = FileExtractor(source_cfg)
-        transformer = PandasTransformer()
-
-        # Set background run metadata
-        if run_id:
-            transformer.set_load_metadata(run_id, run_timestamp)
-
-        loader = FileLoader(target_cfg)
-
-        chunk_size = table_config.chunk_size
-
-        for chunk_idx, df_chunk in enumerate(extractor.extract(chunk_size=chunk_size)):
-            t_metrics.chunks_processed += 1
-            t_metrics.rows_extracted += len(df_chunk)
-
-            if not df_chunk.empty and table_config.transformations:
-                df_chunk = transformer.transform(df_chunk, table_config.transformations)
-            
-            t_metrics.rows_transformed += len(df_chunk)
-
-            if not df_chunk.empty:
-                load_metrics = loader.load(df_chunk)
-                t_metrics.rows_loaded += load_metrics.get("rows_loaded", 0)
-
-        t_metrics.finish()
-        logger.info("Completed FILE_TO_FILE for table_id: %s", table_config.table_id)
-
-    except Exception as exc:
-        t_metrics.add_error(str(exc))
-        t_metrics.finish("failed")
-        raise
+{
+  "job_id": "test_job_001",
+  "pipeline_type": "FILE_TO_DB",
+  "max_workers": 2,
+  "tables": [
+    {
+      "table_id": "employees_truncate",
+      "chunk_size": 10000,
+      "source": {
+        "type": "FILE",
+        "file": {
+          "format": "csv",
+          "path": "../Test_data/employee_data.txt",
+          "delimiter": "|"
+        }
+      },
+      "target": {
+        "type": "DB",
+        "db": {
+          "db_type": "sqlite",
+          "database": "test_target.db",
+          "table": "employees_tgt",
+          "load_strategy": "truncate_load"
+        }
+      },
+      "transformations": [
+        {
+          "action": "upper",
+          "column": "EMP_Name"
+        },
+        {
+          "action": "rename",
+          "column": "EMP_Name",
+          "params": {"new_name": "EmployeeName"}
+        }
+      ]
+    }
+  ]
+}
