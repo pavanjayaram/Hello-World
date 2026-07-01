@@ -1,39 +1,21 @@
-{
-  "job_id": "test_job_001",
-  "pipeline_type": "FILE_TO_DB",
-  "max_workers": 2,
-  "tables": [
-    {
-      "table_id": "employees_truncate",
-      "chunk_size": 10000,
-      "source": {
-        "type": "FILE",
-        "file": {
-          "format": "csv",
-          "path": "../Test_data/employee_data.txt",
-          "delimiter": "|"
-        }
-      },
-      "target": {
-        "type": "DB",
-        "db": {
-          "db_type": "sqlite",
-          "database": "test_target.db",
-          "table": "employees_tgt",
-          "load_strategy": "truncate_load"
-        }
-      },
-      "transformations": [
-        {
-          "action": "upper",
-          "column": "EMP_Name"
-        },
-        {
-          "action": "rename",
-          "column": "EMP_Name",
-          "params": {"new_name": "EmployeeName"}
-        }
-      ]
-    }
-  ]
-}
+"""
+Abstract base class for transformers.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import List
+
+import pandas as pd
+
+from config.models import TransformationRule
+
+
+class BaseTransformer(ABC):
+    """Apply transformation rules to a DataFrame."""
+
+    @abstractmethod
+    def transform(self, df: pd.DataFrame, rules: List[TransformationRule]) -> pd.DataFrame:
+        """Apply a list of transformation rules and return the result."""
+        ...
