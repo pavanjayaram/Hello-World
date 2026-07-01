@@ -1,99 +1,22 @@
 """
-File-based data extractor.
-
-Supports CSV, TSV, TXT, Excel, Parquet, JSON, and Avro formats
-with chunked reading for large files.
+Abstract base class for loaders.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from abc import ABC, abstractmethod
 
 import pandas as pd
 
-from config.models import FileSourceConfig
-from extractors.base import BaseExtractor
-from utils.logger import get_logger
 
-logger = get_logger("file_extractor")
+class BaseLoader(ABC):
+    """Load data into a target system."""
 
-
-class FileExtractor(BaseExtractor):
-    """Extract data from local files."""
-
-    def __init__(self, config: FileSourceConfig):
-        self.config = config
-        self.path = Path(config.path)
-        if not self.path.exists():
-            raise FileNotFoundError(f"Source file not found: {self.path}")
-
-    def _read_kwargs(self) -> Dict[str, Any]:
-        """Build keyword args for the pandas reader."""
-        fmt = self.config.format.value
-        kwargs: Dict[str, Any] = {}
-
-        if fmt in ("csv", "tsv", "txt"):
-            delimiter = self.config.delimiter
-            if fmt == "tsv":
-                delimiter = "\t"
-            kwargs["sep"] = delimiter
-            kwargs["encoding"] = self.config.encoding
-            if not self.config.header:
-                kwargs["header"] = None
-        elif fmt == "excel":
-            kwargs["engine"] = "openpyxl"
-            if self.config.sheet_name:
-                kwargs["sheet_name"] = self.config.sheet_name
-        # parquet and json have sensible defaults
-
-        return kwargs
-
-    def extract(self, chunk_size: int | None = None) -> Iterator[pd.DataFrame]:
-        """Yield DataFrames, optionally in chunks."""
-        fmt = self.config.format.value
-        kwargs = self._read_kwargs()
-
-        logger.info("Extracting from %s (format=%s, chunk_size=%s)", self.path, fmt, chunk_size)
-
-        if fmt in ("csv", "tsv", "txt"):
-            if chunk_size:
-                reader = pd.read_csv(self.path, chunksize=chunk_size, **kwargs)
-                for i, chunk in enumerate(reader):
-                    logger.debug("Chunk %d: %d rows", i, len(chunk))
-                    yield chunk
-            else:
-                yield pd.read_csv(self.path, **kwargs)
-
-        elif fmt == "excel":
-            # openpyxl doesn't support chunked reading natively
-            df = pd.read_excel(self.path, **kwargs)
-            if chunk_size and len(df) > chunk_size:
-                for start in range(0, len(df), chunk_size):
-                    yield df.iloc[start : start + chunk_size]
-            else:
-                yield df
-
-        elif fmt == "parquet":
-            df = pd.read_parquet(self.path, **kwargs)
-            if chunk_size and len(df) > chunk_size:
-                for start in range(0, len(df), chunk_size):
-                    yield df.iloc[start : start + chunk_size]
-            else:
-                yield df
-
-        elif fmt == "json":
-            df = pd.read_json(self.path, **kwargs)
-            if chunk_size and len(df) > chunk_size:
-                for start in range(0, len(df), chunk_size):
-                    yield df.iloc[start : start + chunk_size]
-            else:
-                yield df
-
-        else:
-            raise ValueError(f"Unsupported file format: {fmt}")
-
-    def extract_all(self) -> pd.DataFrame:
-        """Read the entire file into one DataFrame."""
-        chunks = list(self.extract(chunk_size=None))
-        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+    @abstractmethod
+    def load(self, df: pd.DataFrame) -> dict:
+        """Load a DataFrame into the target.
+        
+        Returns:
+            A dictionary with metrics (e.g., {"rows_inserted": 100}).
+        """
+        ...
