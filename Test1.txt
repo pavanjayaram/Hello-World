@@ -1,13 +1,317 @@
-import json
-from pydantic import BaseModel, Field
-from typing import Optional
+# Python ETL Engine — Implementation Plan
 
-class DBSourceConfig(BaseModel):
-    schema_name: Optional[str] = Field(None, alias="schema")
-    table: Optional[str] = None
+Build a production-grade, config-driven Python ETL engine in the existing `backend/` directory that supports multi-source extraction, Excel-driven transformations, truncate-and-load, CDC Type 2 (SCD2), concurrency, chunking, and parallelism.
 
-data = {"schema": "company", "table": "employee"}
-obj = DBSourceConfig(**data)
-print("schema_name is:", obj.schema_name)
-print("getattr schema_name is:", getattr(obj, "schema_name", None))
-print("getattr schema is:", getattr(obj, "schema", None))
+## User Review Required
+
+> [!IMPORTANT]
+> **Database Drivers**: The engine will import `cx_Oracle` and `teradatasql` but will not fail at startup if they are not installed — connections will raise clear errors at runtime. This avoids forcing every developer to install vendor-specific drivers.
+
+> [!IMPORTANT]
+> **No PySpark**: This engine replaces the previous PySpark-based backend with a pure pandas + dask stack. SQLAlchemy handles all DB I/O. If you still need PySpark support, let me know.
+
+> [!WARNING]
+> **CDC Type 2 in-memory**: The SCD2 comparison is done in-memory (pandas merge). For extremely large existing tables (100M+ rows) this will require significant RAM. Chunked CDC is planned but initial implementation will handle the full target table for comparison.
+
+---
+
+## Proposed Changes
+
+### Project Structure
+
+```
+backend/
+├── main.py                    # CLI entry point — dispatches to pipeline by type
+├── requirements.txt           # All dependencies
+├── .env.example               # Env template (Oracle/TD/PG creds)
+│
+├── config/
+│   ├── __init__.py
+│   ├── models.py              # Pydantic job/table config models
+│   └── mapping_reader.py      # Excel mapping file reader
+│
+├── connectors/
+│   ├── __init__.py
+│   ├── base.py                # Abstract connector interface
+│   ├── oracle_connector.py    # cx_Oracle + SQLAlchemy
+│   ├── teradata_connector.py  # teradatasql + SQLAlchemy
+│   └── generic_connector.py   # PostgreSQL / MySQL / SQLite via SQLAlchemy
+│
+├── extractors/
+│   ├── __init__.py
+│   ├── base.py                # Abstract extractor
+│   ├── file_extractor.py      # CSV, Excel, Parquet, JSON, TXT
+│   └── db_extractor.py        # DB source via SQLAlchemy
+│
+├── transformers/
+│   ├── __init__.py
+│   ├── base.py                # Abstract transformer
+│   └── pandas_transformer.py  # Column/row transforms, cast, filter, derive
+│
+├── loaders/
+│   ├── __init__.py
+│   ├── base.py                # Abstract loader
+│   ├── file_loader.py         # Write to CSV/Parquet/JSON
+│   ├── truncate_loader.py     # Truncate-and-load to DB
+│   └── cdc_type2_loader.py    # SCD Type 2 insert/update/close
+│
+├── pipelines/                 # ★ One module per ETL scenario
+│   ├── __init__.py
+│   ├── file_to_file.py        # FILE → FILE pipeline
+│   ├── file_to_db.py          # FILE → DB pipeline (truncate / CDC)
+│   ├── db_to_db.py            # DB → DB pipeline (truncate / CDC)
+│   └── db_to_file.py          # DB → FILE pipeline
+│
+├── core/
+│   ├── __init__.py
+│   ├── engine.py              # Orchestrator — resolves pipeline_type → pipeline module
+│   ├── chunker.py             # Yields dataframe chunks
+│   └── parallel.py            # dask / multiprocessing / asyncio wrappers
+│
+├── utils/
+│   ├── __init__.py
+│   ├── logger.py              # Rich rotating-file + console logger
+│   └── monitor.py             # Job metrics: rows, elapsed time, errors
+│
+├── api/
+│   ├── __init__.py
+│   └── app.py                 # Flask REST API (generate/save/execute)
+│
+├── sample/
+│   ├── job_config.json        # Example multi-table job config
+│   └── mapping.xlsx           # Example Excel mapping file
+│
+└── tests/
+    ├── __init__.py
+    ├── test_config.py
+    ├── test_transformers.py
+    ├── test_cdc_type2.py
+    ├── test_file_to_file.py
+    ├── test_file_to_db.py
+    ├── test_db_to_db.py
+    └── test_db_to_file.py
+```
+
+---
+
+### Config Models
+
+#### [NEW] [models.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/config/models.py)
+
+Pydantic models for:
+- `SourceConfig` — type (FILE/DB), format, path/conn details, query
+- `TargetConfig` — type, table name, schema, load strategy (`truncate_load` | `cdc_type2`), SCD2 keys
+- `TransformationRule` — action, column, params
+- `TableConfig` — source + target + transformations + chunk_size
+- `JobConfig` — job_id, tables list, concurrency settings
+
+---
+
+### Connectors
+
+#### [NEW] [base.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/connectors/base.py)
+Abstract `BaseConnector` with `get_engine()`, `execute()`, `test_connection()`.
+
+#### [NEW] [oracle_connector.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/connectors/oracle_connector.py)
+Uses `cx_Oracle` + SQLAlchemy. Reads creds from env vars.
+
+#### [NEW] [teradata_connector.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/connectors/teradata_connector.py)
+Uses `teradatasql` dialect. Reads creds from env vars.
+
+#### [NEW] [generic_connector.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/connectors/generic_connector.py)
+Supports PostgreSQL (`psycopg2`), MySQL (`pymysql`), SQLite. Accepts full SQLAlchemy URL.
+
+---
+
+### Extractors
+
+#### [NEW] [file_extractor.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/extractors/file_extractor.py)
+- `pd.read_csv`, `pd.read_excel`, `pd.read_parquet`, `pd.read_json`
+- Supports delimiter, header row, encoding options
+- Yields chunks via `chunksize` parameter
+
+#### [NEW] [db_extractor.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/extractors/db_extractor.py)
+- `pd.read_sql` with configurable query or table name
+- Chunked reads via `chunksize`
+
+---
+
+### Transformers
+
+#### [NEW] [pandas_transformer.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/transformers/pandas_transformer.py)
+
+Actions supported:
+| Action | Description |
+|--------|-------------|
+| `upper` / `lower` / `trim` | String transforms |
+| `cast` | Data type conversion |
+| `rename` | Column rename |
+| `add` | Derived column via expression |
+| `drop` | Drop columns |
+| `filter` | Row filter with condition expression |
+| `deduplicate` | Drop duplicate rows |
+| `aggregate` | Group-by aggregation |
+
+---
+
+### Loaders
+
+#### [NEW] [truncate_loader.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/loaders/truncate_loader.py)
+1. `TRUNCATE TABLE target_table`
+2. Insert data in chunks via `df.to_sql(if_exists='append')`
+
+#### [NEW] [cdc_type2_loader.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/loaders/cdc_type2_loader.py)
+
+SCD Type 2 logic:
+1. Read existing active records (`is_current = 1` or `end_date IS NULL`)
+2. Merge incoming data on natural key columns
+3. **New rows** → Insert with `effective_date = now`, `end_date = NULL`, `is_current = 1`
+4. **Changed rows** → Close old record (`end_date = now`, `is_current = 0`), insert new version
+5. **Unchanged rows** → No action
+6. Comparison is via a hash of tracked columns (MD5)
+
+---
+
+### Pipeline Scenarios (★ New)
+
+Each pipeline type lives in its own module under `pipelines/`. `main.py` reads `pipeline_type` from the JSON config and dispatches to the corresponding module.
+
+#### [NEW] [file_to_file.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/pipelines/file_to_file.py)
+
+**FILE → FILE** pipeline:
+1. Extract from source file (CSV/Excel/Parquet/JSON/TXT) using `FileExtractor`
+2. Apply transformations via `PandasTransformer`
+3. Write to target file via `FileLoader`
+4. Supports chunked processing for large files
+
+#### [NEW] [file_to_db.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/pipelines/file_to_db.py)
+
+**FILE → DB** pipeline:
+1. Extract from source file using `FileExtractor`
+2. Apply transformations via `PandasTransformer`
+3. Load to DB using either `TruncateLoader` or `CDCType2Loader` based on `load_strategy` in config
+4. Supports chunked insert for large files
+
+#### [NEW] [db_to_db.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/pipelines/db_to_db.py)
+
+**DB → DB** pipeline:
+1. Extract from source DB using `DBExtractor` (query or table scan)
+2. Apply transformations via `PandasTransformer`
+3. Load to target DB using either `TruncateLoader` or `CDCType2Loader`
+4. Source and target can be different DB types (Oracle → Teradata, etc.)
+
+#### [NEW] [db_to_file.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/pipelines/db_to_file.py)
+
+**DB → FILE** pipeline:
+1. Extract from source DB using `DBExtractor`
+2. Apply transformations via `PandasTransformer`
+3. Write to target file via `FileLoader`
+4. Supports chunked export for large result sets
+
+#### Dispatch logic in `main.py`
+
+```python
+PIPELINE_REGISTRY = {
+    "FILE_TO_FILE": file_to_file.run,
+    "FILE_TO_DB":   file_to_db.run,
+    "DB_TO_DB":     db_to_db.run,
+    "DB_TO_FILE":   db_to_file.run,
+}
+
+def main(config_path):
+    config = load_config(config_path)
+    runner = PIPELINE_REGISTRY[config.pipeline_type]
+    for table_cfg in config.tables:
+        runner(table_cfg, monitor)
+```
+
+---
+
+### Core Engine
+
+#### [NEW] [engine.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/core/engine.py)
+
+Orchestrator that:
+1. Parses `JobConfig` from JSON
+2. Resolves `pipeline_type` → pipeline module from registry
+3. Runs tables concurrently when `max_workers > 1`
+4. Delegates Extract→Transform→Load to the pipeline module
+
+#### [NEW] [chunker.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/core/chunker.py)
+Generator that yields `pd.DataFrame` chunks from a source.
+
+#### [NEW] [parallel.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/core/parallel.py)
+- `run_tables_concurrent(tables, max_workers)` — ThreadPool
+- `transform_with_dask(df, transformations)` — dask DataFrame ops
+- `run_async_io(coros)` — asyncio event loop wrapper
+
+---
+
+### Utilities
+
+#### [NEW] [logger.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/utils/logger.py)
+- Console handler (INFO) + rotating file handler (DEBUG)
+- Per-job log files in `logs/` directory
+- Structured JSON log format option
+
+#### [NEW] [monitor.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/utils/monitor.py)
+- `JobMonitor` class tracking: start/end time, rows extracted/transformed/loaded, errors, status
+- Summary report at job completion
+- Writes metrics to `audit/` directory as JSON
+
+---
+
+### API Bridge
+
+#### [NEW] [app.py](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/api/app.py)
+Flask API exposing:
+- `POST /api/execute-pipeline` — trigger a job
+- `GET /api/job-status/<job_id>` — check running job status
+- `POST /api/generate-config` — generate config from frontend payload
+- Existing endpoints from README kept compatible
+
+---
+
+### Sample Files
+
+#### [NEW] [job_config.json](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/sample/job_config.json)
+Multi-table job with one truncate-and-load table and one CDC Type 2 table.
+
+#### [NEW] [mapping.xlsx](file:///Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend/sample/mapping.xlsx)
+Excel file with sheets: `column_mapping`, `transformations`, `filters`.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+
+All tests live in `backend/tests/` and use `pytest`.
+
+**Run all tests:**
+```bash
+cd /Users/pavankumarvarakudujayaram/Desktop/Code/Config-Python-AI-App/backend
+source .venv/bin/activate  # or create venv first
+pip install -r requirements.txt
+python -m pytest tests/ -v
+```
+
+| Test File | What It Covers |
+|-----------|----------------|
+| `test_config.py` | Pydantic model validation, JSON parsing, Excel mapping reader |
+| `test_transformers.py` | Each transformation action (upper, cast, filter, aggregate, etc.) |
+| `test_cdc_type2.py` | SCD2 logic — inserts, updates, unchanged, end-dating old records |
+| `test_file_to_file.py` | FILE → FILE: CSV→CSV, CSV→Parquet with transforms |
+| `test_file_to_db.py` | FILE → DB: CSV→SQLite truncate-load and CDC Type 2 |
+| `test_db_to_db.py` | DB → DB: SQLite→SQLite truncate-load and CDC Type 2 |
+| `test_db_to_file.py` | DB → FILE: SQLite→CSV/Parquet with transforms |
+
+All tests use in-memory data and SQLite (no external DB required).
+
+### Manual Verification
+
+1. **Generate test data**: Run `python Test_data/test_data_Creation.py` from the project root to create `employee_data.txt`.
+2. **Create a job config** pointing at `employee_data.txt` as source and a local SQLite DB as target.
+3. **Run the engine**: `python backend/main.py backend/sample/job_config.json`
+4. **Check logs**: Verify `backend/logs/` contains a structured log file with row counts.
+5. **Check audit**: Verify `backend/audit/` contains a JSON metrics file.
