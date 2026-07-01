@@ -1,24 +1,47 @@
 """
-Abstract base class for extractors.
+Database-based data extractor using SQLAlchemy.
+
+Supports chunked reading via pd.read_sql with chunksize parameter.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from typing import Iterator
 
 import pandas as pd
+from sqlalchemy.engine import Engine
+
+from extractors.base import BaseExtractor
+from utils.logger import get_logger
+
+logger = get_logger("db_extractor")
 
 
-class BaseExtractor(ABC):
-    """Extract data from a source and yield DataFrames."""
+class DBExtractor(BaseExtractor):
+    """Extract data from a database table or query."""
 
-    @abstractmethod
+    def __init__(self, engine: Engine, table: str | None = None, query: str | None = None, schema: str | None = None):
+        self.engine = engine
+        if query:
+            self.query = query
+        elif table:
+            self.query = f"SELECT * FROM {schema}.{table}" if schema else f"SELECT * FROM {table}"
+        else:
+            raise ValueError("Either 'table' or 'query' must be provided")
+
     def extract(self, chunk_size: int | None = None) -> Iterator[pd.DataFrame]:
-        """Yield DataFrames, optionally in chunks."""
-        ...
+        """Yield DataFrames from the database, optionally in chunks."""
+        logger.info("Extracting from DB (chunk_size=%s): %s", chunk_size, self.query[:200])
 
-    @abstractmethod
+        if chunk_size:
+            reader = pd.read_sql(self.query, self.engine, chunksize=chunk_size)
+            for i, chunk in enumerate(reader):
+                logger.debug("Chunk %d: %d rows", i, len(chunk))
+                yield chunk
+        else:
+            yield pd.read_sql(self.query, self.engine)
+
     def extract_all(self) -> pd.DataFrame:
-        """Extract the entire dataset into a single DataFrame."""
-        ...
+        """Read the entire result set into one DataFrame."""
+        logger.info("Extracting all from DB: %s", self.query[:200])
+        return pd.read_sql(self.query, self.engine)
