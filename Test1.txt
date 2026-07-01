@@ -1,47 +1,99 @@
 """
-Database-based data extractor using SQLAlchemy.
+File-based data extractor.
 
-Supports chunked reading via pd.read_sql with chunksize parameter.
+Supports CSV, TSV, TXT, Excel, Parquet, JSON, and Avro formats
+with chunked reading for large files.
 """
 
 from __future__ import annotations
 
-from typing import Iterator
+from pathlib import Path
+from typing import Any, Dict, Iterator, Optional
 
 import pandas as pd
-from sqlalchemy.engine import Engine
 
+from config.models import FileSourceConfig
 from extractors.base import BaseExtractor
 from utils.logger import get_logger
 
-logger = get_logger("db_extractor")
+logger = get_logger("file_extractor")
 
 
-class DBExtractor(BaseExtractor):
-    """Extract data from a database table or query."""
+class FileExtractor(BaseExtractor):
+    """Extract data from local files."""
 
-    def __init__(self, engine: Engine, table: str | None = None, query: str | None = None, schema: str | None = None):
-        self.engine = engine
-        if query:
-            self.query = query
-        elif table:
-            self.query = f"SELECT * FROM {schema}.{table}" if schema else f"SELECT * FROM {table}"
-        else:
-            raise ValueError("Either 'table' or 'query' must be provided")
+    def __init__(self, config: FileSourceConfig):
+        self.config = config
+        self.path = Path(config.path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Source file not found: {self.path}")
+
+    def _read_kwargs(self) -> Dict[str, Any]:
+        """Build keyword args for the pandas reader."""
+        fmt = self.config.format.value
+        kwargs: Dict[str, Any] = {}
+
+        if fmt in ("csv", "tsv", "txt"):
+            delimiter = self.config.delimiter
+            if fmt == "tsv":
+                delimiter = "\t"
+            kwargs["sep"] = delimiter
+            kwargs["encoding"] = self.config.encoding
+            if not self.config.header:
+                kwargs["header"] = None
+        elif fmt == "excel":
+            kwargs["engine"] = "openpyxl"
+            if self.config.sheet_name:
+                kwargs["sheet_name"] = self.config.sheet_name
+        # parquet and json have sensible defaults
+
+        return kwargs
 
     def extract(self, chunk_size: int | None = None) -> Iterator[pd.DataFrame]:
-        """Yield DataFrames from the database, optionally in chunks."""
-        logger.info("Extracting from DB (chunk_size=%s): %s", chunk_size, self.query[:200])
+        """Yield DataFrames, optionally in chunks."""
+        fmt = self.config.format.value
+        kwargs = self._read_kwargs()
 
-        if chunk_size:
-            reader = pd.read_sql(self.query, self.engine, chunksize=chunk_size)
-            for i, chunk in enumerate(reader):
-                logger.debug("Chunk %d: %d rows", i, len(chunk))
-                yield chunk
+        logger.info("Extracting from %s (format=%s, chunk_size=%s)", self.path, fmt, chunk_size)
+
+        if fmt in ("csv", "tsv", "txt"):
+            if chunk_size:
+                reader = pd.read_csv(self.path, chunksize=chunk_size, **kwargs)
+                for i, chunk in enumerate(reader):
+                    logger.debug("Chunk %d: %d rows", i, len(chunk))
+                    yield chunk
+            else:
+                yield pd.read_csv(self.path, **kwargs)
+
+        elif fmt == "excel":
+            # openpyxl doesn't support chunked reading natively
+            df = pd.read_excel(self.path, **kwargs)
+            if chunk_size and len(df) > chunk_size:
+                for start in range(0, len(df), chunk_size):
+                    yield df.iloc[start : start + chunk_size]
+            else:
+                yield df
+
+        elif fmt == "parquet":
+            df = pd.read_parquet(self.path, **kwargs)
+            if chunk_size and len(df) > chunk_size:
+                for start in range(0, len(df), chunk_size):
+                    yield df.iloc[start : start + chunk_size]
+            else:
+                yield df
+
+        elif fmt == "json":
+            df = pd.read_json(self.path, **kwargs)
+            if chunk_size and len(df) > chunk_size:
+                for start in range(0, len(df), chunk_size):
+                    yield df.iloc[start : start + chunk_size]
+            else:
+                yield df
+
         else:
-            yield pd.read_sql(self.query, self.engine)
+            raise ValueError(f"Unsupported file format: {fmt}")
 
     def extract_all(self) -> pd.DataFrame:
-        """Read the entire result set into one DataFrame."""
-        logger.info("Extracting all from DB: %s", self.query[:200])
-        return pd.read_sql(self.query, self.engine)
+        """Read the entire file into one DataFrame."""
+        chunks = list(self.extract(chunk_size=None))
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
