@@ -1,40 +1,14 @@
 """
-Teradata database connector using teradatasql + SQLAlchemy.
+Chunking utilities.
 """
 
-from __future__ import annotations
+import pandas as pd
 
-import os
-from typing import Any
-
-from connectors.base import BaseConnector
-from utils.logger import get_logger
-
-logger = get_logger("teradata_connector")
-
-
-class TeradataConnector(BaseConnector):
-    """Connector for Teradata databases."""
-
-    def __init__(self, **kwargs: Any):
-        super().__init__(**kwargs)
-        self.host = kwargs.get("host") or os.getenv("TERADATA_HOST", "localhost")
-        self.user = kwargs.get("user") or os.getenv("TERADATA_USER", "")
-        self.password = kwargs.get("password") or os.getenv("TERADATA_PASSWORD", "")
-        self.database = kwargs.get("database") or os.getenv("TERADATA_DB", "")
-        self.connection_url = kwargs.get("connection_url")
-
-    def build_connection_url(self) -> str:
-        if self.connection_url:
-            return self.connection_url
-
-        try:
-            import teradatasql  # noqa: F401
-        except ImportError:
-            raise ImportError(
-                "teradatasql is not installed. Install it with: pip install teradatasql"
-            )
-
-        url = f"teradatasql://{self.user}:{self.password}@{self.host}/{self.database}"
-        logger.debug("Teradata URL built for host=%s db=%s", self.host, self.database)
-        return url
+def yield_chunks(df: pd.DataFrame, chunk_size: int):
+    """Yield chunks from an existing dataframe if native chunking is unavailable."""
+    if chunk_size <= 0:
+        yield df
+        return
+        
+    for start in range(0, len(df), chunk_size):
+        yield df.iloc[start:start+chunk_size]
