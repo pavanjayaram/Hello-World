@@ -1,209 +1,66 @@
 """
-Pydantic configuration models for the ETL engine.
-
-Defines the schema for job configurations, including source/target definitions,
-transformation rules, and load strategies.
+Abstract base class for database connectors.
 """
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any, Dict, List, Optional
+from abc import ABC, abstractmethod
+from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
+from utils.logger import get_logger
 
-# ──────────────────────────────────────────────
-# Enums
-# ──────────────────────────────────────────────
-
-class SourceType(str, Enum):
-    FILE = "FILE"
-    DB = "DB"
+logger = get_logger("connector")
 
 
-class TargetType(str, Enum):
-    FILE = "FILE"
-    DB = "DB"
+class BaseConnector(ABC):
+    """Abstract connector providing a SQLAlchemy engine."""
 
+    def __init__(self, **kwargs: Any):
+        self._engine: Engine | None = None
+        self._kwargs = kwargs
 
-class FileFormat(str, Enum):
-    CSV = "csv"
-    TSV = "tsv"
-    TXT = "txt"
-    EXCEL = "excel"
-    PARQUET = "parquet"
-    JSON = "json"
-    AVRO = "avro"
+    @abstractmethod
+    def build_connection_url(self) -> str:
+        """Subclass must construct the SQLAlchemy connection URL."""
+        ...
 
+    def get_engine(self) -> Engine:
+        """Lazy-create and return a SQLAlchemy engine."""
+        if self._engine is None:
+            url = self.build_connection_url()
+            # Resolve .env aliases
+            from utils.env_utils import resolve_connection_string
+            url = resolve_connection_string(url)
+            
+            logger.info("Creating engine for: %s", url.split("@")[-1] if "@" in url else url)
+            self._engine = create_engine(url, pool_pre_ping=True)
+        return self._engine
 
-class DBType(str, Enum):
-    ORACLE = "oracle"
-    TERADATA = "teradata"
-    POSTGRES = "postgres"
-    MYSQL = "mysql"
-    SQLSERVER = "sqlserver"
-    SQLITE = "sqlite"
+    def execute(self, sql: str) -> None:
+        """Execute a raw SQL statement."""
+        engine = self.get_engine()
+        with engine.connect() as conn:
+            conn.execute(text(sql))
+            conn.commit()
+        logger.debug("Executed SQL: %s", sql[:200])
 
+    def test_connection(self) -> bool:
+        """Test that the connection is alive."""
+        try:
+            engine = self.get_engine()
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            logger.info("Connection test: OK")
+            return True
+        except Exception as exc:
+            logger.error("Connection test FAILED: %s", exc)
+            return False
 
-class LoadStrategy(str, Enum):
-    TRUNCATE_LOAD = "truncate_load"
-    CDC_TYPE2 = "cdc_type2"
-    APPEND = "append"
-
-
-class PipelineType(str, Enum):
-    FILE_TO_FILE = "FILE_TO_FILE"
-    FILE_TO_DB = "FILE_TO_DB"
-    DB_TO_DB = "DB_TO_DB"
-    DB_TO_FILE = "DB_TO_FILE"
-
-
-# ──────────────────────────────────────────────
-# Source / Target configs
-# ──────────────────────────────────────────────
-
-class FileSourceConfig(BaseModel):
-    """Config for file-based sources."""
-    format: FileFormat
-    path: str
-    delimiter: str = ","
-    header: bool = True
-    encoding: str = "utf-8"
-    sheet_name: Optional[str] = None  # For Excel files
-
-
-class DBSourceConfig(BaseModel):
-    """Config for database sources."""
-    db_type: DBType
-    connection_url: Optional[str] = Field(None, alias="connectionString")  # Resolve alias from frontend
-    host: Optional[str] = None
-    port: Optional[int] = None
-    database: Optional[str] = None
-    user: Optional[str] = None
-    password: Optional[str] = None
-    service_name: Optional[str] = None  # Oracle
-    schema_name: Optional[str] = Field(None, alias="schema")
-    table: Optional[str] = None
-    query: Optional[str] = None  # Custom SQL
-    
-    class Config:
-        populate_by_name = True
-
-
-class SourceConfig(BaseModel):
-    """Unified source configuration."""
-    type: SourceType
-    file: Optional[FileSourceConfig] = None
-    db: Optional[DBSourceConfig] = None
-
-
-class FileTargetConfig(BaseModel):
-    """Config for file-based targets."""
-    format: FileFormat
-    path: str
-    delimiter: str = ","
-    header: bool = True
-    encoding: str = "utf-8"
-    mode: str = "overwrite"  # overwrite | append
-
-
-class CDCType2Config(BaseModel):
-    """SCD Type 2 specific settings."""
-    natural_keys: List[str]  # Business key columns
-    tracked_columns: List[str]  # Columns to track for changes
-    effective_date_col: str = "effective_date"
-    end_date_col: str = "end_date"
-    end_date_default: Optional[Any] = None
-    is_current_col: str = "is_current"
-    current_value: Optional[str] = None
-    inactive_value: Optional[str] = None
-    hash_col: Optional[str] = "row_hash"
-    op_column: Optional[str] = None
-
-
-class DBTargetConfig(BaseModel):
-    """Config for database targets."""
-    db_type: DBType
-    connection_url: Optional[str] = Field(None, alias="connectionString")  # Resolve alias
-    host: Optional[str] = None
-    port: Optional[int] = None
-    database: Optional[str] = None
-    user: Optional[str] = None
-    password: Optional[str] = None
-    service_name: Optional[str] = None
-    schema_name: Optional[str] = None
-    table: str
-    load_strategy: LoadStrategy = LoadStrategy.TRUNCATE_LOAD
-    cdc_config: Optional[CDCType2Config] = None
-    batch_size: int = 1000  # Default to 1000 for standard loads
-    
-    class Config:
-        populate_by_name = True
-
-
-class TargetConfig(BaseModel):
-    """Unified target configuration."""
-    type: TargetType
-    file: Optional[FileTargetConfig] = None
-    db: Optional[DBTargetConfig] = None
-
-
-# ──────────────────────────────────────────────
-# Transformations
-# ──────────────────────────────────────────────
-
-class TransformationRule(BaseModel):
-    """Single transformation rule."""
-    action: str  # upper, lower, trim, cast, rename, add, drop, filter, deduplicate, aggregate
-    column: Optional[str] = None
-    params: Dict[str, Any] = Field(default_factory=dict)
-    # Examples:
-    #   {"action": "upper", "column": "name"}
-    #   {"action": "cast", "column": "salary", "params": {"dtype": "float"}}
-    #   {"action": "rename", "column": "old_name", "params": {"new_name": "new_col"}}
-    #   {"action": "add", "params": {"new_column": "full_name", "expression": "first + ' ' + last"}}
-    #   {"action": "filter", "params": {"condition": "salary > 50000"}}
-    #   {"action": "deduplicate", "params": {"subset": ["id", "name"]}}
-    #   {"action": "aggregate", "params": {"group_by": ["dept"], "agg": {"salary": "sum"}}}
-
-    @model_validator(mode="before")
-    @classmethod
-    def _merge_legacy_fields_into_params(cls, data: Any) -> Any:
-        """Support both nested params and legacy top-level transformation fields."""
-        if not isinstance(data, dict):
-            return data
-
-        params = dict(data.get("params") or {})
-        reserved = {"action", "column", "params"}
-        legacy_params = {k: v for k, v in data.items() if k not in reserved}
-
-        if legacy_params:
-            params = {**legacy_params, **params}
-            data = {**data, "params": params}
-
-        return data
-
-
-# ──────────────────────────────────────────────
-# Table / Job configs
-# ──────────────────────────────────────────────
-
-class TableConfig(BaseModel):
-    """Configuration for a single table/dataset in the pipeline."""
-    table_id: str
-    source: SourceConfig
-    target: TargetConfig
-    transformations: List[TransformationRule] = Field(default_factory=list)
-    chunk_size: int = 50000
-    use_dask: bool = False
-
-
-class JobConfig(BaseModel):
-    """Top-level job configuration."""
-    job_id: str
-    pipeline_type: PipelineType
-    tables: List[TableConfig]
-    max_workers: int = 1  # Number of concurrent table processes
-    description: str = ""
-    mapping_file: Optional[str] = None  # Path to Excel mapping file
+    def dispose(self) -> None:
+        """Dispose of the engine and its connection pool."""
+        if self._engine:
+            self._engine.dispose()
+            self._engine = None
