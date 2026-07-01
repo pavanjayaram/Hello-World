@@ -1,91 +1,66 @@
 """
-File loader for writing DataFrames to local files.
-
-Supports CSV, Excel, Parquet, and JSON formats.
+Truncate and load loader for databases.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict
-
 import pandas as pd
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
-from config.models import FileTargetConfig
 from loaders.base import BaseLoader
 from utils.logger import get_logger
 
-logger = get_logger("file_loader")
+logger = get_logger("truncate_loader")
 
 
-class FileLoader(BaseLoader):
-    """Load data into a local file."""
+class TruncateLoader(BaseLoader):
+    """Truncate the target table, then load data."""
 
-    def __init__(self, config: FileTargetConfig):
-        self.config = config
-        self.path = Path(config.path)
-        # Ensure parent directory exists
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._is_first_chunk = True
-
-    def _get_write_kwargs(self) -> Dict[str, Any]:
-        fmt = self.config.format.value
-        mode = self.config.mode  # overwrite | append
-        kwargs: Dict[str, Any] = {}
-
-        file_mode = "w" if self._is_first_chunk and mode == "overwrite" else "a"
-        
-        if fmt in ("csv", "tsv", "txt"):
-            delimiter = self.config.delimiter
-            if fmt == "tsv":
-                delimiter = "\t"
-            kwargs["sep"] = delimiter
-            kwargs["encoding"] = self.config.encoding
-            kwargs["index"] = False
-            kwargs["mode"] = file_mode
-            # Only write header if we want it AND it's a new file or overwrite mode
-            kwargs["header"] = self.config.header if (file_mode == "w" or not self.path.exists()) else False
-            
-        elif fmt == "excel":
-            kwargs["index"] = False
-            
-        # Parquet and JSON defaults are usually fine
-
-        return kwargs
+    def __init__(self, engine: Engine, table: str, schema: str | None = None, batch_size: int = 10000):
+        self.engine = engine
+        self.table = table
+        self.schema = schema
+        self.batch_size = batch_size
+        self._truncated = False
 
     def load(self, df: pd.DataFrame) -> dict:
-        """Write DataFrame to file."""
         if df.empty:
             return {"rows_loaded": 0}
 
-        fmt = self.config.format.value
-        kwargs = self._get_write_kwargs()
+        if not self._truncated:
+            table_name = f"{self.schema}.{self.table}" if self.schema else self.table
+            try:
+                with self.engine.begin() as conn:
+                    # SQLite doesn't support TRUNCATE, so delete
+                    if self.engine.dialect.name == "sqlite":
+                        conn.execute(text(f"DELETE FROM {table_name}"))
+                    else:
+                        conn.execute(text(f"TRUNCATE TABLE {table_name}"))
+                logger.info("Truncated table %s", table_name)
+            except Exception as exc:
+                logger.warning("Truncate failed, attempting drop/create or delete: %s", exc)
+                # Fallback to delete
+                try:
+                    with self.engine.begin() as conn:
+                        conn.execute(text(f"DELETE FROM {table_name}"))
+                except Exception as e2:
+                    logger.error("Fallback delete also failed: %s", e2)
+                    
+            self._truncated = True
 
-        logger.info("Writing %d rows to %s (format=%s, mode=%s)", 
-                    len(df), self.path, fmt, kwargs.get("mode", "w"))
-
-        if fmt in ("csv", "tsv", "txt"):
-            df.to_csv(self.path, **kwargs)
-        elif fmt == "excel":
-            # Pandas does not support appending to Excel out of the box efficiently in chunks
-            mode = self.config.mode
-            if not self._is_first_chunk or (mode == "append" and self.path.exists()):
-                logger.warning("Chunked/append write to Excel is not fully supported natively.")
-                # Basic workaround: could read existing, concat, write, but it's slow.
-                # Here we just overwrite for simplicity if using a simple API.
-            df.to_excel(self.path, **kwargs)
-        elif fmt == "parquet":
-            if kwargs.get("mode") == "a" and self.path.exists():
-                import pyarrow.parquet as pq
-                import pyarrow as pa
-                table = pa.Table.from_pandas(df)
-                pq.write_to_dataset(table, root_path=str(self.path.parent), basename_template="part-{i}.parquet")
-            else:
-                df.to_parquet(self.path, index=False)
-        elif fmt == "json":
-            df.to_json(self.path, orient="records", lines=True, mode=kwargs.get("mode", "w"))
-        else:
-            raise ValueError(f"Unsupported target file format: {fmt}")
-
-        self._is_first_chunk = False
-        return {"rows_loaded": len(df)}
+        logger.info("Loading %d rows into %s (batch_size=%d)", len(df), self.table, self.batch_size)
+        try:
+            df.to_sql(
+                name=self.table,
+                con=self.engine,
+                schema=self.schema,
+                if_exists="append",
+                index=False,
+                chunksize=self.batch_size,
+                method="multi"  # multi-row insert
+            )
+            return {"rows_loaded": len(df), "rows_inserted": len(df)}
+        except Exception as exc:
+            logger.error("TruncateLoad insert failed: %s", exc)
+            raise
