@@ -1,103 +1,146 @@
 """
-Logging configuration for the ETL engine.
+Job monitoring and metrics collection.
 
-Provides structured, colored console output and rotating file logs
-with per-job log files in the logs/ directory.
+Tracks extraction, transformation, and load metrics per table
+and writes a summary JSON to the audit/ directory.
 """
 
 from __future__ import annotations
 
-import logging
+import json
 import os
-import sys
+import time
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from utils.logger import get_logger
+
+logger = get_logger("monitor")
 
 
-def setup_logger(
-    job_id: str = "etl_engine",
-    log_dir: str | None = None,
-    console_level: int = logging.INFO,
-    file_level: int = logging.DEBUG,
-    max_bytes: int = 10 * 1024 * 1024,  # 10 MB
-    backup_count: int = 5,
-) -> logging.Logger:
-    """Configure and return the root ETL logger.
+@dataclass
+class TableMetrics:
+    """Metrics for a single table in the pipeline."""
+    table_id: str
+    status: str = "pending"  # pending | running | success | failed
+    rows_extracted: int = 0
+    rows_transformed: int = 0
+    rows_loaded: int = 0
+    rows_inserted: int = 0
+    rows_updated: int = 0
+    rows_unchanged: int = 0
+    rows_rejected: int = 0
+    chunks_processed: int = 0
+    errors: List[str] = field(default_factory=list)
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
 
-    Args:
-        job_id: Identifier used in the log filename.
-        log_dir: Directory for log files. Defaults to backend/logs/.
-        console_level: Logging level for console output.
-        file_level: Logging level for file output.
-        max_bytes: Max size of each log file before rotation.
-        backup_count: Number of rotated log files to keep.
+    @property
+    def elapsed_seconds(self) -> float:
+        if self.start_time is None:
+            return 0.0
+        end = self.end_time or time.time()
+        return round(end - self.start_time, 2)
 
-    Returns:
-        Configured Logger instance.
-    """
-    if log_dir is None:
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+    def start(self) -> None:
+        self.status = "running"
+        self.start_time = time.time()
 
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    def finish(self, status: str = "success") -> None:
+        self.status = status
+        self.end_time = time.time()
 
-    logger = logging.getLogger("etl_engine")
-    logger.setLevel(logging.DEBUG)
+    def add_error(self, error: str) -> None:
+        self.errors.append(error)
+        logger.error("[%s] %s", self.table_id, error)
 
-    # ── Console handler (colored if available) ──
-    has_console = any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in logger.handlers)
-    if not has_console:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(console_level)
-    
-        try:
-            import colorlog
-            console_fmt = colorlog.ColoredFormatter(
-                "%(log_color)s%(asctime)s │ %(levelname)-8s │ %(name)s │ %(message)s",
-                datefmt="%H:%M:%S",
-                log_colors={
-                    "DEBUG": "cyan",
-                    "INFO": "green",
-                    "WARNING": "yellow",
-                    "ERROR": "red",
-                    "CRITICAL": "bold_red",
-                },
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["elapsed_seconds"] = self.elapsed_seconds
+        return d
+
+
+class JobMonitor:
+    """Aggregates metrics for an entire ETL job."""
+
+    def __init__(self, job_id: str, audit_dir: str | None = None):
+        self.job_id = job_id
+        self.start_time = time.time()
+        self.end_time: Optional[float] = None
+        self.status: str = "running"
+        self.tables: Dict[str, TableMetrics] = {}
+
+        if audit_dir is None:
+            audit_dir = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "audit"
             )
-        except ImportError:
-            console_fmt = logging.Formatter(
-                "%(asctime)s │ %(levelname)-8s │ %(name)s │ %(message)s",
-                datefmt="%H:%M:%S",
-            )
-    
-        console_handler.setFormatter(console_fmt)
-        logger.addHandler(console_handler)
+        self.audit_dir = audit_dir
+        Path(self.audit_dir).mkdir(parents=True, exist_ok=True)
 
-    # ── Rotating file handler ──
-    # Create an independent file handler if one doesn't exist for THIS job_id
-    has_job_file = any(isinstance(h, RotatingFileHandler) and f"{job_id}_" in getattr(h, "baseFilename", "") for h in logger.handlers)
-    
-    if not has_job_file:
+    def get_table(self, table_id: str) -> TableMetrics:
+        """Get or create metrics for a table."""
+        if table_id not in self.tables:
+            self.tables[table_id] = TableMetrics(table_id=table_id)
+        return self.tables[table_id]
+
+    @property
+    def elapsed_seconds(self) -> float:
+        end = self.end_time or time.time()
+        return round(end - self.start_time, 2)
+
+    def finish(self, status: str = "success") -> None:
+        self.status = status
+        self.end_time = time.time()
+
+    def summary(self) -> Dict[str, Any]:
+        """Generate a full summary dict."""
+        return {
+            "job_id": self.job_id,
+            "status": self.status,
+            "started_at": datetime.fromtimestamp(self.start_time).isoformat(),
+            "finished_at": (
+                datetime.fromtimestamp(self.end_time).isoformat()
+                if self.end_time else None
+            ),
+            "elapsed_seconds": self.elapsed_seconds,
+            "tables": {
+                tid: tm.to_dict() for tid, tm in self.tables.items()
+            },
+        }
+
+    def write_audit(self) -> str:
+        """Write metrics JSON to audit directory. Returns the file path."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(log_dir, f"{job_id}_{timestamp}.log")
-    
-        file_handler = RotatingFileHandler(
-            log_file,
-            maxBytes=max_bytes,
-            backupCount=backup_count,
-            encoding="utf-8",
-        )
-        file_handler.setLevel(file_level)
-    
-        file_fmt = logging.Formatter(
-            "%(asctime)s │ %(levelname)-8s │ %(name)s │ %(funcName)s:%(lineno)d │ %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        file_handler.setFormatter(file_fmt)
-        logger.addHandler(file_handler)
-        logger.info("Logger initialised — file: %s", log_file)
+        filename = f"{self.job_id}_{timestamp}.json"
+        filepath = os.path.join(self.audit_dir, filename)
 
-    return logger
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(self.summary(), f, indent=2, default=str)
 
-def get_logger(name: str = "etl_engine") -> logging.Logger:
-    """Return a child logger under the etl_engine hierarchy."""
-    return logging.getLogger(f"etl_engine.{name}")
+        logger.info("Audit written: %s", filepath)
+        return filepath
+
+    def print_summary(self) -> None:
+        """Log a human-readable summary."""
+        s = self.summary()
+        logger.info("=" * 60)
+        logger.info("JOB SUMMARY: %s", s["job_id"])
+        logger.info("Status: %s | Elapsed: %.2fs", s["status"], s["elapsed_seconds"])
+        logger.info("-" * 60)
+        for tid, tm in s["tables"].items():
+            logger.info(
+                "  %-20s | status=%-8s | extracted=%d | loaded=%d | elapsed=%.2fs",
+                tid, tm["status"], tm["rows_extracted"], tm["rows_loaded"],
+                tm["elapsed_seconds"],
+            )
+            if tm.get("rows_inserted") or tm.get("rows_updated"):
+                logger.info(
+                    "  %-20s | inserted=%d | updated=%d | unchanged=%d",
+                    "", tm["rows_inserted"], tm["rows_updated"], tm["rows_unchanged"],
+                )
+            if tm["errors"]:
+                for err in tm["errors"]:
+                    logger.error("  %-20s | ERROR: %s", tid, err)
+        logger.info("=" * 60)
