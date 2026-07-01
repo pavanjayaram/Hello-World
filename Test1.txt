@@ -1,39 +1,103 @@
 """
-Utility for resolving environment variables and connection string aliases.
+Logging configuration for the ETL engine.
+
+Provides structured, colored console output and rotating file logs
+with per-job log files in the logs/ directory.
 """
 
+from __future__ import annotations
+
+import logging
 import os
+import sys
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from dotenv import load_dotenv
-from utils.logger import get_logger
 
-logger = get_logger("env_utils")
 
-# Ensure .env is loaded
-env_path = Path(__file__).parent.parent / ".env"
-if env_path.exists():
-    logger.info("Found .env at %s, loading...", env_path)
-    load_dotenv(env_path)
-else:
-    logger.warning(".env NOT found at %s", env_path)
+def setup_logger(
+    job_id: str = "etl_engine",
+    log_dir: str | None = None,
+    console_level: int = logging.INFO,
+    file_level: int = logging.DEBUG,
+    max_bytes: int = 10 * 1024 * 1024,  # 10 MB
+    backup_count: int = 5,
+) -> logging.Logger:
+    """Configure and return the root ETL logger.
 
-def resolve_connection_string(conn_str: str) -> str:
+    Args:
+        job_id: Identifier used in the log filename.
+        log_dir: Directory for log files. Defaults to backend/logs/.
+        console_level: Logging level for console output.
+        file_level: Logging level for file output.
+        max_bytes: Max size of each log file before rotation.
+        backup_count: Number of rotated log files to keep.
+
+    Returns:
+        Configured Logger instance.
     """
-    Resolve a connection string alias (e.g., 'POSTGRES_URL') to its actual value.
-    """
-    if not conn_str:
-        return ""
-    
-    # If it looks like a full URL already, don't resolve
-    if "://" in conn_str or "host=" in conn_str or conn_str.startswith("sqlite"):
-        return conn_str
-    
-    # Try fetching from environment (loaded via load_dotenv above)
-    val = os.getenv(conn_str)
-    if val:
-        logger.debug("Resolved alias '%s' using environment variable.", conn_str)
-        return val.strip('"\'')
-    
-    logger.warning("Could not resolve connection alias '%s' (not found in env).", conn_str)
-    return conn_str
+    if log_dir is None:
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("etl_engine")
+    logger.setLevel(logging.DEBUG)
+
+    # ── Console handler (colored if available) ──
+    has_console = any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in logger.handlers)
+    if not has_console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(console_level)
+    
+        try:
+            import colorlog
+            console_fmt = colorlog.ColoredFormatter(
+                "%(log_color)s%(asctime)s │ %(levelname)-8s │ %(name)s │ %(message)s",
+                datefmt="%H:%M:%S",
+                log_colors={
+                    "DEBUG": "cyan",
+                    "INFO": "green",
+                    "WARNING": "yellow",
+                    "ERROR": "red",
+                    "CRITICAL": "bold_red",
+                },
+            )
+        except ImportError:
+            console_fmt = logging.Formatter(
+                "%(asctime)s │ %(levelname)-8s │ %(name)s │ %(message)s",
+                datefmt="%H:%M:%S",
+            )
+    
+        console_handler.setFormatter(console_fmt)
+        logger.addHandler(console_handler)
+
+    # ── Rotating file handler ──
+    # Create an independent file handler if one doesn't exist for THIS job_id
+    has_job_file = any(isinstance(h, RotatingFileHandler) and f"{job_id}_" in getattr(h, "baseFilename", "") for h in logger.handlers)
+    
+    if not has_job_file:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"{job_id}_{timestamp}.log")
+    
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(file_level)
+    
+        file_fmt = logging.Formatter(
+            "%(asctime)s │ %(levelname)-8s │ %(name)s │ %(funcName)s:%(lineno)d │ %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        file_handler.setFormatter(file_fmt)
+        logger.addHandler(file_handler)
+        logger.info("Logger initialised — file: %s", log_file)
+
+    return logger
+
+def get_logger(name: str = "etl_engine") -> logging.Logger:
+    """Return a child logger under the etl_engine hierarchy."""
+    return logging.getLogger(f"etl_engine.{name}")
