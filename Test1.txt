@@ -1,346 +1,91 @@
 """
-CDC Type 2 (SCD2) Loader.
+File loader for writing DataFrames to local files.
 
-Performs a merge of incoming data against the currently active records
-in the target database table. Implements inserts for new records and
-end-dating for changed records.
+Supports CSV, Excel, Parquet, and JSON formats.
 """
 
 from __future__ import annotations
 
-import hashlib
-from datetime import datetime
-from typing import List
+from pathlib import Path
+from typing import Any, Dict
 
 import pandas as pd
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
-from config.models import CDCType2Config
+from config.models import FileTargetConfig
 from loaders.base import BaseLoader
 from utils.logger import get_logger
 
-logger = get_logger("cdc_type2_loader")
+logger = get_logger("file_loader")
 
 
-class CDCType2Loader(BaseLoader):
-    """Loader implementing Slowly Changing Dimension Type 2 logic."""
+class FileLoader(BaseLoader):
+    """Load data into a local file."""
 
-    def __init__(self, engine: Engine, table: str, config: CDCType2Config, schema: str | None = None, batch_size: int = 10000):
-        self.engine = engine
-        self.table = table
-        self.schema = schema
+    def __init__(self, config: FileTargetConfig):
         self.config = config
-        self.batch_size = batch_size
-        self.table_name = f"{self.schema}.{self.table}" if self.schema else self.table
-        self.seen_keys_list = set()
-        self._resolved_markers = {}
+        self.path = Path(config.path)
+        # Ensure parent directory exists
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._is_first_chunk = True
 
-    def _hash_row(self, row: pd.Series, tracked_cols: List[str]) -> str:
-        """Create a robust MD5 hash immune to float/integer type mismatches and various null representations."""
-        values = []
-        for col in tracked_cols:
-            if col in row.index:
-                val = row[col]
-                if pd.isna(val) or val is None:
-                    values.append("")
-                else:
-                    try:
-                        import decimal
-                        # Absolute parity with Postgres half-up NUMERIC decimal rounding strategy
-                        dec_val = decimal.Decimal(str(val)).quantize(decimal.Decimal('.01'), rounding=decimal.ROUND_HALF_UP)
-                        v_float = float(dec_val)
-                        if v_float.is_integer():
-                            values.append(str(int(v_float)))
-                        else:
-                            values.append(str(v_float))
-                    except (ValueError, TypeError, decimal.InvalidOperation):
-                        values.append(str(val).strip())
-            else:
-                values.append("")
-                
-        concat = "|".join(values).encode("utf-8")
-        return hashlib.md5(concat).hexdigest()
+    def _get_write_kwargs(self) -> Dict[str, Any]:
+        fmt = self.config.format.value
+        mode = self.config.mode  # overwrite | append
+        kwargs: Dict[str, Any] = {}
 
-    def _resolve_current_markers(self, df: pd.DataFrame, curr_col: str) -> tuple[str, str]:
-        """Resolve active/inactive marker values for the current-row column."""
-        current_value = self.config.current_value
-        inactive_value = self.config.inactive_value
+        file_mode = "w" if self._is_first_chunk and mode == "overwrite" else "a"
+        
+        if fmt in ("csv", "tsv", "txt"):
+            delimiter = self.config.delimiter
+            if fmt == "tsv":
+                delimiter = "\t"
+            kwargs["sep"] = delimiter
+            kwargs["encoding"] = self.config.encoding
+            kwargs["index"] = False
+            kwargs["mode"] = file_mode
+            # Only write header if we want it AND it's a new file or overwrite mode
+            kwargs["header"] = self.config.header if (file_mode == "w" or not self.path.exists()) else False
+            
+        elif fmt == "excel":
+            kwargs["index"] = False
+            
+        # Parquet and JSON defaults are usually fine
 
-        if current_value is None and curr_col in df.columns:
-            non_null = df[curr_col].dropna()
-            if not non_null.empty:
-                current_value = str(non_null.iloc[0])
-
-        if current_value is None:
-            current_value = "1"
-
-        if inactive_value is None:
-            upper_current = current_value.upper()
-            if upper_current == "Y":
-                inactive_value = "N"
-            elif upper_current == "TRUE":
-                inactive_value = "FALSE"
-            else:
-                inactive_value = "0"
-
-        return current_value, inactive_value
-
-    def _resolve_end_date_default(self):
-        """Normalize configured end-date default into a DB-friendly value."""
-        default_value = self.config.end_date_default
-        if default_value in (None, ""):
-            return None
-
-        try:
-            return pd.to_datetime(default_value).date()
-        except Exception:
-            return default_value
+        return kwargs
 
     def load(self, df: pd.DataFrame) -> dict:
+        """Write DataFrame to file."""
         if df.empty:
             return {"rows_loaded": 0}
 
-        now = datetime.now()
-        eff_col = self.config.effective_date_col
-        end_col = self.config.end_date_col
-        curr_col = self.config.is_current_col
-        hash_col = self.config.hash_col
-        keys = self.config.natural_keys
-        tracked = self.config.tracked_columns
-        current_value, inactive_value = self._resolve_current_markers(df, curr_col)
-        self._resolved_markers = {"curr": current_value, "inact": inactive_value}
-        end_date_default = self._resolve_end_date_default()
-        
-        # 1.5 Track keys globally for Delete tracking
-        if keys and len(keys) > 0 and keys[0] in df.columns:
-            self.seen_keys_list.update(df[keys[0]].dropna().astype(str).unique().tolist())
+        fmt = self.config.format.value
+        kwargs = self._get_write_kwargs()
 
-        # 1. Calculate hashes for incoming data
-        # We use a temporary hash alias if the DB doesn't have a hash column
-        working_hash_col = hash_col or "_row_hash"
-        df[working_hash_col] = df.apply(lambda r: self._hash_row(r, tracked), axis=1)
+        logger.info("Writing %d rows to %s (format=%s, mode=%s)", 
+                    len(df), self.path, fmt, kwargs.get("mode", "w"))
 
-        # 2. Extract current active records from DB
-        # If hash_col is missing from DB, we fetch tracked columns and hash them in-memory
-        cols_to_fetch = keys.copy()
-        if hash_col:
-            cols_to_fetch.append(hash_col)
-        else:
-            cols_to_fetch.extend([c for c in tracked if c not in keys])
-        
-        cols_str = ", ".join([f'"{c}"' for c in cols_to_fetch])
-        
-        # Identify the current LOAD_ID to exclude rows from this load from the active records comparison.
-        # This prevents chunking duplicate conflict.
-        load_id_value = None
-        if "LOAD_ID" in df.columns:
-            non_null_id = df["LOAD_ID"].dropna()
-            if not non_null_id.empty:
-                val = non_null_id.iloc[0]
-                load_id_value = int(val)
-                self.current_load_id = load_id_value
-
-        try:
-            keys_in_chunk = [str(x).replace("'", "''") for x in df[keys[0]].dropna().unique()]
-            in_clause = ", ".join(f"'{x}'" for x in keys_in_chunk) if keys_in_chunk else "NULL"
-            
-            if load_id_value is not None:
-                query = text(f'SELECT {cols_str} FROM {self.table_name} WHERE "{curr_col}" = :current_value AND "LOAD_ID" != :load_id AND "{keys[0]}" IN ({in_clause})')
-                existing_df = pd.read_sql(query, self.engine, params={"current_value": current_value, "load_id": load_id_value})
+        if fmt in ("csv", "tsv", "txt"):
+            df.to_csv(self.path, **kwargs)
+        elif fmt == "excel":
+            # Pandas does not support appending to Excel out of the box efficiently in chunks
+            mode = self.config.mode
+            if not self._is_first_chunk or (mode == "append" and self.path.exists()):
+                logger.warning("Chunked/append write to Excel is not fully supported natively.")
+                # Basic workaround: could read existing, concat, write, but it's slow.
+                # Here we just overwrite for simplicity if using a simple API.
+            df.to_excel(self.path, **kwargs)
+        elif fmt == "parquet":
+            if kwargs.get("mode") == "a" and self.path.exists():
+                import pyarrow.parquet as pq
+                import pyarrow as pa
+                table = pa.Table.from_pandas(df)
+                pq.write_to_dataset(table, root_path=str(self.path.parent), basename_template="part-{i}.parquet")
             else:
-                query = text(f'SELECT {cols_str} FROM {self.table_name} WHERE "{curr_col}" = :current_value AND "{keys[0]}" IN ({in_clause})')
-                existing_df = pd.read_sql(query, self.engine, params={"current_value": current_value})
-            
-            logger.debug("Read %d active records from %s", len(existing_df), self.table_name)
-            
-            # If we didn't have a hash_col in DB, create it in-memory for the incoming data comparison
-            if not hash_col and not existing_df.empty:
-                existing_df[working_hash_col] = existing_df.apply(lambda r: self._hash_row(r, tracked), axis=1)
-            elif not hash_col:
-                existing_df[working_hash_col] = None
-                
-        except Exception as exc:
-            logger.warning("Target table empty or query failed. Treating all as new. Error: %s", exc)
-            existing_df = pd.DataFrame(columns=keys + [working_hash_col])
+                df.to_parquet(self.path, index=False)
+        elif fmt == "json":
+            df.to_json(self.path, orient="records", lines=True, mode=kwargs.get("mode", "w"))
+        else:
+            raise ValueError(f"Unsupported target file format: {fmt}")
 
-        # Safely remove any accidental duplicates in target DB to prevent Cartesian explosion during merge
-        if not existing_df.empty:
-            existing_df = existing_df.drop_duplicates(subset=keys, keep="last")
-
-        # 3. Align datatypes for merge (cast keys to string to avoid mismatch between file and DB types)
-        for k in keys:
-            if k in df.columns:
-                df[k] = df[k].astype(str)
-            if k in existing_df.columns:
-                existing_df[k] = existing_df[k].astype(str)
-
-        merged = df.merge(
-            existing_df[keys + [working_hash_col]],
-            on=keys,
-            how="left",
-            suffixes=("", "_tgt"),
-            indicator=True
-        )
-
-        # 4. Identify inserts and updates
-        new_mask = merged["_merge"] == "left_only"
-        changed_mask = (merged["_merge"] == "both") & (merged[working_hash_col] != merged[f"{working_hash_col}_tgt"])
-        unchanged_mask = (merged["_merge"] == "both") & (merged[working_hash_col] == merged[f"{working_hash_col}_tgt"])
-
-        new_df = merged[new_mask].drop(columns=["_merge", f"{working_hash_col}_tgt"])
-        changed_df = merged[changed_mask].drop(columns=["_merge", f"{working_hash_col}_tgt"])
-        
-        metrics = {
-            "rows_loaded": len(new_df) + len(changed_df),
-            "rows_inserted": len(new_df),
-            "rows_updated": len(changed_df),
-            "rows_unchanged": len(merged[unchanged_mask])
-        }
-
-        with self.engine.begin() as conn:
-            # 5. End-date changed records in target DB
-            if not changed_df.empty:
-                logger.info("Closing %d changed records using efficient bulk staging table", len(changed_df))
-                temp_table = f"temp_closes_{int(now.timestamp() * 1000)}"
-                
-                # 5a. Create Temp staging table to hold keys of records needing closure
-                col_defs = ", ".join([f'"{k}" VARCHAR' for k in keys])
-                conn.execute(text(f"CREATE TEMPORARY TABLE {temp_table} ({col_defs}) ON COMMIT DROP"))
-                
-                # 5b. Blazing fast bulk insert into temp table
-                changed_df[keys].to_sql(
-                    name=temp_table,
-                    con=conn,
-                    if_exists="append",
-                    index=False,
-                    method="multi",
-                    chunksize=5000
-                )
-                
-                # 5c. Single bulk update query targeting all active target rows matched in temp table
-                join_conds = " AND ".join([f'CAST(t."{k}" AS VARCHAR) = CAST(tmp."{k}" AS VARCHAR)' for k in keys])
-                update_sql = f"""
-                    UPDATE {self.table_name} t
-                    SET "{end_col}" = :end_dt, "{curr_col}" = :inactive_value
-                    FROM {temp_table} tmp
-                    WHERE {join_conds}
-                    AND CAST(t."{curr_col}" AS VARCHAR) = CAST(:current_value AS VARCHAR)
-                """
-                conn.execute(text(update_sql), {
-                    "end_dt": now,
-                    "inactive_value": inactive_value,
-                    "current_value": current_value
-                })
-
-            # 6. Insert new and changed (new version) records
-            if self.config.op_column:
-                if self.config.op_column in new_df.columns:
-                    new_df.loc[:, self.config.op_column] = "I"
-                if self.config.op_column in changed_df.columns:
-                    changed_df.loc[:, self.config.op_column] = "U"
-            
-            inserts_df = pd.concat([new_df, changed_df], ignore_index=True)
-            if not inserts_df.empty:
-                logger.info("Inserting %d new/updated records", len(inserts_df))
-
-                if eff_col in inserts_df.columns:
-                    inserts_df[eff_col] = inserts_df[eff_col].where(inserts_df[eff_col].notna(), now)
-                else:
-                    inserts_df[eff_col] = now
-
-                if end_col not in inserts_df.columns:
-                    inserts_df[end_col] = end_date_default
-                elif end_date_default is not None:
-                    inserts_df[end_col] = inserts_df[end_col].where(inserts_df[end_col].notna(), end_date_default)
-
-                if curr_col in inserts_df.columns:
-                    inserts_df[curr_col] = inserts_df[curr_col].where(inserts_df[curr_col].notna(), current_value)
-                else:
-                    inserts_df[curr_col] = current_value
-                
-                # IMPORTANT: Drop the temporary hash column if it doesn't exist in the actual DB
-                if not hash_col and working_hash_col in inserts_df.columns:
-                    inserts_df = inserts_df.drop(columns=[working_hash_col])
-                
-                try:
-                    inserts_df.to_sql(
-                        name=self.table,
-                        con=conn,
-                        schema=self.schema,
-                        if_exists="append",
-                        index=False,
-                        chunksize=self.batch_size,
-                        method="multi"
-                    )
-                except Exception as exc:
-                    logger.error("CDC insert failed: %s", exc)
-                    raise
-
-        return metrics
-
-    def finalize(self) -> dict:
-        """Perform post-load CDC Full Volume reconciliation (Soft Deletes).
-        Closes any active records that were NOT present in the incoming data
-        (identified by having a stale LOAD_ID) and tags them as Deleted ('D')."""
-        metrics = {"rows_deleted": 0}
-        
-        if not hasattr(self, 'current_load_id') or self.current_load_id is None or not hasattr(self, 'seen_keys_list'):
-            return metrics
-            
-        curr_col = self.config.is_current_col
-        end_col = self.config.end_date_col
-        op_col = self.config.op_column
-        keys = self.config.natural_keys
-        
-        current_value = self._resolved_markers.get("curr", "Y")
-        inactive_value = self._resolved_markers.get("inact", "N")
-        now = datetime.now()
-
-        if not keys or not self.seen_keys_list:
-            return metrics
-
-        try:
-            with self.engine.begin() as conn:
-                # Dynamically construct temporary reconciliation pipeline stage securely ON COMMIT DROP 
-                temp_seen_table = f"temp_reconcile_{int(now.timestamp() * 1000)}"
-                conn.execute(text(f'CREATE TEMPORARY TABLE {temp_seen_table} ("{keys[0]}" VARCHAR) ON COMMIT DROP'))
-                
-                # Push the high speed Python memory cache seamlessly 
-                pd.DataFrame({keys[0]: list(self.seen_keys_list)}).to_sql(
-                    name=temp_seen_table, con=conn, if_exists="append", index=False, method="multi", chunksize=10000
-                )
-
-                # Identify orphans mathematically missing from cache 
-                check_sql = f'''
-                    SELECT COUNT(*) FROM {self.table_name} t
-                    WHERE t."{curr_col}" = :curr
-                    AND NOT EXISTS (SELECT 1 FROM {temp_seen_table} tmp WHERE CAST(t."{keys[0]}" AS VARCHAR) = CAST(tmp."{keys[0]}" AS VARCHAR))
-                '''
-                res = conn.execute(text(check_sql), {"curr": current_value}).scalar()
-                
-                if res and res > 0:
-                    logger.info("Identified %d deleted (missing) records from full volume load. Processing soft-deletes.", res)
-                    
-                    set_clauses = [f'"{curr_col}" = :inact']
-                    if end_col:
-                        set_clauses.append(f'"{end_col}" = :now')
-                    if op_col:
-                        set_clauses.append(f'"{op_col}" = \'D\'')
-                        
-                    update_sql = f'''
-                        UPDATE {self.table_name} t
-                        SET {", ".join(set_clauses)}
-                        WHERE t."{curr_col}" = :curr
-                        AND NOT EXISTS (SELECT 1 FROM {temp_seen_table} tmp WHERE CAST(t."{keys[0]}" AS VARCHAR) = CAST(tmp."{keys[0]}" AS VARCHAR))
-                    '''
-                    conn.execute(text(update_sql), {
-                        "inact": inactive_value, 
-                        "now": now, 
-                        "curr": current_value
-                    })
-                    metrics["rows_deleted"] = res
-        except Exception as exc:
-            logger.error("Failed executing post-load soft deletes: %s", exc)
-            
-        return metrics
+        self._is_first_chunk = False
+        return {"rows_loaded": len(df)}
