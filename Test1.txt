@@ -1,66 +1,63 @@
 """
-Abstract base class for database connectors.
+Generic database connector for PostgreSQL, MySQL, SQLite, SQL Server.
+
+Accepts a full SQLAlchemy connection URL or builds one from components.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+import os
 from typing import Any
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
-
+from connectors.base import BaseConnector
 from utils.logger import get_logger
 
-logger = get_logger("connector")
+logger = get_logger("generic_connector")
+
+# Default port map
+_DEFAULT_PORTS = {
+    "postgres": 5432,
+    "mysql": 3306,
+    "sqlserver": 1433,
+    "sqlite": None,
+}
+
+# SQLAlchemy dialect prefixes
+_DIALECT_MAP = {
+    "postgres": "postgresql+psycopg2",
+    "mysql": "mysql+pymysql",
+    "sqlserver": "mssql+pyodbc",
+    "sqlite": "sqlite",
+}
 
 
-class BaseConnector(ABC):
-    """Abstract connector providing a SQLAlchemy engine."""
+class GenericConnector(BaseConnector):
+    """Connector supporting PostgreSQL, MySQL, SQLite, SQL Server."""
 
-    def __init__(self, **kwargs: Any):
-        self._engine: Engine | None = None
-        self._kwargs = kwargs
+    def __init__(self, db_type: str, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.db_type = db_type.lower()
+        self.connection_url = kwargs.get("connection_url")
+        self.host = kwargs.get("host") or os.getenv(f"{db_type.upper()}_HOST", "localhost")
+        self.port = kwargs.get("port") or int(
+            os.getenv(f"{db_type.upper()}_PORT", str(_DEFAULT_PORTS.get(self.db_type, 5432)))
+        )
+        self.database = kwargs.get("database") or os.getenv(f"{db_type.upper()}_DB", "")
+        self.user = kwargs.get("user") or os.getenv(f"{db_type.upper()}_USER", "")
+        self.password = kwargs.get("password") or os.getenv(f"{db_type.upper()}_PASSWORD", "")
 
-    @abstractmethod
     def build_connection_url(self) -> str:
-        """Subclass must construct the SQLAlchemy connection URL."""
-        ...
+        if self.connection_url:
+            return self.connection_url
 
-    def get_engine(self) -> Engine:
-        """Lazy-create and return a SQLAlchemy engine."""
-        if self._engine is None:
-            url = self.build_connection_url()
-            # Resolve .env aliases
-            from utils.env_utils import resolve_connection_string
-            url = resolve_connection_string(url)
-            
-            logger.info("Creating engine for: %s", url.split("@")[-1] if "@" in url else url)
-            self._engine = create_engine(url, pool_pre_ping=True)
-        return self._engine
+        if self.db_type == "sqlite":
+            # database is the file path (or ":memory:" for in-memory)
+            return f"sqlite:///{self.database}"
 
-    def execute(self, sql: str) -> None:
-        """Execute a raw SQL statement."""
-        engine = self.get_engine()
-        with engine.connect() as conn:
-            conn.execute(text(sql))
-            conn.commit()
-        logger.debug("Executed SQL: %s", sql[:200])
+        dialect = _DIALECT_MAP.get(self.db_type)
+        if not dialect:
+            raise ValueError(f"Unsupported db_type: {self.db_type}")
 
-    def test_connection(self) -> bool:
-        """Test that the connection is alive."""
-        try:
-            engine = self.get_engine()
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            logger.info("Connection test: OK")
-            return True
-        except Exception as exc:
-            logger.error("Connection test FAILED: %s", exc)
-            return False
-
-    def dispose(self) -> None:
-        """Dispose of the engine and its connection pool."""
-        if self._engine:
-            self._engine.dispose()
-            self._engine = None
+        url = f"{dialect}://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+        logger.debug("Generic URL built for %s host=%s db=%s", self.db_type, self.host, self.database)
+        return url
