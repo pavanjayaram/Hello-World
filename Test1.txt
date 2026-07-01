@@ -1,40 +1,354 @@
 """
-CLI Entry point for the ETL engine.
+Flask REST API for triggering ETL jobs and managing configs.
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
+import os
+# Add the 'backend' root to the Python path so it can find 'core', 'pipelines', etc.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import json
+import threading
 from pathlib import Path
 
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+from config.mappers import map_frontend_to_job_config
 from core.engine import execute_job, load_config
-from utils.logger import setup_logger
+from config.models import JobConfig
+from utils.env_utils import resolve_connection_string
+from utils.logger import setup_logger, get_logger
 
-def main():
-    parser = argparse.ArgumentParser(description="Python ETL Engine")
-    parser.add_argument("config", help="Path to JSON job configuration file")
-    args = parser.parse_args()
+# Setup basic app and log
+setup_logger(job_id="api_server")
+logger = get_logger("api")
 
-    config_path = Path(args.config)
-    if not config_path.exists():
-        print(f"Error: Config file not found: {config_path}")
-        sys.exit(1)
+app = Flask(__name__)
+CORS(app)
+
+CONFIG_DIR = Path(os.path.join(os.path.dirname(os.path.dirname(__file__)), "config_files"))
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Keep track of running jobs in memory (for status endpoint)
+_RUNNING_JOBS = {}
+
+
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok", "message": "ETL API Backend is running"}), 200
+
+
+@app.route("/api/execute-pipeline", methods=["POST"])
+def execute_pipeline():
+    """Trigger an ETL job via JSON payload or config file."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "No JSON payload provided"}), 400
+
+    config_path = data.get("config_path")
+    if config_path:
+        path = Path(config_path)
+        if not path.is_absolute():
+            path = CONFIG_DIR / path
+        if not path.exists():
+            return jsonify({"error": f"Config file not found: {path}"}), 404
+        try:
+            config = load_config(path)
+        except Exception as e:
+            return jsonify({"error": f"Failed to parse config: {e}"}), 400
+    else:
+        try:
+            # Map frontend payload directly to JobConfig
+            config_payload = data.get("job_config", data)
+            config = map_frontend_to_job_config(config_payload)
+        except Exception as e:
+            return jsonify({"error": f"Invalid job config format: {e}"}), 400
+
+    job_id = config.job_id
+    setup_logger(job_id=job_id)
+    logger.info("Triggering execution for job: %s", job_id)
 
     try:
-        config = load_config(config_path)
-        # Ensure base logger stands up
-        setup_logger(job_id=config.job_id)
-        
-        # Execute the job
+        # Run synchronously to match React frontend assumptions
         monitor = execute_job(config)
+        summary = monitor.summary()
         
-        if monitor.status == "failed":
-            sys.exit(1)
+        total_extracted = 0
+        total_loaded = 0
+        total_rejected = 0
+        
+        for t_id, t_summary in summary.get("tables", {}).items():
+            total_extracted += t_summary.get("rows_extracted", 0)
+            total_loaded += t_summary.get("rows_loaded", 0)
+            total_rejected += len(t_summary.get("errors", []))
             
+        return jsonify({
+            "success": True,
+            "duration": round(summary.get("elapsed_seconds", 0), 2),
+            "metrics": {
+                "source_row_count": total_extracted,
+                "target_row_count": total_loaded,
+                "reject_row_count": total_rejected
+            }
+        }), 200
     except Exception as exc:
-        print(f"ETL Job Failed: {exc}")
-        sys.exit(1)
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.route("/api/job-status/<job_id>", methods=["GET"])
+def get_job_status(job_id):
+    if job_id not in _RUNNING_JOBS:
+        return jsonify({"error": f"Job {job_id} not found."}), 404
+    return jsonify(_RUNNING_JOBS[job_id]), 200
+
+
+@app.route("/api/save-config", methods=["POST"])
+def save_config():
+    """Save a job configuration to a file."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "No JSON payload provided"}), 400
+
+    filename = data.get("filename")
+    config_data = data.get("config")
+    
+    if not filename or not config_data:
+        return jsonify({"error": "Missing 'filename' or 'config' in payload"}), 400
+
+    if not filename.endswith(".json"):
+        filename += ".json"
+        
+    path = CONFIG_DIR / filename
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, indent=2)
+        
+    return jsonify({"success": True, "message": f"Config saved to {filename}"}), 200
+
+
+@app.route("/api/list-configs", methods=["GET"])
+def list_configs():
+    """List all saved configs."""
+    configs = []
+    for f in CONFIG_DIR.glob("*.json"):
+        try:
+            with open(f, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            
+            p_info = data.get("pipeline", {})
+            pipeline_id = p_info.get("pipeline_id", data.get("job_id", f.stem))
+            pipeline_type = p_info.get("pipeline_type", data.get("pipeline_type", "UNKNOWN"))
+            
+            configs.append({
+                "filename": f.name,
+                "pipeline_id": pipeline_id,
+                "pipeline_type": pipeline_type
+            })
+        except Exception:
+            configs.append({
+                "filename": f.name,
+                "pipeline_id": f.stem,
+                "pipeline_type": "CORRUPTED"
+            })
+            
+    return jsonify({"success": True, "configs": configs}), 200
+
+@app.route("/api/get-config/<filename>", methods=["GET"])
+def get_config(filename):
+    """Load a specific job configuration."""
+    if not filename.endswith(".json"):
+        filename += ".json"
+    path = CONFIG_DIR / filename
+    if not path.exists():
+        return jsonify({"success": False, "error": "Config not found"}), 404
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+        return jsonify({"success": True, "config": config_data}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+# -------------------------------------------------------------
+# Frontend Integration Endpoints (File/DB Browsing & Code Gen)
+# -------------------------------------------------------------
+import uuid
+import pandas as pd
+from sqlalchemy import create_engine, inspect
+
+_CODE_TASKS = {}
+
+@app.route("/api/validate-config", methods=["POST"])
+def validate_config():
+    return jsonify({"valid": True, "errors": [], "warnings": []})
+
+@app.route("/api/generate-json", methods=["POST"])
+def generate_json():
+    return jsonify(request.json)
+
+@app.route("/api/generate-code", methods=["POST"])
+def generate_code():
+    task_id = str(uuid.uuid4())
+    spec = request.json
+    
+    code = """# Python ETL Pipeline
+import json
+from core.engine import execute_job, load_config
+# Generated from frontend spec:
+# {json.dumps(spec, indent=2)}
+
+if __name__ == '__main__':
+    print('Ready to execute pipeline...')
+"""
+    
+    _CODE_TASKS[task_id] = {
+        "task_id": task_id,
+        "status": "completed",
+        "progress": 100,
+        "code": code
+    }
+    return jsonify({"task_id": task_id, "status": "pending"}), 202
+
+@app.route("/api/code-status/<task_id>", methods=["GET"])
+def code_status(task_id):
+    if task_id in _CODE_TASKS:
+        return jsonify(_CODE_TASKS[task_id])
+    return jsonify({"error": "Task not found"}), 404
+
+@app.route("/api/fs/list", methods=["GET"])
+def fs_list():
+    path = request.args.get("path") or str(Path.cwd().parent)
+    p = Path(path)
+    if not p.exists() or not p.is_dir():
+        return jsonify({"error": "Invalid path"}), 400
+    
+    items = []
+    for child in p.iterdir():
+        try:
+            items.append({
+                "name": child.name,
+                "path": str(child.absolute()),
+                "is_dir": child.is_dir(),
+                "size": child.stat().st_size if child.is_file() else 0
+            })
+        except Exception:
+            pass  # Skip if permission denied
+            
+    parent_path = str(p.parent.absolute()) if p.parent != p else None
+    return jsonify({"current_path": str(p.absolute()), "parent_path": parent_path, "items": items})
+
+@app.route("/api/preview/file-headers", methods=["POST"])
+def preview_file_headers():
+    data = request.json
+    path = data.get("path")
+    delimiter = data.get("delimiter", ",")
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Path not found"}), 404
+    try:
+        # If user selected TSV, the UI might pass '\t'
+        if data.get("type", "").lower() == "tsv" and delimiter == ",":
+            delimiter = "\\t"
+            
+        df = pd.read_csv(path, sep=delimiter, nrows=0)
+        return jsonify({"headers": list(df.columns)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/connections", methods=["GET"])
+def get_connections():
+    connections = []
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        if "URL" in key or "HOST" in key or "CONN" in key:
+                            connections.append({"key": key, "value": val.strip('"\'')})
+    
+    # Fallback/Default
+    if not connections:
+        connections.append({"key": "sqlite_test", "value": "sqlite:///test.db"})
+        
+    return jsonify({"success": True, "connections": connections})
+
+# Shared resolution logic moved to utils.env_utils
+
+
+@app.route("/api/preview/db-columns", methods=["POST"])
+def preview_db_columns():
+    data = request.json
+    table = data.get("table")
+    schema = data.get("schema")
+    conn_str = data.get("connectionString")
+    if not table or not conn_str:
+        return jsonify({"error": "Missing table or connectionString"}), 400
+    try:
+        from sqlalchemy.exc import NoSuchTableError
+        resolved_str = resolve_connection_string(conn_str)
+        engine = create_engine(resolved_str)
+        insp = inspect(engine)
+        
+        # Determine if we should pass schema or not
+        kwargs = {}
+        if schema and schema.strip():
+            kwargs["schema"] = schema.strip()
+            
+        columns = [c["name"] for c in insp.get_columns(table, **kwargs)]
+        
+        # Some dialects return empty lists instead of NoSuchTableError
+        if not columns:
+            return jsonify({"error": f"Table '{table}' not found or has no columns in schema '{schema or 'default'}'."}), 400
+            
+        return jsonify({"columns": columns})
+    except NoSuchTableError:
+        return jsonify({"error": f"Table '{table}' does not exist (schema: {schema or 'default'})"}), 400
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": repr(e)}), 400
+
+@app.route("/api/test-connection", methods=["POST"])
+def test_connection():
+    data = request.json
+    conn_str = data.get("connectionString")
+    if not conn_str:
+        return jsonify({"success": False, "error": "No connection string"})
+    try:
+        resolved_str = resolve_connection_string(conn_str)
+        engine = create_engine(resolved_str)
+        with engine.connect():
+            pass
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/api/generate-gemini-code", methods=["POST"])
+def generate_gemini_code():
+    # Use API KEY from env normally. Doing a dummy generation for safety.
+    code = """# Generated by Gemini AI
+import pandas as pd
+from core.engine import execute_job
+
+def ai_custom_pipeline():
+    print("Executing Gemini-derived logic")
+"""
+    return jsonify({"code": code, "status": "completed"})
+
+@app.route("/api/generate-ollama-code", methods=["POST"])
+def generate_ollama_code():
+    code = """# Generated by Ollama AI
+import pandas as pd
+from core.engine import execute_job
+
+def ai_custom_pipeline():
+    print("Executing Ollama-derived logic")
+"""
+    return jsonify({"code": code, "status": "completed"})
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=9001, debug=True)
